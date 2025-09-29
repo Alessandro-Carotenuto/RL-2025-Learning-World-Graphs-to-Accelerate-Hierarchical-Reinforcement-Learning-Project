@@ -1,4 +1,5 @@
-#OUTSIDE IMPORTS TO MAKE IT WORK
+# STANDARD IMPORTS
+
 import pygame
 import gymnasium as gym
 import numpy as np
@@ -34,7 +35,7 @@ from torch.distributions import Uniform
 
 from typing import List, Tuple, Dict, Optional
 
-#SELF IMPORTS
+# LOCAL IMPORTS
 
 from local_distributions.hardkuma import HardKumaraswamy,BetaDistribution
 from wrappers.minigrid_wrapper import MinigridWrapper,EnvModes,EnvSizes
@@ -46,8 +47,12 @@ from local_networks.vaesystem import PriorNetwork,InferenceNetwork,GenerationNet
 from local_networks.vaesystem import StateEncoder, ActionEncoder, VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance,sample_goal_position
+from local_networks.hierarchical_system import HierarchicalManager, hierarchical_manager_tests
 
 #---------------------------------------------------------------------------------------
+# MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
+# ---------------------------------------------------------------------------------------
+
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8):
     """
     Main alternating training loop - UPDATED to include world graph construction.
@@ -163,7 +168,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     return pivotal_states, world_graph
 
 #-----------------------------------------------------------------------------
-
+# TEST FUNCTIONS FOR EACH COMPONENT, BEFORE SPLITTING IN FILES
 #-----------------------------------------------------------------------------
 
 def test_vae_system():
@@ -223,7 +228,6 @@ def test_vae_system():
     print("\n" + "=" * 40)
     print("VAE System test completed!")
 
-# Test function for the Goal-Conditioned Policy
 def test_goal_conditioned_policy():
     """Test the GoalConditionedPolicy implementation."""
     print("Testing Goal-Conditioned Policy:")
@@ -831,6 +835,7 @@ def test_graph_visualizer():
         plt.show()
         print(f"Shortest path from (1,1) to (6,3): {path}, distance: {distance}")
 
+
 def main():
     # pygame.init()
     # env = MinigridWrapper(render_mode="human",mode=EnvModes.MULTIGOAL, phase_one_eps=10)
@@ -846,10 +851,8 @@ def main():
     # v.total_reward_by_ep_stream()
     # v.reward_stream_for_ep(10)
     
-    
-    # Run the integration test
-    test_graph_visualizer()
-    
+    hierarchical_manager_tests()
+
     input()
     
     
