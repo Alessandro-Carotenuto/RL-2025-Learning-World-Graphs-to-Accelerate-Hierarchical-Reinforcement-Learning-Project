@@ -217,6 +217,56 @@ class HierarchicalManager(nn.Module):
         
         print(f"Manager initialized from goal policy (transfer learning)")
 
+    def update_policy(self, states: List, wide_goals: List, narrow_goals: List,
+                     rewards: List, values: List[torch.Tensor], log_probs: List[torch.Tensor]):
+        """
+        Update Manager policy with horizon-level A2C.
+        Paper: Manager operates at c-step temporal resolution.
+        """
+        if len(rewards) == 0:
+            return
+        
+        # Detach hidden state to prevent backprop through previous horizons
+        if self.hidden_state is not None:
+            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+        
+        # Compute returns
+        returns = []
+        discounted_reward = 0
+        for reward in reversed(rewards):
+            discounted_reward = reward + self.gamma * discounted_reward
+            returns.insert(0, discounted_reward)
+        
+        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        values = torch.stack(values).squeeze()
+        log_probs = torch.stack(log_probs)
+        
+        # Handle shape
+        if values.dim() == 0:
+            values = values.unsqueeze(0)
+        if returns.dim() == 0:
+            returns = returns.unsqueeze(0)
+        
+        # Advantages
+        advantages = returns - values
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Losses
+        policy_loss = -(log_probs * advantages.detach()).mean()
+        value_loss = F.mse_loss(values, returns)
+        
+        # Entropy (using stored goals) - no need to recompute forward passes
+        # Use stored log_probs for entropy approximation
+        entropy_loss = -log_probs.mean()  # Simplified entropy from stored log probs
+        
+        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
+        
+        # Update
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
 # Test functions for HierarchicalManager
 def test_manager_architecture():
     """Test Manager network architecture and forward pass."""
@@ -622,6 +672,57 @@ class HierarchicalWorker(nn.Module):
         
         print(f"Worker initialized from goal policy (transfer learning)")
 
+    def update_policy(self, states: List, actions: List, rewards: List, 
+                     values: List[torch.Tensor], log_probs: List[torch.Tensor]):
+        """
+        Update Worker policy with per-step A2C.
+        Paper: Worker operates at single-step resolution.
+        """
+        if len(rewards) == 0:
+            return
+        
+        # Compute returns
+        returns = []
+        discounted_reward = 0
+        for reward in reversed(rewards):
+            discounted_reward = reward + self.gamma * discounted_reward
+            returns.insert(0, discounted_reward)
+        
+        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        values = torch.stack(values).squeeze()
+        log_probs = torch.stack(log_probs)
+        
+        # Handle single-step case
+        if values.dim() == 0:
+            values = values.unsqueeze(0)
+        if returns.dim() == 0:
+            returns = returns.unsqueeze(0)
+        
+        # Compute advantages
+        advantages = returns - values
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Losses
+        policy_loss = -(log_probs * advantages.detach()).mean()
+        value_loss = F.mse_loss(values, returns)
+        
+        # Entropy
+        entropy_loss = 0
+        for i, (state, wide_goal, narrow_goal) in enumerate(states):
+            action_logits, _ = self.forward(state, wide_goal, narrow_goal)
+            action_probs = F.softmax(action_logits, dim=0)
+            entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
+        entropy_loss = entropy_loss / len(states)
+        
+        # Total loss
+        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
+        
+        # Update
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
 # Test functions for HierarchicalWorker
 def test_worker_architecture():
     """Test Worker network architecture."""
@@ -783,7 +884,7 @@ def test_worker_transfer_learning():
     print("\n" + "=" * 40)
     print("Worker Transfer Learning test completed!")
 
-def hierarchical_worker_tests():
+def hierarchical_worker_tests():   
     """Run all Hierarchical Worker tests."""
     print("\n" + "#" * 60)
     test_worker_architecture()
@@ -791,3 +892,197 @@ def hierarchical_worker_tests():
     test_graph_traversal()
     test_worker_rewards()
     test_worker_transfer_learning()
+
+class HierarchicalTrainer:
+    """
+    Coordinates Manager and Worker training.
+    Paper: "Hierarchical reinforcement learning framework that leverages world graph"
+    """
+    
+    def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker, 
+                 env, horizon: int = 15):
+        self.manager = manager
+        self.worker = worker
+        self.env = env
+        self.horizon = horizon
+    
+    def train_episode(self, max_steps: int = 200) -> Dict:
+        """
+        Train one episode with hierarchical policy.
+        
+        Returns:
+            Episode statistics
+        """
+        # Reset environment and networks
+        obs = self.env.reset()
+        state = tuple(self.env.agent_pos)
+        self.manager.reset_manager_state()
+        self.worker.reset_worker_state()
+        
+        # Episode tracking
+        episode_reward = 0
+        episode_steps = 0
+        manager_updates = 0
+        worker_updates = 0
+        
+        # Manager experience
+        manager_states = []
+        manager_wide_goals = []
+        manager_narrow_goals = []
+        manager_rewards = []
+        manager_values = []
+        manager_log_probs = []
+        
+        while episode_steps < max_steps:
+            # Manager selects goals
+            wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(state)
+            
+            # Detach Manager's hidden state to break computation graph between horizons
+            if self.manager.hidden_state is not None:
+                self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
+            
+            manager_states.append(state)
+            manager_wide_goals.append(wide_goal)
+            manager_narrow_goals.append(narrow_goal)
+            manager_log_probs.append(manager_log_prob)  # Keep gradients
+            manager_values.append(manager_value)  # Keep gradients
+            
+            # Worker executes for horizon steps
+            worker_states = []
+            worker_actions = []
+            worker_rewards = []
+            worker_values = []
+            worker_log_probs = []
+            
+            horizon_env_reward = 0
+            goal_reached = False
+            
+            for h in range(self.horizon):
+                # Worker selects action
+                action, worker_log_prob, worker_value = self.worker.get_action(state, wide_goal, narrow_goal)
+                
+                # Environment step
+                obs, env_reward, terminated, truncated, info = self.env.step(action)
+                next_state = tuple(self.env.agent_pos)
+                
+                # Worker reward (internal)
+                worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
+                
+                # Store Worker experience
+                worker_states.append((state, wide_goal, narrow_goal))
+                worker_actions.append(action)
+                worker_rewards.append(worker_reward)
+                worker_values.append(worker_value)
+                worker_log_probs.append(worker_log_prob)
+                
+                # Update Worker every step
+                if len(worker_rewards) > 0:
+                    self.worker.update_policy(
+                        [worker_states[-1]], [worker_actions[-1]], [worker_rewards[-1]],
+                        [worker_values[-1]], [worker_log_probs[-1]]
+                    )
+                    worker_updates += 1
+                
+                # Track episode stats
+                horizon_env_reward += env_reward
+                episode_reward += env_reward
+                episode_steps += 1
+                state = next_state
+                
+                # Check goal reached
+                if worker_reward > 0:
+                    goal_reached = True
+                    break
+                
+                if terminated or truncated:
+                    break
+            
+            # Manager receives horizon reward
+            manager_rewards.append(horizon_env_reward)
+            
+            # Update Manager every horizon
+            if len(manager_rewards) > 0:
+                self.manager.update_policy(
+                    manager_states, manager_wide_goals, manager_narrow_goals,
+                    manager_rewards, manager_values, manager_log_probs
+                )
+                manager_updates += 1
+                
+                # Reset Manager experience
+                manager_states = []
+                manager_wide_goals = []
+                manager_narrow_goals = []
+                manager_rewards = []
+                manager_values = []
+                manager_log_probs = []
+            
+            if terminated or truncated:
+                break
+        
+        return {
+            'episode_reward': episode_reward,
+            'episode_steps': episode_steps,
+            'manager_updates': manager_updates,
+            'worker_updates': worker_updates
+        }
+
+#This test uses a MockEnv to simulate environment interactions, not the Minigrid Wrapper
+def test_hierarchical_training_loop():
+    """Test complete hierarchical training loop."""
+    print("Testing Hierarchical Training Loop:")
+    print("=" * 40)
+    
+    # Mock environment
+    class MockEnv:
+        def __init__(self):
+            self.agent_pos = (2, 2)
+            self.step_count = 0
+        
+        def reset(self):
+            self.agent_pos = (2, 2)
+            self.step_count = 0
+            return None
+        
+        def step(self, action):
+            self.step_count += 1
+            # Simple movement simulation
+            if action == 2:  # move_forward
+                self.agent_pos = (self.agent_pos[0] + 1, self.agent_pos[1])
+            
+            reward = 0.1 if self.step_count > 10 else 0
+            done = self.step_count >= 20
+            return None, reward, done, False, {}
+    
+    # Create components
+    from utils.graph_manager import GraphManager
+    world_graph = GraphManager()
+    pivotal_states = [(2, 2), (5, 5), (8, 8)]
+    for state in pivotal_states:
+        world_graph.add_node(state)
+    
+    manager = HierarchicalManager(pivotal_states, horizon=5)
+    worker = HierarchicalWorker(world_graph, pivotal_states)
+    env = MockEnv()
+    
+    trainer = HierarchicalTrainer(manager, worker, env, horizon=5)
+    
+    print("Training single episode...")
+    stats = trainer.train_episode(max_steps=20)
+    
+    print(f"Episode reward: {stats['episode_reward']:.2f}")
+    print(f"Episode steps: {stats['episode_steps']}")
+    print(f"Manager updates: {stats['manager_updates']}")
+    print(f"Worker updates: {stats['worker_updates']}")
+    
+    print("\n" + "=" * 40)
+    print("Hierarchical Training Loop test completed!")
+
+def hierarchical_system_tests():
+    """Run all hierarchical system tests."""
+    print("\n" + "#" * 60)
+    print("HIERARCHICAL SYSTEM TESTS")
+    print("#" * 60)
+    hierarchical_manager_tests()
+    hierarchical_worker_tests()
+    test_hierarchical_training_loop()
+
