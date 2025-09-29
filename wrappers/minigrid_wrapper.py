@@ -72,6 +72,12 @@ class MinigridWrapper(MiniGridEnv):
         self.phase = 1  # phase can be 1 or 2
         self.phase1_reset_num = phase_one_eps
 
+        # BALL POSITIONS FOR MULTIGOAL MODE ---------------------
+
+        self.active_balls = set()  # Track ball positions
+        self.total_balls = 0
+        self.balls_collected = 0
+
         # ------------------------------------------------------
 
         # SETUP INITIAL POSITION-DIRECTION
@@ -593,26 +599,31 @@ class MinigridWrapper(MiniGridEnv):
                 if (not (solve1 and solve2)):
                         print("--- RESET (phase 2) ---\n")
     
-    def ResetMultiGoals(self, playerpos, goals=5,):
+    def ResetMultiGoals(self, playerpos, goals=5):
         self.removeitems()
-        reachables=self.BFS_all_reachable(playerpos)
-             
+        reachables = self.BFS_all_reachable(playerpos)
+        
+        ballpos = []
         for i in range(goals):
-            px=playerpos[0]
-            py=playerpos[1]
-            while (px==playerpos[0] and py==playerpos[1]):
-                 point=random.randint(0, len(reachables)-1)
-                 ballpos=[]
-                 px=reachables[point][0]
-                 py=reachables[point][1]
-                 
+            px = playerpos[0]
+            py = playerpos[1]
+            while (px == playerpos[0] and py == playerpos[1]):
+                point = random.randint(0, len(reachables)-1)
+                px = reachables[point][0]
+                py = reachables[point][1]
+                
             self.grid.set(px, py, Ball(COLOR_NAMES[i]))
-            print("BALL PLACED",px,py)
-            self.placeable_grid[px][py]=False
-            ballpos.append((px,py))
+            print("BALL PLACED", px, py)
+            self.placeable_grid[px][py] = False
+            ballpos.append((px, py))
+        
+        # Track active balls
+        self.active_balls = set(ballpos)
+        self.total_balls = len(ballpos)
+        self.balls_collected = 0
+        
         return ballpos
-    
-    
+
     def EasyGeneralPurposeMap(self):
         
        self.resetgrid()
@@ -621,7 +632,6 @@ class MinigridWrapper(MiniGridEnv):
        self.NoiseFiller(0.65)  # noise and reserves
        return
                 
-
     # STARTS GRID GENERATION
     def _gen_grid(self, width, height):
 
@@ -673,8 +683,8 @@ class MinigridWrapper(MiniGridEnv):
                         self.Phase2_ResetDoorKey()
                     elif self.mode==EnvModes.MULTIGOAL:
                         playerpos = (self.agent_start_pos[0], self.agent_start_pos[1])
-                        self.ResetMultiGoals(playerpos)
-
+                        self.ResetMultiGoals(playerpos)  # This now sets up tracking
+                
         # else:
         #     self.grid.set(5, 6, Door(COLOR_NAMES[0], is_locked=True))
         #     self.grid.set(3, 6, Key(COLOR_NAMES[0]))
@@ -692,6 +702,39 @@ class MinigridWrapper(MiniGridEnv):
     #     processed_obs = self._process_obs(obs)
     #     normalized_reward = self._normalize_reward(reward)
     #     return processed_obs, normalized_reward, terminated, truncated, info
+
+# Override step method:
+    def step(self, action):
+        # Determine target position based on action
+        if self.mode == EnvModes.MULTIGOAL and self.phase == 2:
+            ball_collected = False
+            
+            # Get direction vectors
+            if action == self.actions.forward:
+                fwd_pos = self.front_pos
+                fwd_cell = self.grid.get(*fwd_pos)
+                
+                # Check if moving into a ball
+                if isinstance(fwd_cell, Ball) and tuple(fwd_pos) in self.active_balls:
+                    # Remove ball BEFORE moving
+                    self.grid.set(fwd_pos[0], fwd_pos[1], None)
+                    self.active_balls.remove(tuple(fwd_pos))
+                    self.balls_collected += 1
+                    ball_collected = True
+        
+        # Now do the actual step (movement will succeed)
+        obs, reward, terminated, truncated, info = super().step(action)
+        
+        # Add reward if ball was collected
+        if self.mode == EnvModes.MULTIGOAL and self.phase == 2 and ball_collected:
+            reward += 1.0
+            
+            # Check if all balls collected
+            if len(self.active_balls) == 0:
+                terminated = True
+                reward += 5.0
+        
+        return obs, reward, terminated, truncated, info
 
     def _process_obs(self, obs):
         # EXTRACT AND PROCESS THE OBSERVATIONS

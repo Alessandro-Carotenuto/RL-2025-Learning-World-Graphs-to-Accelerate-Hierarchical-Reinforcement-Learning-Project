@@ -838,23 +838,14 @@ def test_graph_visualizer():
 
 
 def main():
-    # pygame.init()
-    # env = MinigridWrapper(render_mode="human",mode=EnvModes.MULTIGOAL, phase_one_eps=10)
+    pygame.init()
+    env = MinigridWrapper(render_mode="human",mode=EnvModes.MULTIGOAL, phase_one_eps=10)
     # #env = FastWrapper("MiniGrid-KeyCorridorS3R2-v0",1000,"human")
     # print(os.path.dirname(minigrid.__file__))
 
-    # # enable manual control for testing
-    # manual_control = ManualControl(env, seed=42)
-    # manual_control.start()
-    # fake_ep_data=TestBuffer()
-    # v=Visualizer(fake_ep_data)
-    # v.total_reward_stream()
-    # v.total_reward_by_ep_stream()
-    # v.reward_stream_for_ep(10)
-    
-    hierarchical_system_tests()
-
-    input()
+    # enable manual control for testing
+    manual_control = ManualControl(env, seed=42)
+    manual_control.start()
     
     
     
