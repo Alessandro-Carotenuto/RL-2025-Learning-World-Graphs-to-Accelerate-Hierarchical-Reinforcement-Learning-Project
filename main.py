@@ -48,7 +48,7 @@ from local_networks.vaesystem import StateEncoder, ActionEncoder, VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance,sample_goal_position
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
-from local_networks.hierarchical_system import hierarchical_system_tests
+from local_networks.hierarchical_system import hierarchical_system_tests, test_phase2_with_real_environment
 
 #---------------------------------------------------------------------------------------
 # MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
@@ -838,17 +838,16 @@ def test_graph_visualizer():
 
 
 def main():
-    pygame.init()
-    env = MinigridWrapper(render_mode="human",mode=EnvModes.MULTIGOAL, phase_one_eps=10)
+    # pygame.init()
+    # env = MinigridWrapper(render_mode="human",mode=EnvModes.MULTIGOAL, phase_one_eps=10)
     # #env = FastWrapper("MiniGrid-KeyCorridorS3R2-v0",1000,"human")
     # print(os.path.dirname(minigrid.__file__))
 
     # enable manual control for testing
-    manual_control = ManualControl(env, seed=42)
-    manual_control.start()
-    
-    
-    
+    # manual_control = ManualControl(env, seed=42)
+    # manual_control.start()
+    test_phase2_with_real_environment()
+
 
 if __name__ == "__main__":
     main()

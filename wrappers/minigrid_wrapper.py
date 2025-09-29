@@ -705,31 +705,27 @@ class MinigridWrapper(MiniGridEnv):
 
 # Override step method:
     def step(self, action):
-        # Determine target position based on action
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2:
             ball_collected = False
             
-            # Get direction vectors
             if action == self.actions.forward:
                 fwd_pos = self.front_pos
-                fwd_cell = self.grid.get(*fwd_pos)
                 
-                # Check if moving into a ball
-                if isinstance(fwd_cell, Ball) and tuple(fwd_pos) in self.active_balls:
-                    # Remove ball BEFORE moving
-                    self.grid.set(fwd_pos[0], fwd_pos[1], None)
-                    self.active_balls.remove(tuple(fwd_pos))
-                    self.balls_collected += 1
-                    ball_collected = True
+                # Boundary check before accessing grid
+                if (0 <= fwd_pos[0] < self.width and 
+                    0 <= fwd_pos[1] < self.height):
+                    fwd_cell = self.grid.get(*fwd_pos)
+                    
+                    if isinstance(fwd_cell, Ball) and tuple(fwd_pos) in self.active_balls:
+                        self.grid.set(fwd_pos[0], fwd_pos[1], None)
+                        self.active_balls.remove(tuple(fwd_pos))
+                        self.balls_collected += 1
+                        ball_collected = True
         
-        # Now do the actual step (movement will succeed)
         obs, reward, terminated, truncated, info = super().step(action)
         
-        # Add reward if ball was collected
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2 and ball_collected:
             reward += 1.0
-            
-            # Check if all balls collected
             if len(self.active_balls) == 0:
                 terminated = True
                 reward += 5.0
