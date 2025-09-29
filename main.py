@@ -47,7 +47,8 @@ from local_networks.vaesystem import PriorNetwork,InferenceNetwork,GenerationNet
 from local_networks.vaesystem import StateEncoder, ActionEncoder, VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance,sample_goal_position
-from local_networks.hierarchical_system import HierarchicalManager, hierarchical_manager_tests
+from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker
+from local_networks.hierarchical_system import hierarchical_manager_tests, hierarchical_worker_tests
 
 #---------------------------------------------------------------------------------------
 # MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
@@ -852,6 +853,8 @@ def main():
     # v.reward_stream_for_ep(10)
     
     hierarchical_manager_tests()
+    print("-"*60)
+    hierarchical_worker_tests()
 
     input()
     
