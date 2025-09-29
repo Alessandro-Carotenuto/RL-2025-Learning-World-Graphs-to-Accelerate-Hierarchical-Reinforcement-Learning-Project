@@ -719,7 +719,7 @@ class MinigridWrapper(MiniGridEnv):
                     if isinstance(fwd_cell, Ball) and tuple(fwd_pos) in self.active_balls:
                         self.grid.set(fwd_pos[0], fwd_pos[1], None)
                         self.active_balls.remove(tuple(fwd_pos))
-                        self.balls_collected += 1
+                        self.balls_collected += 5
                         ball_collected = True
         
         obs, reward, terminated, truncated, info = super().step(action)

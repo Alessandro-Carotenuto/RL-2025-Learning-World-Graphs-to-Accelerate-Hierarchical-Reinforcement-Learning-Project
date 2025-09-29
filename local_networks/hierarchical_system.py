@@ -456,6 +456,7 @@ class HierarchicalWorker(nn.Module):
                  world_graph,
                  pivotal_states: List[Tuple[int, int]],
                  lr: float = 5e-3,
+                 verbose: bool =False,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -464,6 +465,7 @@ class HierarchicalWorker(nn.Module):
             lr: Learning rate
             device: Computing device
         """
+        self.verbose=verbose
         super().__init__()
         
         self.device = device
@@ -586,7 +588,8 @@ class HierarchicalWorker(nn.Module):
             self.traversal_step = 0
             
             if self.current_traversal_path:
-                print(f"    Worker initiating graph traversal: {state} -> {wide_goal}")
+                if self.verbose:
+                    print(f"    Worker initiating graph traversal: {state} -> {wide_goal}")
         
         # If actively traversing, follow graph path
         if self.current_traversal_path and self.traversal_step < len(self.current_traversal_path) - 1:
@@ -602,7 +605,8 @@ class HierarchicalWorker(nn.Module):
             
             # Check if traversal complete
             if self.traversal_step >= len(self.current_traversal_path) - 1:
-                print(f"    Worker completed graph traversal to {wide_goal}")
+                if self.verbose:
+                    print(f"    Worker completed graph traversal to {wide_goal}")
                 self.current_traversal_path = []
                 self.traversal_step = 0
             
@@ -637,7 +641,7 @@ class HierarchicalWorker(nn.Module):
         elif current_state == wide_goal:
             return 0.5  # Partial success (reached wide goal)
         else:
-            return -0.01  # Step penalty
+            return -0.001  # Step penalty
     
     def initialize_from_goal_policy(self, goal_policy):
         """

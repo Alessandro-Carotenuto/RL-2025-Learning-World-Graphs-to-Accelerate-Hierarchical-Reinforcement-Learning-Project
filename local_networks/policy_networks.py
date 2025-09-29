@@ -18,9 +18,10 @@ class GoalConditionedPolicy(nn.Module):
     A2C-based policy that learns to navigate between nearby states.
     """
     
-    def __init__(self, lr: float = 5e-3, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, lr: float = 5e-3, verbose: bool =False, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         super().__init__()
         
+        self.verbose = verbose
         self.device = device
         
         # Neural network components
@@ -135,7 +136,8 @@ class GoalConditionedPolicy(nn.Module):
                 if curiosity_reward > 0.01:
                     reward_breakdown += f", cur:{curiosity_reward:.3f}"
                 reward_breakdown += f") = {total_reward:.2f}"
-                print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
+                if self.verbose:    
+                    print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
             
             # Check if goal reached or episode ended
             if goal_reward > 0:
@@ -215,7 +217,6 @@ class GoalConditionedPolicy(nn.Module):
         
         return action.item(), log_prob, value.squeeze()
     
-        
     def update_policy(self, states: List, actions: List[int], rewards: List[float], 
                          values: List[torch.Tensor], log_probs: List[torch.Tensor]):
             """
@@ -392,7 +393,6 @@ class GoalConditionedPolicy(nn.Module):
         
         return diagnostics
         
-    
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
                                      num_episodes: int = 3, 
                                      vae_system=None,
@@ -438,7 +438,6 @@ class GoalConditionedPolicy(nn.Module):
         
         return episodes_data
     
-
     def discover_edges_between_pivotal_states(self, env, pivotal_states: List[Tuple[int, int]], 
                                             max_walk_length: int = 20,
                                             num_attempts: int = 10) -> Dict[Tuple, List[Tuple]]:
@@ -452,7 +451,8 @@ class GoalConditionedPolicy(nn.Module):
         print(f"Discovering edges between {len(pivotal_states)} pivotal states...")
         
         for start_state in pivotal_states:
-            print(f"  Random walks from {start_state}:")
+            if self.verbose:
+                print(f"  Random walks from {start_state}:")
             
             for attempt in range(num_attempts):
                 try:
@@ -517,7 +517,8 @@ class GoalConditionedPolicy(nn.Module):
                                     edge_key = (start_state, new_pos)
                                     if edge_key not in discovered_edges:
                                         discovered_edges[edge_key] = path.copy()
-                                        print(f"    Found edge {start_state} -> {new_pos} (length: {len(path)})")
+                                        if self.verbose:
+                                            print(f"    Found edge {start_state} -> {new_pos} (length: {len(path)})")
                                 break
                         
                         if terminated or truncated:
@@ -583,7 +584,8 @@ class GoalConditionedPolicy(nn.Module):
                         if len(refined_path) <= len(raw_path) * 1.2:  # Allow 20% longer paths
                             edge_weight = len(refined_path) - 1  # Number of actions
                             refined_edges[(start_state, end_state)] = (refined_path, edge_weight)
-                            print(f"    Refined: {len(refined_path)} steps (was {len(raw_path)})")
+                            if self.verbose:
+                                print(f"    Refined: {len(refined_path)} steps (was {len(raw_path)})")
                         else:
                             # Use raw path
                             edge_weight = len(raw_path) - 1
@@ -630,7 +632,8 @@ class GoalConditionedPolicy(nn.Module):
         # Add refined edges with weights
         for (start_state, end_state), (path, weight) in refined_edges.items():
             world_graph.add_edge(start_state, end_state, weight)
-            print(f"  Edge: {start_state} -> {end_state}, weight: {weight}")
+            if self.verbose:
+                print(f"  Edge: {start_state} -> {end_state}, weight: {weight}")
         
         print(f"World graph constructed: {len(pivotal_states)} nodes, {len(refined_edges)} edges")
         

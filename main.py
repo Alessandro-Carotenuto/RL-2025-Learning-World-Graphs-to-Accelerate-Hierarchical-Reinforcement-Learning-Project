@@ -836,6 +836,128 @@ def test_graph_visualizer():
         plt.show()
         print(f"Shortest path from (1,1) to (6,3): {path}, distance: {distance}")
 
+# ACTUAL TRAINING CODE ----------------------------------------------------
+
+def train_full_phase1_phase2():
+    """Complete training with comprehensive diagnostics."""
+    # Hyperparameters
+    config = {
+        'maze_size': EnvSizes.MEDIUM,
+        'phase1_iterations': 8,
+        'phase2_episodes': 500,
+        'max_steps_per_episode': 500,
+        'manager_horizon': 20,
+        'neighborhood_size': 5,
+        'manager_lr': 5e-3,
+        'worker_lr': 5e-3,
+        'vae_mu0': 8.0
+    }
+    
+    print("="*70)
+    print("FULL TRAINING with Diagnostics")
+    print("="*70)
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    
+    # Phase 1
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = False
+    
+    policy = GoalConditionedPolicy(lr=config['manager_lr'])
+    vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
+    buffer = StatBuffer()
+    
+    print("\nPHASE 1: World Graph Discovery")
+    start_time = time.time()
+    
+    pivotal_states, world_graph = alternating_training_loop(
+        env, policy, vae_system, buffer, max_iterations=config['phase1_iterations']
+    )
+    
+    phase1_time = time.time() - start_time
+    print(f"\nPhase 1 complete in {phase1_time:.1f}s")
+    print(f"  Pivotal states: {len(pivotal_states)}")
+    print(f"  Graph edges: {len(world_graph.edges)}")
+    
+    # Phase 2
+    manager = HierarchicalManager(pivotal_states, config['neighborhood_size'], config['manager_horizon'])
+    worker = HierarchicalWorker(world_graph, pivotal_states)
+    
+    manager.initialize_from_goal_policy(policy)
+    worker.initialize_from_goal_policy(policy)
+    
+    env.phase = 2
+    trainer = HierarchicalTrainer(manager, worker, env, horizon=config['manager_horizon'])
+    
+    print("\nPHASE 2: Hierarchical Training")
+    
+    # Tracking
+    metrics = {
+        'rewards': [],
+        'steps': [],
+        'manager_updates': [],
+        'worker_updates': [],
+        'traversals': [],
+        'times': []
+    }
+    
+    for episode in range(config['phase2_episodes']):
+        ep_start = time.time()
+        stats = trainer.train_episode(max_steps=config['max_steps_per_episode'])
+        
+        metrics['rewards'].append(stats['episode_reward'])
+        metrics['steps'].append(stats['episode_steps'])
+        metrics['manager_updates'].append(stats['manager_updates'])
+        metrics['worker_updates'].append(stats['worker_updates'])
+        metrics['times'].append(time.time() - ep_start)
+        
+        if (episode + 1) % 10 == 0:
+            recent = metrics['rewards'][-10:]
+            print(f"Ep {episode+1}: avg_reward={sum(recent)/10:.2f}, "
+                  f"last={stats['episode_reward']:.2f}, "
+                  f"time={metrics['times'][-1]:.1f}s")
+    
+    # Results
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE")
+    print("="*70)
+    print(f"Phase 1 time: {phase1_time:.1f}s")
+    print(f"Phase 2 time: {sum(metrics['times']):.1f}s")
+    print(f"Best reward: {max(metrics['rewards']):.2f}")
+    print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:])/10:.2f}")
+    print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
+    print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
+    
+    # Plots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    axes[0, 0].plot(metrics['rewards'])
+    axes[0, 0].set_title('Episode Rewards')
+    axes[0, 0].set_xlabel('Episode')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    axes[0, 1].plot(metrics['steps'])
+    axes[0, 1].set_title('Episode Lengths')
+    axes[0, 1].set_xlabel('Episode')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    axes[1, 0].plot(metrics['manager_updates'], label='Manager')
+    axes[1, 0].plot(metrics['worker_updates'], label='Worker')
+    axes[1, 0].set_title('Updates per Episode')
+    axes[1, 0].set_xlabel('Episode')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    axes[1, 1].plot(metrics['times'])
+    axes[1, 1].set_title('Time per Episode')
+    axes[1, 1].set_xlabel('Episode')
+    axes[1, 1].set_ylabel('Seconds')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('training_diagnostics.png')
+    print("\nPlots saved to training_diagnostics.png")
 
 def main():
     # pygame.init()
@@ -846,7 +968,8 @@ def main():
     # enable manual control for testing
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
-    test_phase2_with_real_environment()
+    
+    train_full_phase1_phase2()
 
 
 if __name__ == "__main__":
