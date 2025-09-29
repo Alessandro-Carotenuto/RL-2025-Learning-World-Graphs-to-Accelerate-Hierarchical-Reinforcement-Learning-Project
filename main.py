@@ -279,7 +279,7 @@ def test_goal_policy_with_maze():
     env.phase = 1
     
     # Disable random generation to get consistent clean mazes
-    env.randomgen = False
+    env.randomgen = True
     
     # Create goal-conditioned policy
     policy = GoalConditionedPolicy(lr=1e-3)
@@ -524,7 +524,7 @@ def test_goal_policy_with_curiosity():
         mode=EnvModes.MULTIGOAL
     )
     env.phase = 1
-    env.randomgen = False
+    env.randomgen = True
     
     # Create goal-conditioned policy
     policy = GoalConditionedPolicy(lr=1e-3)
@@ -627,7 +627,7 @@ def test_goal_policy_with_improved_curiosity():
         mode=EnvModes.MULTIGOAL
     )
     env.phase = 1
-    env.randomgen = False
+    env.randomgen = True
     
     # Create goal-conditioned policy
     policy = GoalConditionedPolicy(lr=1e-3)
@@ -745,7 +745,7 @@ def test_alternating_training():
     # Setup
     env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
     env.phase = 1
-    env.randomgen = False
+    env.randomgen = True
     
     policy = GoalConditionedPolicy(lr=1e-3)
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=3.0, grid_size=env.size)
@@ -836,15 +836,772 @@ def test_graph_visualizer():
         plt.show()
         print(f"Shortest path from (1,1) to (6,3): {path}, distance: {distance}")
 
+# GRAPH UPDATED TESTS MECHANISTICS -----------------------------------------
+
+def test_edge_action_storage():
+    """Test that edge refinement stores action sequences correctly."""
+    print("Testing Edge Action Storage:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.policy_networks import GoalConditionedPolicy
+    from utils.graph_manager import GraphManager
+    
+    # Create environment
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = True
+    
+    # Create policy
+    policy = GoalConditionedPolicy(lr=5e-3, verbose=True)
+    
+    # Sample pivotal states close together for easy testing
+    pivotal_states = [(2, 2), (5, 5)]
+    
+    print(f"Testing edge discovery between: {pivotal_states}")
+    
+    # Discover edges
+    raw_edges = policy.discover_edges_between_pivotal_states(
+        env, pivotal_states, max_walk_length=15, num_attempts=5
+    )
+    
+    print(f"\nDiscovered {len(raw_edges)} raw edges")
+    for (start, end), path in raw_edges.items():
+        print(f"  {start} -> {end}: {len(path)} positions")
+    
+    # Refine with policy (should now store actions)
+    refined_edges = policy.refine_paths_with_goal_policy(env, raw_edges)
+    
+    print(f"\nRefined edges with action sequences:")
+    for (start, end), (path, weight, actions) in refined_edges.items():
+        print(f"  {start} -> {end}:")
+        print(f"    Path length: {len(path)} positions")
+        print(f"    Weight: {weight}")
+        print(f"    Actions: {len(actions)} actions: {actions}")
+        
+        # Verify action count matches path
+        expected_actions = len(path) - 1
+        if len(actions) == expected_actions:
+            print(f"    ✓ Action count correct ({len(actions)} == {expected_actions})")
+        else:
+            print(f"    ✗ Action count mismatch! Got {len(actions)}, expected {expected_actions}")
+    
+    print("\n" + "=" * 60)
+    return refined_edges
+
+def test_graph_manager_action_storage():
+    """Test that GraphManager stores and retrieves actions correctly."""
+    print("Testing GraphManager Action Storage:")
+    print("=" * 60)
+    
+    from utils.graph_manager import GraphManager
+    
+    # Create graph
+    graph = GraphManager()
+    
+    # Add nodes
+    nodes = [(2, 2), (5, 5), (8, 8)]
+    for node in nodes:
+        graph.add_node(node)
+    
+    # Add edges WITH action sequences
+    test_actions_1 = [2, 2, 1, 2, 2]  # move, move, turn_right, move, move
+    test_actions_2 = [2, 0, 2, 2]     # move, turn_left, move, move
+    
+    graph.add_edge((2, 2), (5, 5), weight=5, action_sequence=test_actions_1)
+    graph.add_edge((5, 5), (8, 8), weight=4, action_sequence=test_actions_2)
+    
+    print(f"Added {len(graph.nodes)} nodes")
+    print(f"Added {len(graph.edges)} edges with actions")
+    
+    # Retrieve actions
+    print("\nRetrieving action sequences:")
+    
+    actions_1 = graph.get_edge_actions((2, 2), (5, 5))
+    print(f"  (2,2) -> (5,5): {actions_1}")
+    assert actions_1 == test_actions_1, "Action retrieval failed!"
+    print("    ✓ Correct")
+    
+    actions_2 = graph.get_edge_actions((5, 5), (8, 8))
+    print(f"  (5,5) -> (8,8): {actions_2}")
+    assert actions_2 == test_actions_2, "Action retrieval failed!"
+    print("    ✓ Correct")
+    
+    # Test non-existent edge
+    actions_none = graph.get_edge_actions((2, 2), (8, 8))
+    print(f"  Non-existent edge: {actions_none}")
+    assert actions_none is None, "Should return None for non-existent edge!"
+    print("    ✓ Correct (None)")
+    
+    print("\n" + "=" * 60)
+    return graph
+
+def test_worker_action_execution():
+    """Test that Worker executes stored actions during traversal."""
+    print("Testing Worker Action Execution:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.hierarchical_system import HierarchicalWorker
+    from utils.graph_manager import GraphManager
+    
+    # Create graph with known actions
+    graph = GraphManager()
+    pivotal_states = [(2, 2), (5, 5)]
+    
+    for state in pivotal_states:
+        graph.add_node(state)
+    
+    # Manually create a simple action sequence
+    # For testing: just move forward 3 times
+    test_actions = [2, 2, 2]  # 3x move_forward
+    graph.add_edge((2, 2), (5, 5), weight=3, action_sequence=test_actions)
+    
+    # Create worker
+    worker = HierarchicalWorker(graph, pivotal_states, verbose=True)
+    
+    print(f"Created worker with graph:")
+    print(f"  Nodes: {graph.nodes}")
+    print(f"  Edge (2,2)->(5,5) actions: {graph.get_edge_actions((2,2), (5,5))}")
+    
+    # Simulate traversal
+    print(f"\nSimulating traversal from (2,2) to (5,5):")
+    
+    current_state = (2, 2)
+    wide_goal = (5, 5)
+    narrow_goal = (5, 5)
+    
+    # Check if traversal should be initiated
+    should_traverse = worker.should_traverse(current_state, wide_goal)
+    print(f"  Should traverse: {should_traverse}")
+    
+    if should_traverse:
+        # Plan traversal
+        path = worker.plan_traversal(current_state, wide_goal)
+        print(f"  Planned path: {path}")
+        
+        # Manually set traversal path (simulating what get_action does)
+        worker.current_traversal_path = path
+        worker.traversal_step = 0
+        
+        # Execute traversal steps
+        executed_actions = []
+        for step in range(len(path) - 1):
+            action, log_prob, value = worker.get_action(current_state, wide_goal, narrow_goal)
+            executed_actions.append(action)
+            print(f"  Step {step+1}: action={action} (expected={test_actions[step] if step < len(test_actions) else 'N/A'})")
+            
+            # Check if action matches
+            if step < len(test_actions):
+                if action == test_actions[step]:
+                    print(f"    ✓ Correct action")
+                else:
+                    print(f"    ✗ WRONG action! Expected {test_actions[step]}, got {action}")
+        
+        print(f"\n  Executed actions: {executed_actions}")
+        print(f"  Expected actions: {test_actions}")
+        
+        if executed_actions == test_actions:
+            print("  ✓ ALL ACTIONS CORRECT!")
+        else:
+            print("  ✗ Action sequence mismatch")
+    else:
+        print("  ✗ Traversal not initiated (shouldn't happen)")
+    
+    print("\n" + "=" * 60)
+
+def test_full_traversal_in_environment():
+    """Test complete traversal flow in actual environment."""
+    print("Testing Full Traversal in Environment:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.policy_networks import GoalConditionedPolicy
+    from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker
+    import traceback
+    
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = True
+    
+    print("Quick Phase 1 to get pivotal states and graph...")
+    policy = GoalConditionedPolicy(lr=5e-3)
+    
+    pivotal_states = [(2, 2), (5, 5), (7, 7)]
+    
+    try:
+        print("\nStep 1: Discovering edges...")
+        raw_edges = policy.discover_edges_between_pivotal_states(
+            env, pivotal_states, max_walk_length=20, num_attempts=3
+        )
+        print(f"  Found {len(raw_edges)} raw edges")
+        
+        print("\nStep 2: Refining edges...")
+        refined_edges = policy.refine_paths_with_goal_policy(env, raw_edges)
+        print(f"  Refined {len(refined_edges)} edges")
+        
+        # DEBUG: Verify structure
+        print("\nStep 3: Verifying refined_edges structure...")
+        for key, value in refined_edges.items():
+            print(f"  Edge {key}:")
+            print(f"    Type: {type(value)}")
+            print(f"    Length: {len(value)}")
+            if len(value) == 3:
+                path, weight, actions = value
+                print(f"    ✓ Correct 3-tuple: path={len(path)}, weight={weight}, actions={len(actions)}")
+            else:
+                print(f"    ✗ WRONG! Expected 3-tuple, got: {value}")
+        
+        print("\nStep 4: Constructing world graph...")
+        world_graph = policy.construct_world_graph(pivotal_states, refined_edges)
+        print(f"  ✓ Graph constructed successfully")
+        
+        print("\nStep 5: Creating hierarchical system...")
+        manager = HierarchicalManager(pivotal_states, neighborhood_size=3, horizon=10)
+        worker = HierarchicalWorker(world_graph, pivotal_states, verbose=True)
+        
+        manager.initialize_from_goal_policy(policy)
+        worker.initialize_from_goal_policy(policy)
+        
+        print("  ✓ Hierarchical system created")
+        
+    except Exception as e:
+        print(f"\n✗ ERROR at some step:")
+        print(f"  Message: {e}")
+        print(f"\nFull traceback:")
+        traceback.print_exc()
+        raise
+    
+    print("\n" + "=" * 60)
+
+def run_all_traversal_tests():
+    """Run all traversal tests in sequence."""
+    print("\n" + "#" * 60)
+    print("RUNNING ALL GRAPH TRAVERSAL TESTS")
+    print("#" * 60 + "\n")
+    
+    try:
+        print("Test 1: Edge Action Storage")
+        refined_edges = test_edge_action_storage()
+        print("\n✓ Test 1 passed\n")
+    except Exception as e:
+        print(f"\n✗ Test 1 failed: {e}\n")
+        return
+    
+    try:
+        print("Test 2: GraphManager Action Storage")
+        graph = test_graph_manager_action_storage()
+        print("\n✓ Test 2 passed\n")
+    except Exception as e:
+        print(f"\n✗ Test 2 failed: {e}\n")
+        return
+    
+    try:
+        print("Test 3: Worker Action Execution")
+        test_worker_action_execution()
+        print("\n✓ Test 3 passed\n")
+    except Exception as e:
+        print(f"\n✗ Test 3 failed: {e}\n")
+        return
+    
+    try:
+        print("Test 4: Full Traversal in Environment")
+        test_full_traversal_in_environment()
+        print("\n✓ Test 4 passed\n")
+    except Exception as e:
+        print(f"\n✗ Test 4 failed: {e}\n")
+        return
+    
+    print("\n" + "#" * 60)
+    print("ALL TESTS PASSED!")
+    print("#" * 60)
+
+# GRAPH UPDATE TESTS INTEGRATION -------------------------------------------------
+
+def test_ball_collection_mechanics():
+    """Test that balls are collected automatically when stepping on them."""
+    print("Testing Ball Collection Mechanics:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    env.phase = 2  # Phase 2 has balls
+    env.randomgen = True
+    
+    obs = env.reset()
+    print(f"Environment reset in Phase 2")
+    print(f"Agent position: {env.agent_pos}")
+    print(f"Total balls: {env.total_balls}")
+    print(f"Active balls: {len(env.active_balls)}")
+    print(f"Ball positions: {list(env.active_balls)[:3]}...")
+    
+    # Find a ball and navigate to it
+    if len(env.active_balls) > 0:
+        target_ball = list(env.active_balls)[0]
+        print(f"\nTarget ball at: {target_ball}")
+        
+        initial_balls = len(env.active_balls)
+        
+        # Navigate toward ball (simplified - just demonstrate mechanics)
+        collected = False
+        for step in range(50):
+            # Simple navigation toward ball
+            current_pos = tuple(env.agent_pos)
+            
+            # Determine action to move toward ball
+            dx = target_ball[0] - current_pos[0]
+            dy = target_ball[1] - current_pos[1]
+            
+            if abs(dx) > abs(dy):
+                action = 2  # move_forward (assuming facing right direction)
+            else:
+                action = 2
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            new_pos = tuple(env.agent_pos)
+            
+            # Check if we collected the ball
+            if new_pos == target_ball and target_ball not in env.active_balls:
+                print(f"  Step {step+1}: Ball collected!")
+                print(f"    Position: {new_pos}")
+                print(f"    Reward: {reward}")
+                print(f"    Active balls remaining: {len(env.active_balls)}")
+                collected = True
+                break
+            
+            if new_pos != current_pos:
+                print(f"  Step {step+1}: Moved to {new_pos}, distance to ball: {abs(dx) + abs(dy)}")
+        
+        if collected:
+            print("\n✓ Ball collection mechanics working!")
+        else:
+            print("\n✗ Could not collect ball (may need better navigation)")
+    else:
+        print("✗ No balls spawned in Phase 2!")
+    
+    print("\n" + "=" * 60)
+
+def test_phase_switching():
+    """Test Phase 1 (empty) vs Phase 2 (with balls) switching."""
+    print("Testing Phase Switching:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    
+    # Test Phase 1
+    print("Phase 1 (empty maze for graph discovery):")
+    env.phase = 1
+    env.randomgen = True
+    obs = env.reset()
+    
+    print(f"  Agent position: {env.agent_pos}")
+    print(f"  Active balls: {len(env.active_balls)}")
+    
+    # Count items in grid
+    items_phase1 = 0
+    for x in range(1, env.size-1):
+        for y in range(1, env.size-1):
+            cell = env.grid.get(x, y)
+            if cell is not None and not isinstance(cell, type(env.grid.get(0, 0))):
+                items_phase1 += 1
+    
+    print(f"  Items in maze: {items_phase1}")
+    assert env.total_balls == 0, "Phase 1 should have no balls!"
+    print("  ✓ Phase 1: Empty maze as expected")
+    
+    # Test Phase 2
+    print("\nPhase 2 (with balls for task):")
+    env.phase = 2
+    env.randomgen = True
+    obs = env.reset()
+    
+    print(f"  Agent position: {env.agent_pos}")
+    print(f"  Total balls: {env.total_balls}")
+    print(f"  Active balls: {len(env.active_balls)}")
+    
+    assert env.total_balls > 0, "Phase 2 should have balls!"
+    assert len(env.active_balls) > 0, "Phase 2 should have active balls!"
+    print("  ✓ Phase 2: Balls spawned as expected")
+    
+    print("\n" + "=" * 60)
+
+def test_worker_navigation_in_maze():
+    """Test Worker can actually navigate in the real maze."""
+    print("Testing Worker Navigation in Real Maze:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.policy_networks import GoalConditionedPolicy
+    from local_networks.hierarchical_system import HierarchicalWorker
+    from utils.graph_manager import GraphManager
+    
+    # Create environment
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = True
+    obs = env.reset()
+    
+    # Create simple graph
+    graph = GraphManager()
+    pivotal_states = [(2, 2), (5, 5)]
+    for state in pivotal_states:
+        graph.add_node(state)
+    
+    # Create worker
+    worker = HierarchicalWorker(graph, pivotal_states, verbose=True)
+    policy = GoalConditionedPolicy(lr=5e-3)
+    worker.initialize_from_goal_policy(policy)
+    
+    # Place agent at start
+    env.agent_pos = (2, 2)
+    env.agent_dir = 0
+    
+    print(f"Starting navigation test:")
+    print(f"  Start: {tuple(env.agent_pos)}")
+    print(f"  Goal: (5, 5)")
+    
+    # Navigate using worker policy
+    for step in range(30):
+        current_pos = tuple(env.agent_pos)
+        wide_goal = (5, 5)
+        narrow_goal = (5, 5)
+        
+        # Get action from worker
+        action, log_prob, value = worker.get_action(current_pos, wide_goal, narrow_goal)
+        
+        action_names = ['turn_left', 'turn_right', 'move_forward']
+        print(f"  Step {step+1}: pos={current_pos}, action={action_names[action]}")
+        
+        # Take step
+        try:
+            obs, reward, terminated, truncated, info = env.step(action)
+            new_pos = tuple(env.agent_pos)
+            
+            if new_pos != current_pos:
+                print(f"    -> moved to {new_pos}")
+            
+            # Check if reached goal
+            if new_pos == wide_goal:
+                print(f"  ✓ GOAL REACHED in {step+1} steps!")
+                break
+            
+            if terminated or truncated:
+                print(f"  Episode ended")
+                break
+                
+        except (AssertionError, IndexError) as e:
+            print(f"    Action failed (out of bounds): {e}")
+            continue
+    else:
+        print(f"  ✗ Did not reach goal in 30 steps")
+    
+    print("\n" + "=" * 60)
+
+def test_manager_worker_coordination():
+    """Test Manager and Worker work together in environment."""
+    print("Testing Manager-Worker Coordination:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.policy_networks import GoalConditionedPolicy
+    from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker
+    from utils.graph_manager import GraphManager
+    
+    # Setup
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = True
+    obs = env.reset()
+    
+    # Create simple graph
+    graph = GraphManager()
+    pivotal_states = [(2, 2), (4, 4), (6, 6)]
+    for state in pivotal_states:
+        graph.add_node(state)
+    
+    # Create hierarchical system
+    manager = HierarchicalManager(pivotal_states, neighborhood_size=3, horizon=10)
+    worker = HierarchicalWorker(graph, pivotal_states, verbose=False)
+    
+    policy = GoalConditionedPolicy(lr=5e-3)
+    manager.initialize_from_goal_policy(policy)
+    worker.initialize_from_goal_policy(policy)
+    
+    # Place agent
+    env.agent_pos = (2, 2)
+    env.agent_dir = 0
+    
+    print(f"Testing Manager-Worker coordination:")
+    print(f"  Pivotal states: {pivotal_states}")
+    print(f"  Starting at: {tuple(env.agent_pos)}")
+    
+    # Simulate one horizon
+    current_state = tuple(env.agent_pos)
+    
+    # Manager selects goals
+    print(f"\nManager decision:")
+    wide_goal, narrow_goal, manager_log_prob, manager_value = manager.get_manager_action(current_state)
+    print(f"  Wide goal (pivotal): {wide_goal}")
+    print(f"  Narrow goal (local): {narrow_goal}")
+    print(f"  Manager value estimate: {manager_value.item():.3f}")
+    
+    # Worker executes
+    print(f"\nWorker execution (horizon=10):")
+    horizon_reward = 0
+    
+    for h in range(10):
+        current_pos = tuple(env.agent_pos)
+        
+        # Worker action
+        action, worker_log_prob, worker_value = worker.get_action(
+            current_pos, wide_goal, narrow_goal
+        )
+        
+        action_names = ['turn_left', 'turn_right', 'move_forward']
+        
+        # Environment step
+        try:
+            obs, reward, terminated, truncated, info = env.step(action)
+            new_pos = tuple(env.agent_pos)
+            
+            horizon_reward += reward
+            
+            if new_pos != current_pos or h % 3 == 0:
+                print(f"  Step {h+1}: {current_pos} -> {action_names[action]} -> {new_pos}, reward={reward:.3f}")
+            
+            # Check goal reached
+            worker_reward = worker.compute_reward(new_pos, wide_goal, narrow_goal)
+            if worker_reward > 0:
+                print(f"  ✓ Worker reached goal! Internal reward: {worker_reward}")
+                break
+            
+            if terminated or truncated:
+                break
+                
+        except (AssertionError, IndexError):
+            continue
+    
+    print(f"\nHorizon summary:")
+    print(f"  Total horizon reward: {horizon_reward:.3f}")
+    print(f"  Manager receives this as feedback")
+    
+    print("\n" + "=" * 60)
+
+def test_complete_episode_with_balls():
+    """Test complete episode flow with ball collection."""
+    print("Testing Complete Episode with Ball Collection:")
+    print("=" * 60)
+    
+    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
+    from local_networks.policy_networks import GoalConditionedPolicy
+    from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
+    from utils.graph_manager import GraphManager
+    
+    # Setup environment in Phase 2 (with balls)
+    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
+    
+    # Do quick Phase 1 first
+    print("Quick Phase 1 simulation...")
+    env.phase = 1
+    env.randomgen = True
+    obs = env.reset()
+    
+    # Use predetermined pivotal states
+    pivotal_states = [(2, 2), (4, 4), (6, 6), (3, 7), (7, 3)]
+    
+    # Create minimal graph
+    graph = GraphManager()
+    for state in pivotal_states:
+        graph.add_node(state)
+    
+    # Create hierarchical system
+    manager = HierarchicalManager(pivotal_states, neighborhood_size=3, horizon=15)
+    worker = HierarchicalWorker(graph, pivotal_states, verbose=False)
+    
+    policy = GoalConditionedPolicy(lr=5e-3)
+    manager.initialize_from_goal_policy(policy)
+    worker.initialize_from_goal_policy(policy)
+    
+    # Switch to Phase 2
+    print("\nSwitching to Phase 2 (with balls)...")
+    env.phase = 2
+    trainer = HierarchicalTrainer(manager, worker, env, horizon=15)
+    
+    # Run one episode
+    print("\nRunning test episode:")
+    stats = trainer.train_episode(max_steps=100)
+    
+    print(f"\nEpisode results:")
+    print(f"  Total reward: {stats['episode_reward']:.2f}")
+    print(f"  Steps taken: {stats['episode_steps']}")
+    print(f"  Manager updates: {stats['manager_updates']}")
+    print(f"  Worker updates: {stats['worker_updates']}")
+    
+    if stats['episode_reward'] > 0:
+        print("  ✓ POSITIVE REWARD! Ball collection working!")
+    else:
+        print("  ✗ Negative reward (expected initially, will improve with training)")
+    
+    print("\n" + "=" * 60)
+
+def run_environment_integration_tests():
+    """Run all environment integration tests."""
+    print("\n" + "#" * 60)
+    print("ENVIRONMENT INTEGRATION TESTS")
+    print("#" * 60 + "\n")
+    
+    tests = [
+        ("Phase Switching", test_phase_switching),
+        ("Ball Collection", test_ball_collection_mechanics),
+        ("Worker Navigation", test_worker_navigation_in_maze),
+        ("Manager-Worker Coordination", test_manager_worker_coordination),
+        ("Complete Episode", test_complete_episode_with_balls),
+    ]
+    
+    passed = 0
+    failed = 0
+    
+    for name, test_func in tests:
+        try:
+            print(f"\n{'='*60}")
+            print(f"Running: {name}")
+            print('='*60)
+            test_func()
+            print(f"\n✓ {name} PASSED\n")
+            passed += 1
+        except Exception as e:
+            import traceback
+            print(f"\n✗ {name} FAILED:")
+            print(f"  Error: {e}")
+            traceback.print_exc()
+            failed += 1
+    
+    print("\n" + "#" * 60)
+    print(f"RESULTS: {passed} passed, {failed} failed")
+    print("#" * 60)
+
+def test_phase2_ball_spawning():
+    """Debug test: Do balls spawn during Phase 2 training?"""
+    env = MinigridWrapper(size=EnvSizes.MEDIUM, mode=EnvModes.MULTIGOAL)
+    env.phase = 2
+    env.randomgen = True
+    
+    for i in range(5):
+        obs = env.reset()
+        print(f"Reset {i+1}: {len(env.active_balls)} balls at {list(env.active_balls)[:3]}")
+# COMPREHENSIVE TEST SUITE ----------------------------------------------------
+
+def run_all_comprehensive_tests():
+    """Run all tests - traversal mechanics + environment integration."""
+    print("\n" + "#" * 70)
+    print("COMPREHENSIVE TEST SUITE")
+    print("#" * 70 + "\n")
+    
+    results = {
+        'traversal': {'passed': 0, 'failed': 0, 'tests': []},
+        'environment': {'passed': 0, 'failed': 0, 'tests': []}
+    }
+    
+    # Part 1: Graph Traversal Tests
+    print("\n" + "=" * 70)
+    print("PART 1: GRAPH TRAVERSAL MECHANICS")
+    print("=" * 70 + "\n")
+    
+    traversal_tests = [
+        ("Edge Action Storage", test_edge_action_storage),
+        ("GraphManager Storage", test_graph_manager_action_storage),
+        ("Worker Action Execution", test_worker_action_execution),
+        ("Full Traversal Integration", test_full_traversal_in_environment),
+    ]
+    
+    for name, test_func in traversal_tests:
+        try:
+            print(f"\nRunning: {name}")
+            print("-" * 60)
+            test_func()
+            print(f"✓ {name} PASSED")
+            results['traversal']['passed'] += 1
+            results['traversal']['tests'].append((name, 'PASS'))
+        except Exception as e:
+            print(f"✗ {name} FAILED: {e}")
+            results['traversal']['failed'] += 1
+            results['traversal']['tests'].append((name, 'FAIL', str(e)))
+    
+    # Part 2: Environment Integration Tests
+    print("\n" + "=" * 70)
+    print("PART 2: ENVIRONMENT INTEGRATION")
+    print("=" * 70 + "\n")
+    
+    env_tests = [
+        ("Phase Switching", test_phase_switching),
+        ("Ball Collection", test_ball_collection_mechanics),
+        ("Worker Navigation", test_worker_navigation_in_maze),
+        ("Manager-Worker Coordination", test_manager_worker_coordination),
+        ("Complete Episode", test_complete_episode_with_balls),
+    ]
+    
+    for name, test_func in env_tests:
+        try:
+            print(f"\nRunning: {name}")
+            print("-" * 60)
+            test_func()
+            print(f"✓ {name} PASSED")
+            results['environment']['passed'] += 1
+            results['environment']['tests'].append((name, 'PASS'))
+        except Exception as e:
+            import traceback
+            print(f"✗ {name} FAILED: {e}")
+            # Print short traceback
+            traceback.print_exc()
+            results['environment']['failed'] += 1
+            results['environment']['tests'].append((name, 'FAIL', str(e)))
+    
+    # Final Summary
+    print("\n" + "#" * 70)
+    print("FINAL TEST SUMMARY")
+    print("#" * 70)
+    
+    total_passed = results['traversal']['passed'] + results['environment']['passed']
+    total_failed = results['traversal']['failed'] + results['environment']['failed']
+    total_tests = total_passed + total_failed
+    
+    print(f"\nGraph Traversal: {results['traversal']['passed']}/{results['traversal']['passed'] + results['traversal']['failed']} passed")
+    for test in results['traversal']['tests']:
+        status = "✓" if test[1] == 'PASS' else "✗"
+        print(f"  {status} {test[0]}")
+        if test[1] == 'FAIL':
+            print(f"    Error: {test[2][:80]}...")
+    
+    print(f"\nEnvironment Integration: {results['environment']['passed']}/{results['environment']['passed'] + results['environment']['failed']} passed")
+    for test in results['environment']['tests']:
+        status = "✓" if test[1] == 'PASS' else "✗"
+        print(f"  {status} {test[0]}")
+        if test[1] == 'FAIL':
+            print(f"    Error: {test[2][:80]}...")
+    
+    print(f"\n{'='*70}")
+    print(f"OVERALL: {total_passed}/{total_tests} tests passed ({total_passed/total_tests*100:.1f}%)")
+    print(f"{'='*70}")
+    
+    if total_failed == 0:
+        print("\n🎉 ALL TESTS PASSED! Ready for training.")
+    else:
+        print(f"\n⚠️  {total_failed} test(s) failed. Review errors above.")
+    
+    return results
+
 # ACTUAL TRAINING CODE ----------------------------------------------------
 
 def train_full_phase1_phase2():
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters
     config = {
-        'maze_size': EnvSizes.MEDIUM,
+        'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 8,
-        'phase2_episodes': 500,
+        'phase2_episodes': 10,
         'max_steps_per_episode': 500,
         'manager_horizon': 20,
         'neighborhood_size': 5,
@@ -862,7 +1619,7 @@ def train_full_phase1_phase2():
     # Phase 1
     env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL)
     env.phase = 1
-    env.randomgen = False
+    env.randomgen = True
     
     policy = GoalConditionedPolicy(lr=config['manager_lr'])
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
@@ -968,9 +1725,9 @@ def main():
     # enable manual control for testing
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
-    
-    train_full_phase1_phase2()
 
+    train_full_phase1_phase2()
+    #test_phase2_ball_spawning()
 
 if __name__ == "__main__":
     main()

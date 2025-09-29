@@ -613,7 +613,7 @@ class MinigridWrapper(MiniGridEnv):
                 py = reachables[point][1]
                 
             self.grid.set(px, py, Ball(COLOR_NAMES[i]))
-            print("BALL PLACED", px, py)
+            #print("BALL PLACED", px, py)
             self.placeable_grid[px][py] = False
             ballpos.append((px, py))
         
@@ -719,16 +719,16 @@ class MinigridWrapper(MiniGridEnv):
                     if isinstance(fwd_cell, Ball) and tuple(fwd_pos) in self.active_balls:
                         self.grid.set(fwd_pos[0], fwd_pos[1], None)
                         self.active_balls.remove(tuple(fwd_pos))
-                        self.balls_collected += 5
+                        self.balls_collected += 1
                         ball_collected = True
         
         obs, reward, terminated, truncated, info = super().step(action)
         
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2 and ball_collected:
-            reward += 1.0
+            reward += 5.0
             if len(self.active_balls) == 0:
                 terminated = True
-                reward += 5.0
+                reward += 10.0
         
         return obs, reward, terminated, truncated, info
 

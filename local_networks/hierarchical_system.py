@@ -597,9 +597,15 @@ class HierarchicalWorker(nn.Module):
             current_pos = self.current_traversal_path[self.traversal_step]
             next_pos = self.current_traversal_path[self.traversal_step + 1]
             
-            # Determine action needed (simplified: assumes agent faces correct direction)
-            # In reality, would use stored edge action sequences
-            action = 2  # move_forward (placeholder)
+            # Get stored action sequence from graph
+            edge_actions = self.world_graph.get_edge_actions(current_pos, next_pos)
+            
+            if edge_actions and self.traversal_step < len(edge_actions):
+                # Use actual stored action
+                action = edge_actions[self.traversal_step]
+            else:
+                # Fallback to move_forward if no actions stored
+                action = 2
             
             self.traversal_step += 1
             
@@ -919,6 +925,11 @@ class HierarchicalTrainer:
         """
         # Reset environment and networks
         obs = self.env.reset()
+
+        # DEBUG: Check if balls spawned
+        if hasattr(self.env, 'active_balls'):
+            print(f"Episode start: {len(self.env.active_balls)} balls active")
+
         state = tuple(self.env.agent_pos)
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
@@ -977,7 +988,9 @@ class HierarchicalTrainer:
                     terminated = False
                     truncated = False
                 
-                next_state = tuple(self.env.agent_pos)
+                # DEBUG: Print non-zero rewards
+                if env_reward != 0:
+                    print(f"    Step {episode_steps}: reward={env_reward:.3f}, pos={next_state}, balls={len(self.env.active_balls)}")
                 
                 # Worker reward (internal)
                 worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
@@ -1033,6 +1046,9 @@ class HierarchicalTrainer:
             if terminated or truncated:
                 break
         
+        if episode_steps % 100 == 0:  # Every 100th episode
+            print(f"  Debug: horizon_rewards={episode_reward:.2f}, balls_left={len(self.env.active_balls) if hasattr(self.env, 'active_balls') else 'N/A'}")
+
         return {
             'episode_reward': episode_reward,
             'episode_steps': episode_steps,

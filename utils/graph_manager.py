@@ -11,22 +11,29 @@ import numpy as np
 
 class GraphManager:
     def __init__(self):
-        self.nodes= set() #handles double things
-        self.edges= {}
+        self.nodes = set()
+        self.edges = {}
+        self.edge_actions = {}  # NEW: Store action sequences
         
-    def add_node(self,node):
+    def add_node(self, node):
         self.nodes.add(node)
     
-    def add_edge(self,node1,node2,weight):
-        self.edges[(node1,node2)]=weight
-        
-    def get_neighbors(self,node):
-        neigh=set()
-        for (n1,n2) in self.edges.keys():
-            if n1==node:
+    def add_edge(self, node1, node2, weight, action_sequence=None):  # NEW parameter
+        self.edges[(node1, node2)] = weight
+        if action_sequence is not None:
+            self.edge_actions[(node1, node2)] = action_sequence
+    
+    def get_edge_actions(self, node1, node2):  # NEW method
+        """Get stored action sequence for edge."""
+        return self.edge_actions.get((node1, node2), None)
+    
+    def get_neighbors(self, node):
+        """Get all neighbors of a node."""
+        neigh = set()
+        for (n1, n2) in self.edges.keys():
+            if n1 == node:
                 neigh.add(n2)
         return neigh
-    
     
     #THE NEXT FUNCTION HAS TO BE REVISED IN THE FUTURE
     def shortest_path(self, start, end):

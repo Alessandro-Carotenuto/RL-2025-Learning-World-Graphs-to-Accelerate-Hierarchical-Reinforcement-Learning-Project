@@ -531,17 +531,12 @@ class GoalConditionedPolicy(nn.Module):
         print(f"Discovered {len(discovered_edges)} edges between pivotal states")
         return discovered_edges
     
-    def refine_paths_with_goal_policy(self, env, raw_edges: Dict[Tuple, List[Tuple]]) -> Dict[Tuple, Tuple[List[Tuple], int]]:
+    def refine_paths_with_goal_policy(self, env, raw_edges: Dict[Tuple, List[Tuple]]) -> Dict[Tuple, Tuple[List[Tuple], int, List[int]]]:
         """
         Refine discovered edge paths using goal-conditioned policy.
-        Paper: "Each path is further refined by πg if feasible"
         
-        Args:
-            env: Environment
-            raw_edges: Dict of (start, end) -> raw_path from random walks
-            
         Returns:
-            Dict of (start, end) -> (refined_path, weight)
+            Dict of (start, end) -> (refined_path, weight, action_sequence)
         """
         refined_edges = {}
         
@@ -550,25 +545,24 @@ class GoalConditionedPolicy(nn.Module):
         for (start_state, end_state), raw_path in raw_edges.items():
             print(f"  Refining {start_state} -> {end_state}")
             
-            # Try to use goal-conditioned policy to find better path
             try:
-                # Place agent at start state
                 env.reset()
                 env.agent_pos = start_state
                 env.agent_dir = 0
                 current_pos = start_state
                 
                 refined_path = [start_state]
-                max_refinement_steps = len(raw_path) + 5  # Allow slightly longer paths
+                action_sequence = []  # NEW: Store actions
+                max_refinement_steps = len(raw_path) + 5
                 
                 for step in range(max_refinement_steps):
-                    # Get action from goal-conditioned policy
                     action, log_prob, value = self.get_action(current_pos, end_state)
                     
-                    # Take step
+                    # Store action BEFORE taking step
+                    action_sequence.append(action)
+                    
                     obs, reward, terminated, truncated, info = env.step(action)
                     
-                    # Get new position
                     if hasattr(env, 'agent_pos') and env.agent_pos is not None:
                         new_pos = tuple(env.agent_pos)
                     else:
@@ -578,48 +572,44 @@ class GoalConditionedPolicy(nn.Module):
                         refined_path.append(new_pos)
                         current_pos = new_pos
                     
-                    # Check if reached target
                     if current_pos == end_state:
-                        # Use refined path if it's better (shorter or similar length)
-                        if len(refined_path) <= len(raw_path) * 1.2:  # Allow 20% longer paths
-                            edge_weight = len(refined_path) - 1  # Number of actions
-                            refined_edges[(start_state, end_state)] = (refined_path, edge_weight)
+                        if len(refined_path) <= len(raw_path) * 1.2:
+                            edge_weight = len(refined_path) - 1
+                            refined_edges[(start_state, end_state)] = (refined_path, edge_weight, action_sequence)
                             if self.verbose:
-                                print(f"    Refined: {len(refined_path)} steps (was {len(raw_path)})")
+                                print(f"    Refined: {len(refined_path)} steps, {len(action_sequence)} actions")
                         else:
-                            # Use raw path
+                            # Use raw path but need to generate dummy actions
                             edge_weight = len(raw_path) - 1
-                            refined_edges[(start_state, end_state)] = (raw_path, edge_weight)
+                            dummy_actions = [2] * (len(raw_path) - 1)  # All move_forward
+                            refined_edges[(start_state, end_state)] = (raw_path, edge_weight, dummy_actions)
                             print(f"    Kept raw: {len(raw_path)} steps (refinement too long)")
                         break
                         
                     if terminated or truncated:
                         break
                 else:
-                    # Policy couldn't reach target, use raw path
+                    # Failed - use raw path with dummy actions
                     edge_weight = len(raw_path) - 1
-                    refined_edges[(start_state, end_state)] = (raw_path, edge_weight)
+                    dummy_actions = [2] * (len(raw_path) - 1)
+                    refined_edges[(start_state, end_state)] = (raw_path, edge_weight, dummy_actions)
                     print(f"    Policy failed, kept raw: {len(raw_path)} steps")
                     
             except Exception as e:
-                # Fallback to raw path on any error
                 edge_weight = len(raw_path) - 1
-                refined_edges[(start_state, end_state)] = (raw_path, edge_weight)
+                dummy_actions = [2] * (len(raw_path) - 1)
+                refined_edges[(start_state, end_state)] = (raw_path, edge_weight, dummy_actions)
                 print(f"    Error during refinement, kept raw: {e}")
         
         return refined_edges
     
     def construct_world_graph(self, pivotal_states: List[Tuple[int, int]], 
-                             refined_edges: Dict[Tuple, Tuple[List[Tuple], int]]) -> GraphManager:
+                            refined_edges: Dict[Tuple, Tuple[List[Tuple], int, List[int]]]) -> GraphManager:
         """
-        Construct the final world graph with nodes and weighted edges.
+        Construct the final world graph with nodes, weighted edges, and action sequences.
         
         Args:
-            pivotal_states: List of pivotal state coordinates
-            refined_edges: Dict of (start, end) -> (path, weight)
-            
-        Returns:
-            GraphManager: Populated world graph
+            refined_edges: Dict of (start, end) -> (path, weight, action_sequence)
         """
         world_graph = GraphManager()
         
@@ -629,16 +619,16 @@ class GoalConditionedPolicy(nn.Module):
         for state in pivotal_states:
             world_graph.add_node(state)
         
-        # Add refined edges with weights
-        for (start_state, end_state), (path, weight) in refined_edges.items():
-            world_graph.add_edge(start_state, end_state, weight)
+        # Add refined edges with weights AND action sequences
+        for (start_state, end_state), (path, weight, action_sequence) in refined_edges.items():
+            world_graph.add_edge(start_state, end_state, weight, action_sequence)  # Pass actions
             if self.verbose:
-                print(f"  Edge: {start_state} -> {end_state}, weight: {weight}")
+                print(f"  Edge: {start_state} -> {end_state}, weight: {weight}, actions: {len(action_sequence)}")
         
         print(f"World graph constructed: {len(pivotal_states)} nodes, {len(refined_edges)} edges")
         
         return world_graph
-    
+
     def complete_world_graph_discovery(self, env, pivotal_states: List[Tuple[int, int]]) -> GraphManager:
         """
         Complete Phase 1 by discovering edges and constructing world graph.
@@ -682,3 +672,5 @@ class GoalConditionedPolicy(nn.Module):
         print("="*60)
         
         return world_graph
+    
+#c
