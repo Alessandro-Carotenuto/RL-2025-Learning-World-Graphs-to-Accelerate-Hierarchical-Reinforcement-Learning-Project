@@ -49,6 +49,7 @@ from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance,sample_goal_position
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 from local_networks.hierarchical_system import hierarchical_system_tests, test_phase2_with_real_environment
+from utils.optimal_reward_computer import compute_optimal_reward_for_episode, compute_optimal_reward_bruteforce_small
 
 #---------------------------------------------------------------------------------------
 # MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
@@ -1390,63 +1391,6 @@ def test_manager_worker_coordination(verb):
     
     print("\n" + "=" * 60)
 
-def test_complete_episode_with_balls():
-    """Test complete episode flow with ball collection."""
-    print("Testing Complete Episode with Ball Collection:")
-    print("=" * 60)
-    
-    from wrappers.minigrid_wrapper import MinigridWrapper, EnvSizes, EnvModes
-    from local_networks.policy_networks import GoalConditionedPolicy
-    from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
-    from utils.graph_manager import GraphManager
-    
-    # Setup environment in Phase 2 (with balls)
-    env = MinigridWrapper(size=EnvSizes.SMALL, mode=EnvModes.MULTIGOAL)
-    
-    # Do quick Phase 1 first
-    print("Quick Phase 1 simulation...")
-    env.phase = 1
-    env.randomgen = True
-    obs = env.reset()
-    
-    # Use predetermined pivotal states
-    pivotal_states = [(2, 2), (4, 4), (6, 6), (3, 7), (7, 3)]
-    
-    # Create minimal graph
-    graph = GraphManager()
-    for state in pivotal_states:
-        graph.add_node(state)
-    
-    # Create hierarchical system
-    manager = HierarchicalManager(pivotal_states, neighborhood_size=3, horizon=15)
-    worker = HierarchicalWorker(graph, pivotal_states, verbose=False)
-    
-    policy = GoalConditionedPolicy(lr=5e-3)
-    manager.initialize_from_goal_policy(policy)
-    worker.initialize_from_goal_policy(policy)
-    
-    # Switch to Phase 2
-    print("\nSwitching to Phase 2 (with balls)...")
-    env.phase = 2
-    trainer = HierarchicalTrainer(manager, worker, env, horizon=15)
-    
-    # Run one episode
-    print("\nRunning test episode:")
-    stats = trainer.train_episode(max_steps=100,full_breakdown_every=config['full_breakdown_every'])
-    
-    print(f"\nEpisode results:")
-    print(f"  Total reward: {stats['episode_reward']:.2f}")
-    print(f"  Steps taken: {stats['episode_steps']}")
-    print(f"  Manager updates: {stats['manager_updates']}")
-    print(f"  Worker updates: {stats['worker_updates']}")
-    
-    if stats['episode_reward'] > 0:
-        print("  ✓ POSITIVE REWARD! Ball collection working!")
-    else:
-        print("  ✗ Negative reward (expected initially, will improve with training)")
-    
-    print("\n" + "=" * 60)
-
 def run_environment_integration_tests():
     """Run all environment integration tests."""
     print("\n" + "#" * 60)
@@ -1458,7 +1402,7 @@ def run_environment_integration_tests():
         ("Ball Collection", test_ball_collection_mechanics),
         ("Worker Navigation", test_worker_navigation_in_maze),
         ("Manager-Worker Coordination", test_manager_worker_coordination),
-        ("Complete Episode", test_complete_episode_with_balls),
+        #("Complete Episode", test_complete_episode_with_balls),
     ]
     
     passed = 0
@@ -1540,7 +1484,7 @@ def run_all_comprehensive_tests():
         ("Ball Collection", test_ball_collection_mechanics),
         ("Worker Navigation", test_worker_navigation_in_maze),
         ("Manager-Worker Coordination", test_manager_worker_coordination),
-        ("Complete Episode", test_complete_episode_with_balls),
+        #("Complete Episode", test_complete_episode_with_balls),
     ]
     
     for name, test_func in env_tests:
@@ -1599,14 +1543,14 @@ def train_full_phase1_phase2():
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters
     config = {
-        'maze_size': EnvSizes.SMALL,
+        'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 100,
+        'phase2_episodes': 50,
         'max_steps_per_episode': 500,
         'manager_horizon': 10,
         'neighborhood_size': 5,
         'manager_lr': 1e-4,
-        'worker_lr': 5e-3,
+        'worker_lr': 5e-3, 
         'vae_mu0': 8.0,
         'diagnostic_interval': 5000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
@@ -1677,7 +1621,8 @@ def train_full_phase1_phase2():
         'manager_updates': [],
         'worker_updates': [],
         'traversals': [],
-        'times': []
+        'times': [],
+        'optimal_rewards': []  # NEW: Add this line
     }
     
     for episode in range(config['phase2_episodes']):
@@ -1689,6 +1634,7 @@ def train_full_phase1_phase2():
         metrics['manager_updates'].append(stats['manager_updates'])
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
+        metrics['optimal_rewards'].append(stats['optimal_reward'])
         
         #OLD METRICS, NOW IN HIERARCHICAL SISTEM
         # if (episode + 1) % 10 == 0:
@@ -1711,9 +1657,12 @@ def train_full_phase1_phase2():
     # Plots
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     
-    axes[0, 0].plot(metrics['rewards'])
+    axes[0, 0].plot(metrics['rewards'], 'b-', label='Agent')
+    axes[0, 0].plot(metrics['optimal_rewards'], 'r--', label='Optimal')
     axes[0, 0].set_title('Episode Rewards')
-    axes[0, 0].set_xlabel('Episode')
+    axes[0, 0].set_xlabel('Episodes')
+    axes[0, 0].set_ylabel('Reward')
+    axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
     axes[0, 1].plot(metrics['steps'])

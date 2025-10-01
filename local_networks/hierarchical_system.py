@@ -5,7 +5,7 @@ import torch.optim as optim
 from typing import List, Tuple, Dict, Optional
 import random
 import numpy as np
-
+from utils.optimal_reward_computer import compute_optimal_reward_for_episode
 
 class HierarchicalManager(nn.Module):
     """
@@ -1074,6 +1074,9 @@ class HierarchicalTrainer:
         # Reset environment and networks
         obs = self.env.reset()
         state = tuple(self.env.agent_pos)
+
+        optimal_reward, optimal_steps = compute_optimal_reward_for_episode(self.env)
+        
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
         
@@ -1281,6 +1284,8 @@ class HierarchicalTrainer:
             'final_entropy': manager_entropies[-1] if manager_entropies else 0,
             'unique_manager_goals': len(unique_manager_goals),
             'goal_diversity_history': goal_diversity_history,
+            'optimal_reward': optimal_reward,      # NEW
+            'optimal_steps': optimal_steps         # NEW
         }
 
 
