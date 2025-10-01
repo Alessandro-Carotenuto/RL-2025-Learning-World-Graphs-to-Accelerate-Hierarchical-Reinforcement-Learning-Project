@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from typing import List, Tuple, Dict, Optional
 import random
+import numpy as np
 
 
 class HierarchicalManager(nn.Module):
@@ -17,6 +18,8 @@ class HierarchicalManager(nn.Module):
                  neighborhood_size: int = 3,
                  lr: float = 5e-3,
                  horizon: int = 15,
+                 diagnostic_interval: int = 30,  # NEW
+                 diagnostic_checkstart: bool = True,  # NEW
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -61,6 +64,10 @@ class HierarchicalManager(nn.Module):
         self.gamma = 0.99
         self.entropy_coef = 0.01
         self.value_coef = 0.5
+
+        # Diagnostic parameters
+        self.diagnostic_interval = diagnostic_interval
+        self.diagnostic_checkstart = diagnostic_checkstart
     
     def reset_manager_state(self):
         """Reset LSTM hidden state and previous goals."""
@@ -162,110 +169,250 @@ class HierarchicalManager(nn.Module):
         
         return narrow_goal, narrow_log_prob
     
-    def get_manager_action(self, state: Tuple[int, int]) -> Tuple[Tuple[int, int], Tuple[int, int], torch.Tensor, torch.Tensor]:
-        """
-        Complete Wide-then-Narrow goal selection.
-        Paper: "Manager first selects a pivotal state and then specifies a final goal within nearby neighborhood"
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0):
+        """Complete Wide-then-Narrow goal selection with hidden state diagnostics."""
         
-        Returns:
-            wide_goal: Selected pivotal state
-            narrow_goal: Selected local goal
-            combined_log_prob: Combined log probability
-            value: State value estimate
-        """
+        # Configurable diagnostic printing
+        if self.diagnostic_checkstart and step_count < 15:
+            verbose = True
+        elif step_count % self.diagnostic_interval == 0:
+            verbose = True
+        else:
+            verbose = False
+        
+        if verbose:
+            print(f"\n[Manager Action] Step {step_count}")
+            print(f"  Current state: {state}")
+            print(f"  Hidden state exists: {self.hidden_state is not None}")
+            if self.hidden_state is not None:
+                h, c = self.hidden_state
+                print(f"  Hidden state norms: h={h.norm().item():.3f}, c={c.norm().item():.3f}")
+        
         # Step 1: Wide goal selection
         wide_idx, wide_log_prob, value = self.select_wide_goal(state)
         wide_goal = self.pivotal_states[wide_idx]
         
+        # Get distribution for diagnostics
+        if verbose:
+            with torch.no_grad():
+                wide_logits, _, _ = self.forward(state)
+                wide_probs = F.softmax(wide_logits, dim=0)
+                
+                # Top 5 logits and probs
+                top_k = min(5, len(wide_logits))
+                top_logits, top_indices = wide_logits.topk(top_k)
+                top_probs = wide_probs[top_indices]
+                
+                print(f"  Wide goal selection:")
+                print(f"    Top {top_k} logits: {top_logits.tolist()}")
+                print(f"    Top {top_k} probs: {top_probs.tolist()}")
+                print(f"    Selected idx: {wide_idx}, goal: {wide_goal}")
+                
+                # Entropy
+                entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
+                max_entropy = torch.log(torch.tensor(float(len(self.pivotal_states))))
+                print(f"    Entropy: {entropy.item():.3f} / {max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
+        
         # Step 2: Narrow goal selection  
         narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal)
         
-        # Combined log probability: log(π^ω × π^n)
+        # Combined log probability
         combined_log_prob = wide_log_prob + narrow_log_prob
         
+        if verbose:
+            print(f"  Narrow goal: {narrow_goal}")
+            print(f"  Combined log prob: {combined_log_prob.item():.3f}")
+            print(f"  Value estimate: {value.item():.3f}")
+        
         return wide_goal, narrow_goal, combined_log_prob, value
-    
+        
     def initialize_from_goal_policy(self, goal_policy):
         """
-        Transfer learning: Initialize Manager with πg weights.
-        Paper: "implicit skill transfer by initializing task-specific Worker and Manager with weights from πg"
-        
-        Note: Manager uses LSTM while πg uses linear layers, so we initialize with small
-        random weights to maintain similar learned structure conceptually.
+        Transfer learning: Initialize Manager with better scaling.
         """
         with torch.no_grad():
-            # Initialize LSTM with small random weights (can't directly copy from linear layers)
+            # Use standard initialization (gain=1.0, not 0.1)
             for name, param in self.lstm.named_parameters():
-                if 'weight' in name:
-                    nn.init.xavier_uniform_(param, gain=0.1)
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param, gain=1.0)  # ← FIX: gain=1.0
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param, gain=1.0)  # ← Better for recurrent
                 elif 'bias' in name:
                     nn.init.zeros_(param)
             
-            # Initialize output heads with small weights
-            nn.init.xavier_uniform_(self.wide_head.weight, gain=0.1)
-            nn.init.constant_(self.wide_head.bias, 0)
-            nn.init.xavier_uniform_(self.narrow_head.weight, gain=0.1)
-            nn.init.constant_(self.narrow_head.bias, 0)
+            # Initialize output heads with standard gain
+            nn.init.xavier_uniform_(self.wide_head.weight, gain=1.0)
+            nn.init.zeros_(self.wide_head.bias)
+            nn.init.xavier_uniform_(self.narrow_head.weight, gain=1.0)
+            nn.init.zeros_(self.narrow_head.bias)
             
-            # Initialize critic similarly to goal policy's critic if available
+            # Initialize critic
             if hasattr(goal_policy, 'critic'):
                 self.critic.weight.copy_(goal_policy.critic.weight)
                 self.critic.bias.copy_(goal_policy.critic.bias)
             else:
                 nn.init.xavier_uniform_(self.critic.weight, gain=1.0)
-                nn.init.constant_(self.critic.bias, 0)
+                nn.init.zeros_(self.critic.bias)
         
-        print(f"Manager initialized from goal policy (transfer learning)")
+        print(f"Manager initialized with standard scaling (gain=1.0)")
 
-    def update_policy(self, states: List, wide_goals: List, narrow_goals: List,
-                     rewards: List, values: List[torch.Tensor], log_probs: List[torch.Tensor]):
+    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0):
         """
-        Update Manager policy with horizon-level A2C.
-        Paper: Manager operates at c-step temporal resolution.
+        Update Manager policy with comprehensive diagnostics.
+        
+        Args:
+            step_count: Global step counter for conditional printing
         """
         if len(rewards) == 0:
             return
         
-        # Detach hidden state to prevent backprop through previous horizons
-        if self.hidden_state is not None:
-            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+
+        # Configurable diagnostic printing
+        if self.diagnostic_checkstart and step_count < 15:
+            verbose = True
+        elif step_count % self.diagnostic_interval == 0:
+            verbose = True
+        else:
+            verbose = False
+            verbose = False
         
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"[Manager Update Debug] Step {step_count}")
+            print(f"{'='*70}")
+        
+        # Convert to tensors
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        values_tensor = torch.stack(values).squeeze()
+        log_probs_tensor = torch.stack(log_probs)
+        entropies_tensor = torch.stack(entropies)
+
+        # Fix dimension mismatch
+        if values_tensor.dim() == 0:
+            values_tensor = values_tensor.unsqueeze(0)
+        if rewards_tensor.dim() == 0:
+            rewards_tensor = rewards_tensor.unsqueeze(0)
+        
+        if verbose:
+            print(f"Batch size: {len(rewards)}")
+            print(f"Rewards: {rewards_tensor.tolist()}")
+            print(f"Values: {values_tensor.tolist()}")
+            print(f"Log probs: {log_probs_tensor.tolist()}")
+            print(f"Entropies: {entropies_tensor.tolist()}")
+
         # Compute returns
         returns = []
-        discounted_reward = 0
-        for reward in reversed(rewards):
-            discounted_reward = reward + self.gamma * discounted_reward
-            returns.insert(0, discounted_reward)
-        
+        R = 0
+        for r in reversed(rewards):
+            R = r + self.gamma * R
+            returns.insert(0, R)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        values = torch.stack(values).squeeze()
-        log_probs = torch.stack(log_probs)
         
-        # Handle shape
-        if values.dim() == 0:
-            values = values.unsqueeze(0)
-        if returns.dim() == 0:
-            returns = returns.unsqueeze(0)
+        if verbose:
+            print(f"Returns (discounted): {returns.tolist()}")
         
-        # Advantages
-        advantages = returns - values
+        # GAE
+        gae_lambda = 0.95
+        advantages = torch.zeros_like(rewards_tensor)
+        
+        gae = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                delta = rewards_tensor[t] - values_tensor[t]
+            else:
+                delta = rewards_tensor[t] + self.gamma * values_tensor[t + 1] - values_tensor[t]
+            
+            gae = delta + self.gamma * gae_lambda * gae
+            advantages[t] = gae
+        
+        if verbose:
+            print(f"Advantages (raw): min={advantages.min().item():.3f}, max={advantages.max().item():.3f}, mean={advantages.mean().item():.3f}")
+        
+        # Normalize advantages
+        advantages_prenorm = advantages.clone()
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Losses
-        policy_loss = -(log_probs * advantages.detach()).mean()
-        value_loss = F.mse_loss(values, returns)
-        
-        # Entropy (using stored goals) - no need to recompute forward passes
-        # Use stored log_probs for entropy approximation
-        entropy_loss = -log_probs.mean()  # Simplified entropy from stored log probs
-        
-        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
-        
-        # Update
+            if verbose:
+                print(f"Advantages (normalized): min={advantages.min().item():.3f}, max={advantages.max().item():.3f}, mean={advantages.mean().item():.3f}")
+        else:
+            if verbose:
+                print(f"Advantages: Single sample, no normalization applied")
+
+        # Store pre-update weights for comparison
+        if verbose:
+            pre_weights = {}
+            for name, param in self.named_parameters():
+                if 'lstm' in name or 'wide_head' in name:
+                    pre_weights[name] = param.data.clone()
+
+        # Policy loss
+        policy_loss = -(advantages.detach() * log_probs_tensor).mean()
+
+        # Value loss
+        value_loss = F.mse_loss(values_tensor, returns)
+
+        # Entropy (pre-computed)
+        avg_entropy = entropies_tensor.mean()
+
+        if verbose:
+            print(f"\nLoss components:")
+            print(f"  Policy loss: {policy_loss.item():.6f}")
+            print(f"  Value loss: {value_loss.item():.6f}")
+            print(f"  Avg entropy: {avg_entropy.item():.6f}")
+            print(f"  Entropy coef: {self.entropy_coef}")
+            print(f"  Value coef: {self.value_coef}")
+
+        # Combined loss
+        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * avg_entropy
+
+        if verbose:
+            print(f"  Total loss: {total_loss.item():.6f}")
+
+        # Optimization
         self.optimizer.zero_grad()
         total_loss.backward()
+        
+        # Check gradients before clipping
+        if verbose:
+            print(f"\nGradients (before clipping):")
+            total_grad_norm = 0
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm += grad_norm ** 2
+                    if grad_norm > 0.01 or 'lstm' in name or 'wide_head' in name:
+                        print(f"  {name}: {grad_norm:.6f}")
+            total_grad_norm = total_grad_norm ** 0.5
+            print(f"  Total grad norm: {total_grad_norm:.6f}")
+        
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+        
+        # Check gradients after clipping
+        if verbose:
+            print(f"\nGradients (after clipping):")
+            total_grad_norm_clipped = 0
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm_clipped += grad_norm ** 2
+                    if grad_norm > 0.01 or 'lstm' in name or 'wide_head' in name:
+                        print(f"  {name}: {grad_norm:.6f}")
+            total_grad_norm_clipped = total_grad_norm_clipped ** 0.5
+            print(f"  Total grad norm (clipped): {total_grad_norm_clipped:.6f}")
+        
         self.optimizer.step()
+        
+        # Check weight changes
+        if verbose:
+            print(f"\nWeight changes:")
+            for name, param in self.named_parameters():
+                if name in pre_weights:
+                    weight_change = (param.data - pre_weights[name]).norm().item()
+                    weight_norm = param.data.norm().item()
+                    print(f"  {name}: change={weight_change:.6f}, norm={weight_norm:.6f}")
+        
+        if verbose:
+            print(f"{'='*70}\n")
 
 # Test functions for HierarchicalManager
 def test_manager_architecture():
@@ -910,26 +1057,22 @@ class HierarchicalTrainer:
     """
     
     def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker, 
-                 env, horizon: int = 15):
+                 env, horizon: int = 15,
+                 diagnostic_interval: int = 30,
+                 diagnostic_checkstart: bool = True):
         self.manager = manager
         self.worker = worker
         self.env = env
         self.horizon = horizon
+        self.diagnostic_interval = diagnostic_interval
+        self.diagnostic_checkstart = diagnostic_checkstart
+        self.global_step_counter = 0  # NEW: Global counter across ALL episodes
+        self.global_episode_counter = 0
     
-    def train_episode(self, max_steps: int = 200) -> Dict:
-        """
-        Train one episode with hierarchical policy.
-        
-        Returns:
-            Episode statistics
-        """
+    def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
+        """Train one episode with comprehensive diagnostics."""
         # Reset environment and networks
         obs = self.env.reset()
-
-        # DEBUG: Check if balls spawned
-        if hasattr(self.env, 'active_balls'):
-            print(f"Episode start: {len(self.env.active_balls)} balls active")
-
         state = tuple(self.env.agent_pos)
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
@@ -940,27 +1083,87 @@ class HierarchicalTrainer:
         manager_updates = 0
         worker_updates = 0
         
-        # Manager experience
+        # Diagnostic tracking
+        manager_entropies = []
+        unique_manager_goals = set()
+        goal_diversity_history = []
+        
+        # Manager experience accumulation
         manager_states = []
         manager_wide_goals = []
         manager_narrow_goals = []
         manager_rewards = []
         manager_values = []
         manager_log_probs = []
+        manager_entropies_for_update = []
+        
+        horizon_counter = 0
+        
+        # print(f"\n{'#'*70}")
+        # print(f"Starting Episode - max_steps={max_steps}, horizon={self.horizon}")
+        # print(f"{'#'*70}")
         
         while episode_steps < max_steps:
-            # Manager selects goals
-            wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(state)
+            # Configurable diagnostic printing using GLOBAL counter
+            if self.diagnostic_checkstart and self.global_step_counter < 15:
+                verbose_action = True
+            elif self.global_step_counter % self.diagnostic_interval == 0:
+                verbose_action = True
+            else:
+                verbose_action = False
             
-            # Detach Manager's hidden state to break computation graph between horizons
+            if verbose_action:
+                print(f"\n--- Global Step {self.global_step_counter} (Episode Step {episode_steps}, Horizon {horizon_counter}) ---")
+            
+            # Manager selects goals - PASS GLOBAL COUNTER
+            wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
+                state, step_count=self.global_step_counter
+            )
+            
+            # CRITICAL: Compute entropy with CURRENT hidden state
+            with torch.no_grad():
+                saved_hidden = self.manager.hidden_state
+                wide_logits_saved, _, _ = self.manager.forward(state)
+                wide_probs_saved = F.softmax(wide_logits_saved, dim=0)
+                entropy_saved = -(wide_probs_saved * torch.log(wide_probs_saved + 1e-8)).sum()
+                
+                # DIAGNOSTIC: Compare with reset hidden state (use parameter, not hardcoded)
+                if verbose_action and self.global_step_counter % self.diagnostic_interval == 0:
+                    self.manager.hidden_state = None
+                    wide_logits_reset, _, _ = self.manager.forward(state)
+                    wide_probs_reset = F.softmax(wide_logits_reset, dim=0)
+                    
+                    logit_diff = (wide_logits_saved - wide_logits_reset).abs().max()
+                    prob_diff = (wide_probs_saved - wide_probs_reset).abs().max()
+                    
+                    print(f"\n[Hidden State Diagnostic]")
+                    print(f"  Logit diff (saved vs reset): {logit_diff.item():.6f}")
+                    print(f"  Prob diff (saved vs reset): {prob_diff.item():.6f}")
+                    print(f"  Top 3 logits (saved): {wide_logits_saved[:3].tolist()}")
+                    print(f"  Top 3 logits (reset): {wide_logits_reset[:3].tolist()}")
+                    
+                    if logit_diff > 1.0:
+                        print(f"  WARNING: Large hidden state desynchronization!")
+                
+                self.manager.hidden_state = saved_hidden
+                manager_entropy = entropy_saved
+            
+            # Track diagnostics
+            manager_entropies.append(manager_entropy.item())
+            unique_manager_goals.add(wide_goal)
+            goal_diversity_history.append(len(unique_manager_goals))
+            
+            # Detach Manager's hidden state
             if self.manager.hidden_state is not None:
                 self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
             
+            # ACCUMULATE Manager experience
             manager_states.append(state)
             manager_wide_goals.append(wide_goal)
             manager_narrow_goals.append(narrow_goal)
-            manager_log_probs.append(manager_log_prob)  # Keep gradients
-            manager_values.append(manager_value)  # Keep gradients
+            manager_log_probs.append(manager_log_prob)
+            manager_values.append(manager_value)
+            manager_entropies_for_update.append(manager_entropy)
             
             # Worker executes for horizon steps
             worker_states = []
@@ -977,20 +1180,14 @@ class HierarchicalTrainer:
                 action, worker_log_prob, worker_value = self.worker.get_action(state, wide_goal, narrow_goal)
                 
                 # Environment step
-                # With:
                 try:
                     obs, env_reward, terminated, truncated, info = self.env.step(action)
                     next_state = tuple(self.env.agent_pos)
                 except (AssertionError, IndexError):
-                    # Out of bounds action - treat as failed action
                     env_reward = -0.1
-                    next_state = state  # Stay in place
+                    next_state = state
                     terminated = False
                     truncated = False
-                
-                # DEBUG: Print non-zero rewards
-                if env_reward != 0:
-                    print(f"    Step {episode_steps}: reward={env_reward:.3f}, pos={next_state}, balls={len(self.env.active_balls)}")
                 
                 # Worker reward (internal)
                 worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
@@ -1013,12 +1210,17 @@ class HierarchicalTrainer:
                 # Track episode stats
                 horizon_env_reward += env_reward
                 episode_reward += env_reward
+                
+                # INCREMENT GLOBAL COUNTER
+                self.global_step_counter += 1
                 episode_steps += 1
                 state = next_state
                 
                 # Check goal reached
                 if worker_reward > 0:
                     goal_reached = True
+                    if verbose_action:
+                        print(f"  Worker reached goal at step {self.global_step_counter}")
                     break
                 
                 if terminated or truncated:
@@ -1026,12 +1228,18 @@ class HierarchicalTrainer:
             
             # Manager receives horizon reward
             manager_rewards.append(horizon_env_reward)
+            horizon_counter += 1
             
-            # Update Manager every horizon
+            if verbose_action:
+                print(f"  Horizon {horizon_counter} complete: reward={horizon_env_reward:.3f}, steps={self.global_step_counter}")
+            
+            # Update Manager after EVERY horizon
             if len(manager_rewards) > 0:
                 self.manager.update_policy(
                     manager_states, manager_wide_goals, manager_narrow_goals,
-                    manager_rewards, manager_values, manager_log_probs
+                    manager_rewards, manager_values, manager_log_probs,
+                    manager_entropies_for_update,
+                    step_count=self.global_step_counter
                 )
                 manager_updates += 1
                 
@@ -1042,19 +1250,39 @@ class HierarchicalTrainer:
                 manager_rewards = []
                 manager_values = []
                 manager_log_probs = []
+                manager_entropies_for_update = []
             
             if terminated or truncated:
                 break
         
-        if episode_steps % 100 == 0:  # Every 100th episode
-            print(f"  Debug: horizon_rewards={episode_reward:.2f}, balls_left={len(self.env.active_balls) if hasattr(self.env, 'active_balls') else 'N/A'}")
+        self.global_episode_counter += 1
 
+        if self.global_episode_counter%full_breakdown_every == 0: 
+            # Episode summary
+
+            print(f"\n{'#'*70}")
+            print(f"Episode",self.global_episode_counter,"Complete")
+            print(f"{'#'*70}")
+            print(f"Total reward: {episode_reward:.2f}")
+            print(f"Total steps: {episode_steps}")
+            print(f"Manager updates: {manager_updates}")
+            print(f"Worker updates: {worker_updates}")
+            print(f"Unique goals selected: {len(unique_manager_goals)}/{len(self.manager.pivotal_states)}")
+            print(f"Final entropy: {manager_entropies[-1]:.3f}")
+            print(f"Average entropy: {np.mean(manager_entropies):.3f}")
+            print(f"{'#'*70}\n")
+        
         return {
             'episode_reward': episode_reward,
             'episode_steps': episode_steps,
             'manager_updates': manager_updates,
-            'worker_updates': worker_updates
+            'worker_updates': worker_updates,
+            'manager_entropy': np.mean(manager_entropies) if manager_entropies else 0,
+            'final_entropy': manager_entropies[-1] if manager_entropies else 0,
+            'unique_manager_goals': len(unique_manager_goals),
+            'goal_diversity_history': goal_diversity_history,
         }
+
 
 #This test uses a MockEnv to simulate environment interactions, not the Minigrid Wrapper
 def test_hierarchical_training_loop():

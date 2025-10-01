@@ -1300,7 +1300,7 @@ def test_worker_navigation_in_maze():
     
     print("\n" + "=" * 60)
 
-def test_manager_worker_coordination():
+def test_manager_worker_coordination(verb):
     """Test Manager and Worker work together in environment."""
     print("Testing Manager-Worker Coordination:")
     print("=" * 60)
@@ -1432,7 +1432,7 @@ def test_complete_episode_with_balls():
     
     # Run one episode
     print("\nRunning test episode:")
-    stats = trainer.train_episode(max_steps=100)
+    stats = trainer.train_episode(max_steps=100,full_breakdown_every=config['full_breakdown_every'])
     
     print(f"\nEpisode results:")
     print(f"  Total reward: {stats['episode_reward']:.2f}")
@@ -1601,14 +1601,18 @@ def train_full_phase1_phase2():
     config = {
         'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 8,
-        'phase2_episodes': 10,
+        'phase2_episodes': 100,
         'max_steps_per_episode': 500,
-        'manager_horizon': 20,
+        'manager_horizon': 10,
         'neighborhood_size': 5,
-        'manager_lr': 5e-3,
+        'manager_lr': 1e-4,
         'worker_lr': 5e-3,
-        'vae_mu0': 8.0
+        'vae_mu0': 8.0,
+        'diagnostic_interval': 5000,  # NEW: Print diagnostics every K steps
+        'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
+        'full_breakdown_every': 10  # NEW: Full breakdown every N episodes
     }
+
     
     print("="*70)
     print("FULL TRAINING with Diagnostics")
@@ -1637,15 +1641,32 @@ def train_full_phase1_phase2():
     print(f"  Pivotal states: {len(pivotal_states)}")
     print(f"  Graph edges: {len(world_graph.edges)}")
     
-    # Phase 2
-    manager = HierarchicalManager(pivotal_states, config['neighborhood_size'], config['manager_horizon'])
-    worker = HierarchicalWorker(world_graph, pivotal_states)
+    # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
+    manager = HierarchicalManager(
+        pivotal_states, 
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],  # NEW
+        diagnostic_checkstart=config['diagnostic_checkstart']  # NEW
+    )
+    
+    worker = HierarchicalWorker(
+        world_graph, 
+        pivotal_states,
+        lr=config['worker_lr']  # ← ADD THIS
+    )
     
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
     
     env.phase = 2
-    trainer = HierarchicalTrainer(manager, worker, env, horizon=config['manager_horizon'])
+    trainer = HierarchicalTrainer(
+    manager, worker, env, 
+    horizon=config['manager_horizon'],
+    diagnostic_interval=config['diagnostic_interval'],  # NEW
+    diagnostic_checkstart=config['diagnostic_checkstart']  # NEW
+    )
     
     print("\nPHASE 2: Hierarchical Training")
     
@@ -1661,7 +1682,7 @@ def train_full_phase1_phase2():
     
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
-        stats = trainer.train_episode(max_steps=config['max_steps_per_episode'])
+        stats = trainer.train_episode(max_steps=config['max_steps_per_episode'],full_breakdown_every=config['full_breakdown_every'])
         
         metrics['rewards'].append(stats['episode_reward'])
         metrics['steps'].append(stats['episode_steps'])
@@ -1669,11 +1690,12 @@ def train_full_phase1_phase2():
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
         
-        if (episode + 1) % 10 == 0:
-            recent = metrics['rewards'][-10:]
-            print(f"Ep {episode+1}: avg_reward={sum(recent)/10:.2f}, "
-                  f"last={stats['episode_reward']:.2f}, "
-                  f"time={metrics['times'][-1]:.1f}s")
+        #OLD METRICS, NOW IN HIERARCHICAL SISTEM
+        # if (episode + 1) % 10 == 0:
+        #     recent = metrics['rewards'][-10:]
+        #     print(f"Ep {episode+1}: avg_reward={sum(recent)/10:.2f}, "
+        #           f"last={stats['episode_reward']:.2f}, "
+        #           f"time={metrics['times'][-1]:.1f}s")
     
     # Results
     print("\n" + "="*70)

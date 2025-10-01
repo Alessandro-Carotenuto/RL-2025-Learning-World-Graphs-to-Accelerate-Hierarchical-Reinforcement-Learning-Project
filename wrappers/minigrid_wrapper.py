@@ -517,7 +517,7 @@ class MinigridWrapper(MiniGridEnv):
             keypos = self.PlaceRandomKey()  # places a key and reserves the tile
             goalpos = self.PlaceRandomGoal()  # places a goal and reserves the tile
 
-            self.NoiseFiller(0.65)  # noise and reserves
+            self.NoiseFiller(0.70)  # noise and reserves
 
             solve1, keypath = self.BFS(
                 keypos, (self.agent_start_pos[0], self.agent_start_pos[1]), self.agent_start_pos)
@@ -703,7 +703,7 @@ class MinigridWrapper(MiniGridEnv):
     #     normalized_reward = self._normalize_reward(reward)
     #     return processed_obs, normalized_reward, terminated, truncated, info
 
-# Override step method:
+    #OVERRIDING STEP TO CUSTOMIZE REWARDS
     def step(self, action):
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2:
             ball_collected = False
@@ -725,10 +725,13 @@ class MinigridWrapper(MiniGridEnv):
         obs, reward, terminated, truncated, info = super().step(action)
         
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2 and ball_collected:
-            reward += 5.0
+            reward += 0.05  # Per ball reward
+            
             if len(self.active_balls) == 0:
                 terminated = True
-                reward += 10.0
+                # Terminal bonus: +0.5 max, reduced by time penalty
+                time_penalty = 0.45 * (self.step_count / self.max_steps)
+                reward += (0.5 - time_penalty)
         
         return obs, reward, terminated, truncated, info
 
