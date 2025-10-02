@@ -612,14 +612,14 @@ class HierarchicalWorker(nn.Module):
             lr: Learning rate
             device: Computing device
         """
-        self.verbose=verbose
+        self.verbose = verbose
         super().__init__()
         
         self.device = device
         self.world_graph = world_graph
-        self.pivotal_states = set(pivotal_states)  # For fast membership check
+        self.pivotal_states = set(pivotal_states)
         
-        # A2C-LSTM architecture (paper: "Manager and Worker are both A2C-LSTMs")
+        # A2C-LSTM architecture
         self.lstm = nn.LSTM(
             input_size=6,  # [state_x, state_y, gw_x, gw_y, gn_x, gn_y]
             hidden_size=64,
@@ -627,19 +627,17 @@ class HierarchicalWorker(nn.Module):
             batch_first=True
         ).to(device)
         
-        # Action head: 3 navigation actions [turn_left, turn_right, move_forward]
         self.actor = nn.Linear(64, 3).to(device)
-        
-        # Value function
         self.critic = nn.Linear(64, 1).to(device)
         
-        # Optimizer
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
         
         # Worker state
         self.hidden_state = None
-        self.current_traversal_path = []  # Active graph traversal
+        self.current_traversal_path = []
         self.traversal_step = 0
+        self.current_edge_actions = None
+        self.current_action_idx = 0
         
         # Hyperparameters
         self.gamma = 0.99
@@ -647,10 +645,12 @@ class HierarchicalWorker(nn.Module):
         self.value_coef = 0.5
     
     def reset_worker_state(self):
-        """Reset LSTM hidden state and traversal."""
+        """Reset LSTM hidden state and traversal state."""
         self.hidden_state = None
         self.current_traversal_path = []
         self.traversal_step = 0
+        self.current_edge_actions = None
+        self.current_action_idx = 0
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -723,67 +723,151 @@ class HierarchicalWorker(nn.Module):
         
         return action_logits, value
     
-    def get_action(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        """
-        Sample action from Worker policy with graph traversal integration.
-        Paper: "Worker can traverse the world via graph if at pivotal state"
-        """
-        # Check if should use graph traversal
+    def get_action(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int], agent_dir: int):
+        """Worker selects action with geometric path-to-action conversion."""
+
+        # 1. INITIATE TRAVERSAL
         if self.should_traverse(state, wide_goal) and not self.current_traversal_path:
-            # Initiate new traversal
-            self.current_traversal_path = self.plan_traversal(state, wide_goal)
-            self.traversal_step = 0
-            
-            if self.current_traversal_path:
-                if self.verbose:
-                    print(f"    Worker initiating graph traversal: {state} -> {wide_goal}")
-        
-        # If actively traversing, follow graph path
-        if self.current_traversal_path and self.traversal_step < len(self.current_traversal_path) - 1:
-            # Get next position in path
-            current_pos = self.current_traversal_path[self.traversal_step]
-            next_pos = self.current_traversal_path[self.traversal_step + 1]
-            
-            # Get stored action sequence from graph
-            edge_actions = self.world_graph.get_edge_actions(current_pos, next_pos)
-            
-            if edge_actions and self.traversal_step < len(edge_actions):
-                # Use actual stored action
-                action = edge_actions[self.traversal_step]
-            else:
-                # Fallback to move_forward if no actions stored
-                action = 2
-            
-            self.traversal_step += 1
-            
-            # Check if traversal complete
-            if self.traversal_step >= len(self.current_traversal_path) - 1:
-                if self.verbose:
-                    print(f"    Worker completed graph traversal to {wide_goal}")
-                self.current_traversal_path = []
+            path = self.plan_traversal(state, wide_goal)
+            if path:
+                self.current_traversal_path = path
                 self.traversal_step = 0
-            
-            # Get value estimate from network
-            with torch.no_grad():
-                _, value = self.forward(state, wide_goal, narrow_goal)
-            
-            # Dummy log prob for traversal actions
-            log_prob = torch.tensor(-1.0, device=self.device)
-            
-            return action, log_prob, value.squeeze()
-        
-        # Normal policy action
+                print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
+                print(f"  - Target (gw): {wide_goal}")
+                print(f"  - Planned Path: {self.current_traversal_path}")
+
+        # 2. EXECUTE TRAVERSAL
+        is_traversing = self.current_traversal_path and self.traversal_step < len(self.current_traversal_path) - 1
+
+        if is_traversing:
+            print(f"\n[WORKER DIAGNOSTIC] Executing Traversal Step")
+            print(f"  - Agent is at: {state}, facing direction: {agent_dir}")
+
+            expected_node = self.current_traversal_path[self.traversal_step]
+            next_node = self.current_traversal_path[self.traversal_step + 1]
+
+            print(f"  - Path State: Following path {self.current_traversal_path}")
+            print(f"  - Edge State: On edge {self.traversal_step} ({expected_node} -> {next_node})")
+
+            # CRITICAL CHECK: Position Synchronization
+            if state != expected_node:
+                print(f"  - 🔴 DESYNC DETECTED! Agent is at {state}, but expected to be at {expected_node}.")
+                print(f"  - Aborting traversal and switching to policy.")
+                self.reset_worker_state()
+            else:
+                print(f"  - ✅ SYNC CONFIRMED. Agent is at the correct node.")
+                
+                # Generate action sequence for current edge segment if needed
+                if not hasattr(self, 'current_edge_actions') or self.current_edge_actions is None:
+                    edge_path = [expected_node, next_node]
+                    self.current_edge_actions = self.generate_actions_from_path(edge_path, agent_dir)
+                    self.current_action_idx = 0
+                    print(f"  - Action Generation: Created sequence {self.current_edge_actions} from path")
+                
+                # Execute next action in sequence
+                if self.current_action_idx < len(self.current_edge_actions):
+                    action = self.current_edge_actions[self.current_action_idx]
+                    action_names = ['turn_left', 'turn_right', 'move_forward']
+                    print(f"  - Action Execution: Returning action '{action_names[action]}' (index {self.current_action_idx})")
+                    
+                    self.current_action_idx += 1
+                    
+                    # Check if finished this edge segment
+                    if self.current_action_idx >= len(self.current_edge_actions):
+                        print(f"  - State Update: Completed edge segment, advancing to next node")
+                        self.current_edge_actions = None
+                        self.traversal_step += 1
+                        
+                        if self.traversal_step >= len(self.current_traversal_path) - 1:
+                            print("  - State Update: End of entire path reached. Clearing path.")
+                            self.current_traversal_path = []
+                    
+                    with torch.no_grad():
+                        _, value = self.forward(state, wide_goal, narrow_goal)
+                    
+                    log_prob = torch.tensor(-1.0, device=self.device)
+                    return action, log_prob, value.squeeze()
+                else:
+                    print(f"  - 🔴 ERROR: No actions available but still traversing")
+                    self.reset_worker_state()
+
+        # 3. FALLBACK TO POLICY ACTION
+        if not is_traversing:
+            if self.current_traversal_path and self.traversal_step > 0:
+                print("[WORKER DIAGNOSTIC] Traversal just ended. Switching to policy.")
+            self.reset_worker_state()
+
         with torch.no_grad():
             action_logits, value = self.forward(state, wide_goal, narrow_goal)
-        
-        # Sample from action distribution
+
         action_probs = F.softmax(action_logits, dim=0)
         action_dist = torch.distributions.Categorical(action_probs)
         action = action_dist.sample()
         log_prob = action_dist.log_prob(action)
-        
+
         return action.item(), log_prob, value.squeeze()
-    
+
+    def _compute_required_direction(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> int:
+        """
+        Compute which direction agent must face to move from->to in one step.
+        
+        Returns:
+            0: Right (+x)
+            1: Down (+y)
+            2: Left (-x)
+            3: Up (-y)
+        """
+        dx = to_pos[0] - from_pos[0]
+        dy = to_pos[1] - from_pos[1]
+        
+        if dx > 0:
+            return 0  # Right
+        elif dy > 0:
+            return 1  # Down
+        elif dx < 0:
+            return 2  # Left
+        elif dy < 0:
+            return 3  # Up
+        else:
+            # Same position (shouldn't happen in traversal)
+            return 0
+
+    def _compute_turn_action(self, current_dir: int, target_dir: int) -> int:
+        """
+        Compute ONE turn action to get closer to target direction.
+        
+        Args:
+            current_dir: Current facing direction (0-3)
+            target_dir: Target facing direction (0-3)
+        
+        Returns:
+            0: turn_left
+            1: turn_right
+        """
+        # Compute shortest rotation
+        diff = (target_dir - current_dir) % 4
+        
+        if diff == 0:
+            # Already facing target (shouldn't be called in this case)
+            return 1  # turn_right (no-op, shouldn't happen)
+        elif diff == 1:
+            # Target is 1 turn right away
+            return 1  # turn_right
+        elif diff == 2:
+            # Target is opposite (2 turns away, choose right arbitrarily)
+            return 1  # turn_right
+        else:  # diff == 3
+            # Target is 1 turn left away (or 3 turns right)
+            return 0  # turn_left
+
+    def reset_worker_state(self):
+        """Reset LSTM hidden state and traversal state."""
+        self.hidden_state = None
+        self.current_traversal_path = []
+        self.traversal_step = 0
+        self.current_edge_step = 0
+        self.orientation_complete = False  # NEW: Reset orientation flag
+
     def compute_reward(self, current_state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> float:
         """
         Compute Worker's reward.
@@ -879,6 +963,45 @@ class HierarchicalWorker(nn.Module):
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
+
+    def generate_actions_from_path(self, path, current_agent_dir):
+        """Convert position path to action sequence based on current orientation."""
+        actions = []
+        agent_dir = current_agent_dir
+        
+        for i in range(len(path) - 1):
+            curr_pos = path[i]
+            next_pos = path[i + 1]
+            
+            # Compute required direction from geometry
+            dx = next_pos[0] - curr_pos[0]
+            dy = next_pos[1] - curr_pos[1]
+            
+            if dx > 0:
+                required_dir = 0  # Right
+            elif dy > 0:
+                required_dir = 1  # Down
+            elif dx < 0:
+                required_dir = 2  # Left
+            elif dy < 0:
+                required_dir = 3  # Up
+            else:
+                continue  # Same position, skip
+            
+            # Generate turns to face required direction
+            while agent_dir != required_dir:
+                diff = (required_dir - agent_dir) % 4
+                if diff <= 2:
+                    actions.append(1)  # turn_right
+                    agent_dir = (agent_dir + 1) % 4
+                else:
+                    actions.append(0)  # turn_left
+                    agent_dir = (agent_dir - 1) % 4
+            
+            # Move forward
+            actions.append(2)
+        
+        return actions
 
 # Test functions for HierarchicalWorker
 def test_worker_architecture():
@@ -1051,11 +1174,6 @@ def hierarchical_worker_tests():
     test_worker_transfer_learning()
 
 class HierarchicalTrainer:
-    """
-    Coordinates Manager and Worker training.
-    Paper: "Hierarchical reinforcement learning framework that leverages world graph"
-    """
-    
     def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker, 
                  env, horizon: int = 15,
                  diagnostic_interval: int = 30,
@@ -1066,8 +1184,22 @@ class HierarchicalTrainer:
         self.horizon = horizon
         self.diagnostic_interval = diagnostic_interval
         self.diagnostic_checkstart = diagnostic_checkstart
-        self.global_step_counter = 0  # NEW: Global counter across ALL episodes
+        self.global_step_counter = 0
         self.global_episode_counter = 0
+        
+        # NEW: Diagnostic tracking
+        self.diagnostic_history = {
+            'manager_goal_diversity': [],
+            'manager_entropy': [],
+            'worker_goal_achievement': [],
+            'balls_collected_per_episode': [],
+            'manager_rewards_mean': [],
+            'manager_rewards_std': [],
+            'goal_distance_to_balls': [],
+            'manager_value_mean': [],
+            'worker_value_mean': [],
+            'episode_rewards': []
+        }
     
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
         """Train one episode with comprehensive diagnostics."""
@@ -1086,10 +1218,15 @@ class HierarchicalTrainer:
         manager_updates = 0
         worker_updates = 0
         
-        # Diagnostic tracking
+        # NEW: Diagnostic tracking for this episode
         manager_entropies = []
         unique_manager_goals = set()
-        goal_diversity_history = []
+        manager_wide_goals_list = []
+        manager_narrow_goals_list = []
+        manager_values_list = []
+        worker_values_list = []
+        worker_goal_reached_count = 0
+        total_horizons = 0
         
         # Manager experience accumulation
         manager_states = []
@@ -1102,59 +1239,23 @@ class HierarchicalTrainer:
         
         horizon_counter = 0
         
-        # print(f"\n{'#'*70}")
-        # print(f"Starting Episode - max_steps={max_steps}, horizon={self.horizon}")
-        # print(f"{'#'*70}")
-        
         while episode_steps < max_steps:
-            # Configurable diagnostic printing using GLOBAL counter
-            if self.diagnostic_checkstart and self.global_step_counter < 15:
-                verbose_action = True
-            elif self.global_step_counter % self.diagnostic_interval == 0:
-                verbose_action = True
-            else:
-                verbose_action = False
-            
-            if verbose_action:
-                print(f"\n--- Global Step {self.global_step_counter} (Episode Step {episode_steps}, Horizon {horizon_counter}) ---")
-            
-            # Manager selects goals - PASS GLOBAL COUNTER
+            # Manager selects goals
             wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
                 state, step_count=self.global_step_counter
             )
             
-            # CRITICAL: Compute entropy with CURRENT hidden state
+            # NEW: Track Manager diagnostics
             with torch.no_grad():
-                saved_hidden = self.manager.hidden_state
-                wide_logits_saved, _, _ = self.manager.forward(state)
-                wide_probs_saved = F.softmax(wide_logits_saved, dim=0)
-                entropy_saved = -(wide_probs_saved * torch.log(wide_probs_saved + 1e-8)).sum()
-                
-                # DIAGNOSTIC: Compare with reset hidden state (use parameter, not hardcoded)
-                if verbose_action and self.global_step_counter % self.diagnostic_interval == 0:
-                    self.manager.hidden_state = None
-                    wide_logits_reset, _, _ = self.manager.forward(state)
-                    wide_probs_reset = F.softmax(wide_logits_reset, dim=0)
-                    
-                    logit_diff = (wide_logits_saved - wide_logits_reset).abs().max()
-                    prob_diff = (wide_probs_saved - wide_probs_reset).abs().max()
-                    
-                    print(f"\n[Hidden State Diagnostic]")
-                    print(f"  Logit diff (saved vs reset): {logit_diff.item():.6f}")
-                    print(f"  Prob diff (saved vs reset): {prob_diff.item():.6f}")
-                    print(f"  Top 3 logits (saved): {wide_logits_saved[:3].tolist()}")
-                    print(f"  Top 3 logits (reset): {wide_logits_reset[:3].tolist()}")
-                    
-                    if logit_diff > 1.0:
-                        print(f"  WARNING: Large hidden state desynchronization!")
-                
-                self.manager.hidden_state = saved_hidden
-                manager_entropy = entropy_saved
+                wide_logits, _, _ = self.manager.forward(state)
+                wide_probs = F.softmax(wide_logits, dim=0)
+                entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
+                manager_entropies.append(entropy.item())
             
-            # Track diagnostics
-            manager_entropies.append(manager_entropy.item())
             unique_manager_goals.add(wide_goal)
-            goal_diversity_history.append(len(unique_manager_goals))
+            manager_wide_goals_list.append(wide_goal)
+            manager_narrow_goals_list.append(narrow_goal)
+            manager_values_list.append(manager_value.item())
             
             # Detach Manager's hidden state
             if self.manager.hidden_state is not None:
@@ -1166,7 +1267,7 @@ class HierarchicalTrainer:
             manager_narrow_goals.append(narrow_goal)
             manager_log_probs.append(manager_log_prob)
             manager_values.append(manager_value)
-            manager_entropies_for_update.append(manager_entropy)
+            manager_entropies_for_update.append(entropy)
             
             # Worker executes for horizon steps
             worker_states = []
@@ -1176,11 +1277,17 @@ class HierarchicalTrainer:
             worker_log_probs = []
             
             horizon_env_reward = 0
-            goal_reached = False
+            goal_reached_this_horizon = False
             
             for h in range(self.horizon):
                 # Worker selects action
-                action, worker_log_prob, worker_value = self.worker.get_action(state, wide_goal, narrow_goal)
+                action, worker_log_prob, worker_value = self.worker.get_action(
+                    state, wide_goal, narrow_goal,
+                    agent_dir=self.env.agent_dir  # ← ADD THIS
+)
+                
+                # NEW: Track Worker values
+                worker_values_list.append(worker_value.item())
                 
                 # Environment step
                 try:
@@ -1194,6 +1301,10 @@ class HierarchicalTrainer:
                 
                 # Worker reward (internal)
                 worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
+                
+                # NEW: Track if Worker reached goal
+                if worker_reward > 0:
+                    goal_reached_this_horizon = True
                 
                 # Store Worker experience
                 worker_states.append((state, wide_goal, narrow_goal))
@@ -1214,27 +1325,21 @@ class HierarchicalTrainer:
                 horizon_env_reward += env_reward
                 episode_reward += env_reward
                 
-                # INCREMENT GLOBAL COUNTER
                 self.global_step_counter += 1
                 episode_steps += 1
                 state = next_state
                 
-                # Check goal reached
-                if worker_reward > 0:
-                    goal_reached = True
-                    if verbose_action:
-                        print(f"  Worker reached goal at step {self.global_step_counter}")
-                    break
-                
                 if terminated or truncated:
                     break
+            
+            # NEW: Track Worker success
+            if goal_reached_this_horizon:
+                worker_goal_reached_count += 1
+            total_horizons += 1
             
             # Manager receives horizon reward
             manager_rewards.append(horizon_env_reward)
             horizon_counter += 1
-            
-            if verbose_action:
-                print(f"  Horizon {horizon_counter} complete: reward={horizon_env_reward:.3f}, steps={self.global_step_counter}")
             
             # Update Manager after EVERY horizon
             if len(manager_rewards) > 0:
@@ -1259,20 +1364,60 @@ class HierarchicalTrainer:
                 break
         
         self.global_episode_counter += 1
-
-        if self.global_episode_counter%full_breakdown_every == 0: 
-            # Episode summary
-
+        
+        # NEW: Compute episode-level diagnostics
+        balls_collected = self.env.total_balls - len(self.env.active_balls)
+        worker_success_rate = worker_goal_reached_count / total_horizons if total_horizons > 0 else 0
+        
+        # Distance from Manager goals to balls
+        avg_distance_to_balls = None
+        if hasattr(self.env, 'active_balls') and len(self.env.active_balls) > 0:
+            distances = []
+            for wide_goal in manager_wide_goals_list:
+                min_dist = min(
+                    abs(wide_goal[0] - ball[0]) + abs(wide_goal[1] - ball[1])
+                    for ball in self.env.active_balls
+                )
+                distances.append(min_dist)
+            avg_distance_to_balls = np.mean(distances) if distances else None
+        
+        # Store diagnostics
+        self.diagnostic_history['manager_goal_diversity'].append(
+            len(unique_manager_goals) / len(self.manager.pivotal_states)
+        )
+        self.diagnostic_history['manager_entropy'].append(np.mean(manager_entropies))
+        self.diagnostic_history['worker_goal_achievement'].append(worker_success_rate)
+        self.diagnostic_history['balls_collected_per_episode'].append(balls_collected)
+        self.diagnostic_history['manager_rewards_mean'].append(np.mean(manager_rewards))
+        self.diagnostic_history['manager_rewards_std'].append(np.std(manager_rewards))
+        if avg_distance_to_balls is not None:
+            self.diagnostic_history['goal_distance_to_balls'].append(avg_distance_to_balls)
+        self.diagnostic_history['manager_value_mean'].append(np.mean(manager_values_list))
+        self.diagnostic_history['worker_value_mean'].append(np.mean(worker_values_list))
+        self.diagnostic_history['episode_rewards'].append(episode_reward)
+        
+        # NEW: Print diagnostics every N episodes
+        if self.global_episode_counter % full_breakdown_every == 0:
             print(f"\n{'#'*70}")
-            print(f"Episode",self.global_episode_counter,"Complete")
+            print(f"Episode {self.global_episode_counter} Complete")
             print(f"{'#'*70}")
-            print(f"Total reward: {episode_reward:.2f}")
-            print(f"Total steps: {episode_steps}")
-            print(f"Manager updates: {manager_updates}")
-            print(f"Worker updates: {worker_updates}")
-            print(f"Unique goals selected: {len(unique_manager_goals)}/{len(self.manager.pivotal_states)}")
-            print(f"Final entropy: {manager_entropies[-1]:.3f}")
-            print(f"Average entropy: {np.mean(manager_entropies):.3f}")
+            print(f"Task Performance:")
+            print(f"  Episode reward: {episode_reward:.2f} (optimal: {optimal_reward:.2f})")
+            print(f"  Balls collected: {balls_collected}/{self.env.total_balls}")
+            print(f"  Episode steps: {episode_steps}")
+            print(f"\nManager Diagnostics:")
+            print(f"  Goal diversity: {len(unique_manager_goals)}/{len(self.manager.pivotal_states)} unique goals")
+            print(f"  Avg entropy: {np.mean(manager_entropies):.3f}")
+            print(f"  Avg reward: {np.mean(manager_rewards):.3f} ± {np.std(manager_rewards):.3f}")
+            print(f"  Avg value estimate: {np.mean(manager_values_list):.3f}")
+            if avg_distance_to_balls is not None:
+                print(f"  Avg distance to balls: {avg_distance_to_balls:.1f}")
+            print(f"\nWorker Diagnostics:")
+            print(f"  Goal achievement rate: {worker_success_rate*100:.1f}%")
+            print(f"  Avg value estimate: {np.mean(worker_values_list):.3f}")
+            print(f"\nTraining Stats:")
+            print(f"  Manager updates: {manager_updates}")
+            print(f"  Worker updates: {worker_updates}")
             print(f"{'#'*70}\n")
         
         return {
@@ -1283,11 +1428,10 @@ class HierarchicalTrainer:
             'manager_entropy': np.mean(manager_entropies) if manager_entropies else 0,
             'final_entropy': manager_entropies[-1] if manager_entropies else 0,
             'unique_manager_goals': len(unique_manager_goals),
-            'goal_diversity_history': goal_diversity_history,
-            'optimal_reward': optimal_reward,      # NEW
-            'optimal_steps': optimal_steps         # NEW
+            'goal_diversity_history': None,
+            'optimal_reward': optimal_reward,
+            'optimal_steps': optimal_steps
         }
-
 
 #This test uses a MockEnv to simulate environment interactions, not the Minigrid Wrapper
 def test_hierarchical_training_loop():

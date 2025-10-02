@@ -1537,22 +1537,296 @@ def run_all_comprehensive_tests():
     
     return results
 
+# PLOT AND DIAGNOSTICS -------------------------------------------------------
+
+def diagnose_graph_connectivity(world_graph, pivotal_states, env):
+    """
+    Diagnose graph connectivity issues from spawn position.
+    """
+    print("\n" + "="*70)
+    print("GRAPH CONNECTIVITY DIAGNOSTICS")
+    print("="*70)
+    
+    # Get spawn position
+    env.phase = 2
+    obs = env.reset()
+    spawn_pos = tuple(env.agent_pos)
+    
+    print(f"\nAgent spawn position: {spawn_pos}")
+    print(f"Is spawn a pivotal state? {spawn_pos in pivotal_states}")
+    
+    # Check if spawn is in graph
+    print(f"Is spawn in graph nodes? {spawn_pos in world_graph.nodes}")
+    
+    # Check connectivity from spawn to all pivotal states
+    print(f"\nChecking paths from spawn to all {len(pivotal_states)} pivotal states:")
+    reachable_from_spawn = []
+    unreachable_from_spawn = []
+    
+    for pivotal in pivotal_states:
+        if pivotal == spawn_pos:
+            print(f"  {pivotal}: SPAWN (skip)")
+            continue
+            
+        path, distance = world_graph.shortest_path(spawn_pos, pivotal)
+        
+        if path and distance < float('inf'):
+            reachable_from_spawn.append((pivotal, distance))
+            if len(reachable_from_spawn) <= 5:  # Show first 5
+                print(f"  {pivotal}: REACHABLE (distance={distance:.0f})")
+        else:
+            unreachable_from_spawn.append(pivotal)
+            if len(unreachable_from_spawn) <= 5:  # Show first 5
+                print(f"  {pivotal}: UNREACHABLE (no path in graph)")
+    
+    print(f"\nSummary:")
+    print(f"  Reachable pivotal states: {len(reachable_from_spawn)}/{len(pivotal_states)-1}")
+    print(f"  Unreachable pivotal states: {len(unreachable_from_spawn)}/{len(pivotal_states)-1}")
+    
+    if len(unreachable_from_spawn) > 0:
+        print(f"\n⚠ WARNING: {len(unreachable_from_spawn)} pivotal states unreachable from spawn!")
+        print(f"  Manager may select goals Worker cannot traverse to.")
+    
+    # Check if graph is generally connected
+    print(f"\nChecking overall graph connectivity:")
+    total_pairs = len(pivotal_states) * (len(pivotal_states) - 1)
+    connected_pairs = 0
+    
+    for i, start in enumerate(pivotal_states):
+        for j, end in enumerate(pivotal_states):
+            if i != j:
+                path, dist = world_graph.shortest_path(start, end)
+                if path:
+                    connected_pairs += 1
+    
+    connectivity_pct = 100 * connected_pairs / total_pairs
+    print(f"  Connected pairs: {connected_pairs}/{total_pairs} ({connectivity_pct:.1f}%)")
+    
+    if connectivity_pct < 50:
+        print(f"  ⚠ WARNING: Graph is poorly connected!")
+    
+    print("="*70 + "\n")
+    
+    return reachable_from_spawn, unreachable_from_spawn
+
+def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states):
+    """
+    Run ONE episode with detailed Worker diagnostics.
+    """
+    print("\n" + "="*70)
+    print("WORKER BEHAVIOR DIAGNOSTICS - SINGLE EPISODE")
+    print("="*70)
+    
+    env.phase = 2
+    obs = env.reset()
+    start_pos = tuple(env.agent_pos)
+    
+    print(f"\nAgent starts at: {start_pos}")
+    print(f"Balls at: {list(env.active_balls)[:5]}")
+    
+    manager.reset_manager_state()
+    worker.reset_worker_state()
+    
+    episode_diagnostics = []
+    
+    for horizon_num in range(5):  # Just 5 horizons for diagnosis
+        print(f"\n--- Horizon {horizon_num} ---")
+        
+        current_pos = tuple(env.agent_pos)
+        print(f"Start position: {current_pos}")
+        
+        # Manager selects goals
+        wide_goal, narrow_goal, log_prob, value = manager.get_manager_action(current_pos)
+        print(f"Manager goals: wide={wide_goal}, narrow={narrow_goal}")
+        
+        # Check if wide goal is reachable
+        dist_to_wide = manhattan_distance(current_pos, wide_goal)
+        print(f"  Distance to wide goal: {dist_to_wide}")
+        
+        # Check if Worker should traverse
+        should_traverse = worker.should_traverse(current_pos, wide_goal)
+        print(f"  Worker should_traverse: {should_traverse}")
+        
+        if should_traverse:
+            path = worker.plan_traversal(current_pos, wide_goal)
+            print(f"  Planned traversal path: {path}")
+        else:
+            # Why not?
+            is_at_pivotal = worker.is_at_pivotal_state(current_pos)
+            is_wide_pivotal = worker.is_at_pivotal_state(wide_goal)
+            graph_path, graph_dist = world_graph.shortest_path(current_pos, wide_goal)
+            
+            print(f"  Why no traversal?")
+            print(f"    Current is pivotal: {is_at_pivotal}")
+            print(f"    Wide goal is pivotal: {is_wide_pivotal}")
+            print(f"    Graph path exists: {graph_path is not None}")
+        
+        # Execute Worker for horizon
+        positions_visited = [current_pos]
+        actions_taken = []
+        
+        for h in range(10):
+            action, log_prob, value = worker.get_action(current_pos, wide_goal, narrow_goal,agent_dir=env.agent_dir)
+            actions_taken.append(action)
+            
+            try:
+                obs, reward, terminated, truncated, info = env.step(action)
+                current_pos = tuple(env.agent_pos)
+                positions_visited.append(current_pos)
+            except:
+                break
+            
+            # Check if reached goals
+            if current_pos == wide_goal:
+                print(f"  ✓ Reached wide goal at step {h+1}")
+                break
+            if current_pos == narrow_goal:
+                print(f"  ✓ Reached narrow goal at step {h+1}")
+                break
+            
+            if terminated or truncated:
+                break
+        
+        # Analyze Worker trajectory
+        final_dist_to_wide = manhattan_distance(current_pos, wide_goal)
+        final_dist_to_narrow = manhattan_distance(current_pos, narrow_goal)
+        
+        print(f"  Worker trajectory: {len(positions_visited)} positions")
+        print(f"  Final distance to wide: {final_dist_to_wide} (started at {dist_to_wide})")
+        print(f"  Final distance to narrow: {final_dist_to_narrow}")
+        print(f"  Actions: {actions_taken}")
+        
+        horizon_diagnostics = {
+            'start_pos': start_pos,
+            'wide_goal': wide_goal,
+            'narrow_goal': narrow_goal,
+            'initial_distance': dist_to_wide,
+            'final_distance': final_dist_to_wide,
+            'should_traverse': should_traverse,
+            'positions_visited': positions_visited,
+            'actions_taken': actions_taken
+        }
+        episode_diagnostics.append(horizon_diagnostics)
+    
+    print("\n" + "="*70)
+    return episode_diagnostics
+
+def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.png'):
+    """Plot comprehensive training diagnostics."""
+    import matplotlib.pyplot as plt
+    
+    history = trainer.diagnostic_history
+    num_episodes = len(history['episode_rewards'])
+    episodes = range(1, num_episodes + 1)
+    
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle('Hierarchical RL Training Diagnostics', fontsize=16, fontweight='bold')
+    
+    # 1. Episode rewards
+    axes[0, 0].plot(episodes, history['episode_rewards'], 'b-', alpha=0.7, label='Agent')
+    axes[0, 0].set_title('Episode Rewards')
+    axes[0, 0].set_xlabel('Episode')
+    axes[0, 0].set_ylabel('Reward')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+    
+    # 2. Manager goal diversity
+    axes[0, 1].plot(episodes, history['manager_goal_diversity'], 'g-', linewidth=2)
+    axes[0, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='Random (100%)')
+    axes[0, 1].axhline(y=1/len(trainer.manager.pivotal_states), color='orange', 
+                       linestyle='--', alpha=0.5, label='Collapsed')
+    axes[0, 1].set_title('Manager Goal Diversity')
+    axes[0, 1].set_xlabel('Episode')
+    axes[0, 1].set_ylabel('Fraction of Unique Goals')
+    axes[0, 1].set_ylim([0, 1.1])
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend()
+    
+    # 3. Manager entropy
+    axes[0, 2].plot(episodes, history['manager_entropy'], 'purple', linewidth=2)
+    max_entropy = np.log(len(trainer.manager.pivotal_states))
+    axes[0, 2].axhline(y=max_entropy, color='r', linestyle='--', alpha=0.5, label='Max entropy')
+    axes[0, 2].set_title('Manager Policy Entropy')
+    axes[0, 2].set_xlabel('Episode')
+    axes[0, 2].set_ylabel('Entropy (nats)')
+    axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 2].legend()
+    
+    # 4. Worker goal achievement
+    axes[1, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2)
+    axes[1, 0].set_title('Worker Goal Achievement Rate')
+    axes[1, 0].set_xlabel('Episode')
+    axes[1, 0].set_ylabel('% Horizons Goal Reached')
+    axes[1, 0].set_ylim([0, 100])
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. Balls collected
+    axes[1, 1].plot(episodes, history['balls_collected_per_episode'], 'red', linewidth=2)
+    axes[1, 1].axhline(y=trainer.env.total_balls, color='g', linestyle='--', 
+                       alpha=0.5, label='All balls')
+    axes[1, 1].set_title('Balls Collected per Episode')
+    axes[1, 1].set_xlabel('Episode')
+    axes[1, 1].set_ylabel('Number of Balls')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].legend()
+    
+    # 6. Manager rewards
+    axes[1, 2].plot(episodes, history['manager_rewards_mean'], 'b-', linewidth=2, label='Mean')
+    axes[1, 2].fill_between(episodes, 
+                            np.array(history['manager_rewards_mean']) - np.array(history['manager_rewards_std']),
+                            np.array(history['manager_rewards_mean']) + np.array(history['manager_rewards_std']),
+                            alpha=0.3)
+    axes[1, 2].axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    axes[1, 2].set_title('Manager Reward per Horizon')
+    axes[1, 2].set_xlabel('Episode')
+    axes[1, 2].set_ylabel('Reward')
+    axes[1, 2].grid(True, alpha=0.3)
+    axes[1, 2].legend()
+    
+    # 7. Distance to balls
+    if len(history['goal_distance_to_balls']) > 0:
+        axes[2, 0].plot(episodes[:len(history['goal_distance_to_balls'])], 
+                        history['goal_distance_to_balls'], 'brown', linewidth=2)
+        axes[2, 0].set_title('Avg Distance: Manager Goals → Balls')
+        axes[2, 0].set_xlabel('Episode')
+        axes[2, 0].set_ylabel('Manhattan Distance')
+        axes[2, 0].grid(True, alpha=0.3)
+    
+    # 8. Manager values
+    axes[2, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2)
+    axes[2, 1].set_title('Manager Value Estimates')
+    axes[2, 1].set_xlabel('Episode')
+    axes[2, 1].set_ylabel('Average Value')
+    axes[2, 1].grid(True, alpha=0.3)
+    
+    # 9. Worker values
+    axes[2, 2].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2)
+    axes[2, 2].set_title('Worker Value Estimates')
+    axes[2, 2].set_xlabel('Episode')
+    axes[2, 2].set_ylabel('Average Value')
+    axes[2, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    print(f"\nDiagnostic plots saved to {save_path}")
+    plt.close()
+
 # ACTUAL TRAINING CODE ----------------------------------------------------
 
 def train_full_phase1_phase2():
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters
     config = {
-        'maze_size': EnvSizes.MEDIUM,
+        'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 8,
-        'phase2_episodes': 50,
+        'phase2_episodes': 2,
         'max_steps_per_episode': 500,
         'manager_horizon': 10,
         'neighborhood_size': 5,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3, 
         'vae_mu0': 8.0,
-        'diagnostic_interval': 5000,  # NEW: Print diagnostics every K steps
+        'diagnostic_interval': 10000000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
         'full_breakdown_every': 10  # NEW: Full breakdown every N episodes
     }
@@ -1585,6 +1859,11 @@ def train_full_phase1_phase2():
     print(f"  Pivotal states: {len(pivotal_states)}")
     print(f"  Graph edges: {len(world_graph.edges)}")
     
+    # Diagnose graph connectivity
+    reachable, unreachable = diagnose_graph_connectivity(
+        world_graph, pivotal_states, env
+    )
+
     # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
     manager = HierarchicalManager(
         pivotal_states, 
@@ -1594,15 +1873,18 @@ def train_full_phase1_phase2():
         diagnostic_interval=config['diagnostic_interval'],  # NEW
         diagnostic_checkstart=config['diagnostic_checkstart']  # NEW
     )
-    
     worker = HierarchicalWorker(
         world_graph, 
         pivotal_states,
         lr=config['worker_lr']  # ← ADD THIS
     )
-    
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
+
+    print("\nDiagnosing Worker behavior BEFORE training:")
+    diagnose_worker_behavior_single_episode(
+        env, manager, worker, world_graph, pivotal_states
+    )
     
     env.phase = 2
     trainer = HierarchicalTrainer(
@@ -1636,6 +1918,7 @@ def train_full_phase1_phase2():
         metrics['times'].append(time.time() - ep_start)
         metrics['optimal_rewards'].append(stats['optimal_reward'])
         
+        
         #OLD METRICS, NOW IN HIERARCHICAL SISTEM
         # if (episode + 1) % 10 == 0:
         #     recent = metrics['rewards'][-10:]
@@ -1643,6 +1926,13 @@ def train_full_phase1_phase2():
         #           f"last={stats['episode_reward']:.2f}, "
         #           f"time={metrics['times'][-1]:.1f}s")
     
+    # AFTER all episodes complete - NOW plot the diagnostics
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE - Generating diagnostic plots...")
+    print("="*70)
+    
+    plot_training_diagnostics(trainer)  # ← HERE, after the loop
+
     # Results
     print("\n" + "="*70)
     print("TRAINING COMPLETE")

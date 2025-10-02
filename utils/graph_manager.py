@@ -13,19 +13,12 @@ class GraphManager:
     def __init__(self):
         self.nodes = set()
         self.edges = {}
-        self.edge_actions = {}  # NEW: Store action sequences
         
     def add_node(self, node):
         self.nodes.add(node)
     
-    def add_edge(self, node1, node2, weight, action_sequence=None):  # NEW parameter
+    def add_edge(self, node1, node2, weight):
         self.edges[(node1, node2)] = weight
-        if action_sequence is not None:
-            self.edge_actions[(node1, node2)] = action_sequence
-    
-    def get_edge_actions(self, node1, node2):  # NEW method
-        """Get stored action sequence for edge."""
-        return self.edge_actions.get((node1, node2), None)
     
     def get_neighbors(self, node):
         """Get all neighbors of a node."""
@@ -35,7 +28,6 @@ class GraphManager:
                 neigh.add(n2)
         return neigh
     
-    #THE NEXT FUNCTION HAS TO BE REVISED IN THE FUTURE
     def shortest_path(self, start, end):
         if start not in self.nodes or end not in self.nodes:
             return None, float('inf')
@@ -263,4 +255,3 @@ class GraphVisualizer:
             # Most connected nodes
             sorted_nodes = sorted(connectivity.items(), key=lambda x: x[1], reverse=True)
             print(f"  Most connected nodes: {sorted_nodes[:5]}")
-    
