@@ -9,6 +9,7 @@ from utils.optimal_reward_computer import compute_optimal_reward_for_episode
 
 diag=False
 diag2=False
+diag3=False
 
 class HierarchicalManager(nn.Module):
     """
@@ -404,6 +405,9 @@ class HierarchicalManager(nn.Module):
             print(f"  Total grad norm (clipped): {total_grad_norm_clipped:.6f}")
         
         self.optimizer.step()
+        
+        if diag3:
+            print(f"  [UPDATE VERIFY] Manager update completed, loss={total_loss.item():.6f}")
         
         # Check weight changes
         if verbose:
@@ -1400,7 +1404,10 @@ class HierarchicalTrainer:
 
             # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(horizon_env_reward)
-            
+            # Add after this line:
+            if diag3:
+                if horizon_counter % 10 == 0:  # Print every 10 horizons
+                    print(f"  [REWARD DEBUG] Horizon {horizon_counter}: env_reward={horizon_env_reward:.3f}, total_so_far={sum(all_manager_rewards_this_episode):.3f}")
 
             
             # Update Manager after EVERY horizon
@@ -1475,7 +1482,12 @@ class HierarchicalTrainer:
             print(f"\nManager Diagnostics:")
             print(f"  Goal diversity: {len(unique_manager_goals)}/{len(self.manager.pivotal_states)} unique goals")
             print(f"  Avg entropy: {np.mean(manager_entropies):.3f}")
-            print(f"  Avg reward: {np.mean(manager_rewards):.3f} ± {np.std(manager_rewards):.3f}")
+            
+            if len(all_manager_rewards_this_episode) > 0:
+                print(f"  Avg reward: {np.mean(all_manager_rewards_this_episode):.3f} ± {np.std(all_manager_rewards_this_episode):.3f}")
+            else:
+                print(f"  Avg reward: N/A (no data)")
+
             print(f"  Avg value estimate: {np.mean(manager_values_list):.3f}")
             if avg_distance_to_balls is not None:
                 print(f"  Avg distance to balls: {avg_distance_to_balls:.1f}")

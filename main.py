@@ -202,7 +202,8 @@ def test_vae_system():
         action_vocab_size=7,
         hidden_dim=32,
         mu0=2.0,  # Expect 2 pivotal states per trajectory
-        grid_size=24
+        grid_size=24,
+        device=config['device']
     )
     
     print(f"Created VAE system with {sum(p.numel() for p in vae_system.parameters())} parameters")
@@ -231,7 +232,7 @@ def test_vae_system():
     print("VAE System test completed!")
 
 def test_goal_conditioned_policy():
-    """Test the GoalConditionedPolicy implementation."""
+    """Test the a implementation."""
     print("Testing Goal-Conditioned Policy:")
     print("=" * 40)
     
@@ -1857,22 +1858,32 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 2000,
+        'phase2_episodes': 50,
         'max_steps_per_episode': 2500,
         'manager_horizon': 50,
         'neighborhood_size': 5,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3, 
-        'vae_mu0': 8.0,
+        'vae_mu0': 10.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
-        'full_breakdown_every': 50  # NEW: Full breakdown every N episodes
+        'full_breakdown_every': 50,  # NEW: Full breakdown every N episodes
+        'device': 'cuda'  # <-- ADD THIS: 'cpu' or 'cuda'
     }
 
 def train_full_phase1_phase2(config=externalconfig):
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
 
+    # Validate device availability
+    if config['device'] == 'cuda':
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA requested but not available. Falling back to CPU.")
+            config['device'] = 'cpu'
+        else:
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU")
     
     print("="*70)
     print("FULL TRAINING with Diagnostics")
@@ -1885,7 +1896,7 @@ def train_full_phase1_phase2(config=externalconfig):
     env.phase = 1
     env.randomgen = True
     
-    policy = GoalConditionedPolicy(lr=config['manager_lr'])
+    policy = GoalConditionedPolicy(lr=config['manager_lr'],device=config['device'])
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
     buffer = StatBuffer()
     
@@ -1913,12 +1924,14 @@ def train_full_phase1_phase2(config=externalconfig):
         lr=config['manager_lr'],
         horizon=config['manager_horizon'],
         diagnostic_interval=config['diagnostic_interval'],  # NEW
-        diagnostic_checkstart=config['diagnostic_checkstart']  # NEW
+        diagnostic_checkstart=config['diagnostic_checkstart'],  # NEW
+        device=config['device']
     )
     worker = HierarchicalWorker(
         world_graph, 
         pivotal_states,
-        lr=config['worker_lr']  # ← ADD THIS
+        lr=config['worker_lr'],  # ← ADD THIS
+        device=config['device']
     )
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
@@ -1951,6 +1964,8 @@ def train_full_phase1_phase2(config=externalconfig):
     
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
+        if episode%10 == 0 and episode > 0:
+            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} ---")
         stats = trainer.train_episode(max_steps=config['max_steps_per_episode'],full_breakdown_every=config['full_breakdown_every'])
         
         metrics['rewards'].append(stats['episode_reward'])

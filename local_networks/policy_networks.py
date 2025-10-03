@@ -439,8 +439,8 @@ class GoalConditionedPolicy(nn.Module):
         return episodes_data
     
     def discover_edges_between_pivotal_states(self, env, pivotal_states: List[Tuple[int, int]], 
-                                            max_walk_length: int = 20,
-                                            num_attempts: int = 10) -> Dict[Tuple, List[Tuple]]:
+                                            max_walk_length: int = 50,
+                                            num_attempts: int = 20) -> Dict[Tuple, List[Tuple]]:
         """
         Discover edges between pivotal states using random walks.
         FIXED: Added boundary validation to prevent grid overflow.
