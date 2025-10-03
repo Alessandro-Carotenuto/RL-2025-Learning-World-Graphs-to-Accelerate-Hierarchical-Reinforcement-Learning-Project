@@ -114,7 +114,7 @@ def compute_optimal_reward_for_episode(env, debug=False) -> Tuple[float, int]:
     step_penalty = total_steps * (-0.01)
     
     # Ball collection rewards
-    ball_rewards = balls_collected * 0.05
+    ball_rewards = balls_collected * 1
     
     # Terminal bonus (only if all balls collected)
     terminal_bonus = 0.0

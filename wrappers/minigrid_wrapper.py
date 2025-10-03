@@ -733,13 +733,14 @@ class MinigridWrapper(MiniGridEnv):
         obs, reward, terminated, truncated, info = super().step(action)
         
         if self.mode == EnvModes.MULTIGOAL and self.phase == 2 and ball_collected:
-            reward += 0.15  # Per ball reward
+            reward += 1  # Per ball reward
             
             if len(self.active_balls) == 0:
                 terminated = True
                 # Terminal bonus: +0.5 max, reduced by time penalty
                 time_penalty = 0.45 * (self.step_count / self.max_steps)
                 reward += (0.6 - time_penalty)
+
         
         return obs, reward, terminated, truncated, info
 

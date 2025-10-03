@@ -7,6 +7,9 @@ import random
 import numpy as np
 from utils.optimal_reward_computer import compute_optimal_reward_for_episode
 
+diag=False
+diag2=False
+
 class HierarchicalManager(nn.Module):
     """
     Phase 2: Hierarchical Manager implementing Wide-then-Narrow goal selection.
@@ -732,54 +735,63 @@ class HierarchicalWorker(nn.Module):
             if path:
                 self.current_traversal_path = path
                 self.traversal_step = 0
-                print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
-                print(f"  - Target (gw): {wide_goal}")
-                print(f"  - Planned Path: {self.current_traversal_path}")
+                if diag:
+                    print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
+                    print(f"  - Target (gw): {wide_goal}")
+                    print(f"  - Planned Path: {self.current_traversal_path}")
 
         # 2. EXECUTE TRAVERSAL
         is_traversing = self.current_traversal_path and self.traversal_step < len(self.current_traversal_path) - 1
 
         if is_traversing:
-            print(f"\n[WORKER DIAGNOSTIC] Executing Traversal Step")
-            print(f"  - Agent is at: {state}, facing direction: {agent_dir}")
+            if diag:
+                print(f"\n[WORKER DIAGNOSTIC] Executing Traversal Step")
+                print(f"  - Agent is at: {state}, facing direction: {agent_dir}")
 
             expected_node = self.current_traversal_path[self.traversal_step]
             next_node = self.current_traversal_path[self.traversal_step + 1]
 
-            print(f"  - Path State: Following path {self.current_traversal_path}")
-            print(f"  - Edge State: On edge {self.traversal_step} ({expected_node} -> {next_node})")
+            if diag:
+                print(f"  - Path State: Following path {self.current_traversal_path}")
+                print(f"  - Edge State: On edge {self.traversal_step} ({expected_node} -> {next_node})")
 
             # CRITICAL CHECK: Position Synchronization
             if state != expected_node:
-                print(f"  - 🔴 DESYNC DETECTED! Agent is at {state}, but expected to be at {expected_node}.")
-                print(f"  - Aborting traversal and switching to policy.")
+                if diag:
+                    print(f"  - 🔴 DESYNC DETECTED! Agent is at {state}, but expected to be at {expected_node}.")
+                    print(f"  - Aborting traversal and switching to policy.")
                 self.reset_worker_state()
             else:
-                print(f"  - ✅ SYNC CONFIRMED. Agent is at the correct node.")
+                if diag:
+                    print(f"  - ✅ SYNC CONFIRMED. Agent is at the correct node.")
                 
                 # Generate action sequence for current edge segment if needed
                 if not hasattr(self, 'current_edge_actions') or self.current_edge_actions is None:
                     edge_path = [expected_node, next_node]
                     self.current_edge_actions = self.generate_actions_from_path(edge_path, agent_dir)
                     self.current_action_idx = 0
-                    print(f"  - Action Generation: Created sequence {self.current_edge_actions} from path")
+                    if diag:
+                        print(f"  - Action Generation: Created sequence {self.current_edge_actions} from path")
                 
                 # Execute next action in sequence
                 if self.current_action_idx < len(self.current_edge_actions):
                     action = self.current_edge_actions[self.current_action_idx]
                     action_names = ['turn_left', 'turn_right', 'move_forward']
-                    print(f"  - Action Execution: Returning action '{action_names[action]}' (index {self.current_action_idx})")
+                    if diag:
+                        print(f"  - Action Execution: Returning action '{action_names[action]}' (index {self.current_action_idx})")
                     
                     self.current_action_idx += 1
                     
                     # Check if finished this edge segment
                     if self.current_action_idx >= len(self.current_edge_actions):
-                        print(f"  - State Update: Completed edge segment, advancing to next node")
+                        if diag:
+                            print(f"  - State Update: Completed edge segment, advancing to next node")
                         self.current_edge_actions = None
                         self.traversal_step += 1
                         
                         if self.traversal_step >= len(self.current_traversal_path) - 1:
-                            print("  - State Update: End of entire path reached. Clearing path.")
+                            if diag:
+                                print("  - State Update: End of entire path reached. Clearing path.")
                             self.current_traversal_path = []
                     
                     with torch.no_grad():
@@ -788,13 +800,15 @@ class HierarchicalWorker(nn.Module):
                     log_prob = torch.tensor(-1.0, device=self.device)
                     return action, log_prob, value.squeeze()
                 else:
-                    print(f"  - 🔴 ERROR: No actions available but still traversing")
+                    if diag:
+                        print(f"  - 🔴 ERROR: No actions available but still traversing")
                     self.reset_worker_state()
 
         # 3. FALLBACK TO POLICY ACTION
         if not is_traversing:
             if self.current_traversal_path and self.traversal_step > 0:
-                print("[WORKER DIAGNOSTIC] Traversal just ended. Switching to policy.")
+                if diag:
+                    print("[WORKER DIAGNOSTIC] Traversal just ended. Switching to policy.")
             self.reset_worker_state()
 
         with torch.no_grad():
@@ -1203,9 +1217,26 @@ class HierarchicalTrainer:
     
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
         """Train one episode with comprehensive diagnostics."""
+        
+        # Episode tracking
+        episode_reward = 0
+        episode_steps = 0
+        manager_updates = 0
+        worker_updates = 0
+
+        # ADD THIS:
+        all_manager_rewards_this_episode = []  # Track all horizon rewards for diagnostics
+
         # Reset environment and networks
         obs = self.env.reset()
         state = tuple(self.env.agent_pos)
+
+        # ADD THIS DIAGNOSTIC HERE:
+        if diag2:
+            print(f"\n[EPISODE {self.global_episode_counter + 1} START]")
+            print(f"  Agent at: {state}")
+            print(f"  Balls at: {list(self.env.active_balls)}")
+            print(f"  Pivotal states (first 5): {self.manager.pivotal_states[:5]}")
 
         optimal_reward, optimal_steps = compute_optimal_reward_for_episode(self.env)
         
@@ -1241,10 +1272,22 @@ class HierarchicalTrainer:
         
         while episode_steps < max_steps:
             # Manager selects goals
+            self.manager.reset_manager_state()  # ← Force fresh decision each horizon
+
             wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
                 state, step_count=self.global_step_counter
             )
             
+            # ADD THIS DIAGNOSTIC HERE:
+            if diag2:
+                balls_before_horizon = len(self.env.active_balls)
+                if len(self.env.active_balls) > 0:
+                    nearest_ball = min(self.env.active_balls, 
+                                    key=lambda b: abs(wide_goal[0]-b[0]) + abs(wide_goal[1]-b[1]))
+                    dist_to_nearest = abs(wide_goal[0]-nearest_ball[0]) + abs(wide_goal[1]-nearest_ball[1])
+                    print(f"[MANAGER SELECT] wide={wide_goal}, narrow={narrow_goal}, "
+                        f"nearest_ball={nearest_ball}, dist={dist_to_nearest}")
+
             # NEW: Track Manager diagnostics
             with torch.no_grad():
                 wide_logits, _, _ = self.manager.forward(state)
@@ -1299,6 +1342,12 @@ class HierarchicalTrainer:
                     terminated = False
                     truncated = False
                 
+                if diag2:
+                    if env_reward != 0:
+                        print(f"[REWARD] Step {episode_steps}: env_reward={env_reward:.3f}, "
+                            f"horizon_total={horizon_env_reward + env_reward:.3f}, "
+                            f"agent_pos={next_state}, balls_remaining={len(self.env.active_balls)}")
+
                 # Worker reward (internal)
                 worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
                 
@@ -1325,12 +1374,20 @@ class HierarchicalTrainer:
                 horizon_env_reward += env_reward
                 episode_reward += env_reward
                 
+                
                 self.global_step_counter += 1
                 episode_steps += 1
                 state = next_state
                 
                 if terminated or truncated:
                     break
+            
+            if diag2:
+                # ADD THIS DIAGNOSTIC HERE (after the for h in range loop):
+                balls_collected_this_horizon = balls_before_horizon - len(self.env.active_balls)
+                print(f"[HORIZON END] horizon_reward={horizon_env_reward:.3f}, "
+                    f"balls_this_horizon={balls_collected_this_horizon}, "
+                    f"wide_goal={wide_goal}, narrow_goal={narrow_goal}")
             
             # NEW: Track Worker success
             if goal_reached_this_horizon:
@@ -1340,6 +1397,13 @@ class HierarchicalTrainer:
             # Manager receives horizon reward
             manager_rewards.append(horizon_env_reward)
             horizon_counter += 1
+
+            # ADD THIS - save for diagnostics before resetting
+            all_manager_rewards_this_episode.append(horizon_env_reward)
+            
+            # In train_episode(), at the end:
+            print(f"Episode {self.global_episode_counter}: {total_horizons} horizons")
+
             
             # Update Manager after EVERY horizon
             if len(manager_rewards) > 0:
@@ -1381,15 +1445,20 @@ class HierarchicalTrainer:
                 distances.append(min_dist)
             avg_distance_to_balls = np.mean(distances) if distances else None
         
+        diversity_ratio = len(unique_manager_goals) / total_horizons if total_horizons > 0 else 0
         # Store diagnostics
-        self.diagnostic_history['manager_goal_diversity'].append(
-            len(unique_manager_goals) / len(self.manager.pivotal_states)
-        )
+        self.diagnostic_history['manager_goal_diversity'].append(diversity_ratio)
         self.diagnostic_history['manager_entropy'].append(np.mean(manager_entropies))
         self.diagnostic_history['worker_goal_achievement'].append(worker_success_rate)
         self.diagnostic_history['balls_collected_per_episode'].append(balls_collected)
-        self.diagnostic_history['manager_rewards_mean'].append(np.mean(manager_rewards))
-        self.diagnostic_history['manager_rewards_std'].append(np.std(manager_rewards))
+        # Store diagnostics
+        self.diagnostic_history['manager_rewards_mean'].append(
+            np.mean(all_manager_rewards_this_episode) if all_manager_rewards_this_episode else 0.0
+        )
+        self.diagnostic_history['manager_rewards_std'].append(
+            np.std(all_manager_rewards_this_episode) if len(all_manager_rewards_this_episode) > 1 else 0.0
+        )
+        
         if avg_distance_to_balls is not None:
             self.diagnostic_history['goal_distance_to_balls'].append(avg_distance_to_balls)
         self.diagnostic_history['manager_value_mean'].append(np.mean(manager_values_list))

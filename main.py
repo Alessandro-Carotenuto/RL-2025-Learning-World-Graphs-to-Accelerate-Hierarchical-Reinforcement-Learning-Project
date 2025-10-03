@@ -1712,8 +1712,14 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
     return episode_diagnostics
 
 def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.png'):
-    """Plot comprehensive training diagnostics."""
+    """Plot comprehensive training diagnostics with moving averages."""
     import matplotlib.pyplot as plt
+    
+    def moving_average(data, window=20):
+        """Compute moving average with specified window size."""
+        if len(data) < window:
+            return data  # Return original if not enough data
+        return np.convolve(data, np.ones(window)/window, mode='valid')
     
     history = trainer.diagnostic_history
     num_episodes = len(history['episode_rewards'])
@@ -1724,6 +1730,9 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     
     # 1. Episode rewards
     axes[0, 0].plot(episodes, history['episode_rewards'], 'b-', alpha=0.7, label='Agent')
+    ma_rewards = moving_average(history['episode_rewards'])
+    if len(ma_rewards) > 0:
+        axes[0, 0].plot(range(20, 20 + len(ma_rewards)), ma_rewards, 'k-', linewidth=2, label='MA(20)')
     axes[0, 0].set_title('Episode Rewards')
     axes[0, 0].set_xlabel('Episode')
     axes[0, 0].set_ylabel('Reward')
@@ -1731,7 +1740,10 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     axes[0, 0].legend()
     
     # 2. Manager goal diversity
-    axes[0, 1].plot(episodes, history['manager_goal_diversity'], 'g-', linewidth=2)
+    axes[0, 1].plot(episodes, history['manager_goal_diversity'], 'g-', linewidth=2, alpha=0.7, label='Diversity')
+    ma_diversity = moving_average(history['manager_goal_diversity'])
+    if len(ma_diversity) > 0:
+        axes[0, 1].plot(range(20, 20 + len(ma_diversity)), ma_diversity, 'k-', linewidth=2, label='MA(20)')
     axes[0, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='Random (100%)')
     axes[0, 1].axhline(y=1/len(trainer.manager.pivotal_states), color='orange', 
                        linestyle='--', alpha=0.5, label='Collapsed')
@@ -1743,7 +1755,10 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     axes[0, 1].legend()
     
     # 3. Manager entropy
-    axes[0, 2].plot(episodes, history['manager_entropy'], 'purple', linewidth=2)
+    axes[0, 2].plot(episodes, history['manager_entropy'], 'purple', linewidth=2, alpha=0.7, label='Entropy')
+    ma_entropy = moving_average(history['manager_entropy'])
+    if len(ma_entropy) > 0:
+        axes[0, 2].plot(range(20, 20 + len(ma_entropy)), ma_entropy, 'k-', linewidth=2, label='MA(20)')
     max_entropy = np.log(len(trainer.manager.pivotal_states))
     axes[0, 2].axhline(y=max_entropy, color='r', linestyle='--', alpha=0.5, label='Max entropy')
     axes[0, 2].set_title('Manager Policy Entropy')
@@ -1753,15 +1768,22 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     axes[0, 2].legend()
     
     # 4. Worker goal achievement
-    axes[1, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2)
+    axes[1, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2, alpha=0.7, label='Achievement')
+    ma_achievement = moving_average([x*100 for x in history['worker_goal_achievement']])
+    if len(ma_achievement) > 0:
+        axes[1, 0].plot(range(20, 20 + len(ma_achievement)), ma_achievement, 'k-', linewidth=2, label='MA(20)')
     axes[1, 0].set_title('Worker Goal Achievement Rate')
     axes[1, 0].set_xlabel('Episode')
     axes[1, 0].set_ylabel('% Horizons Goal Reached')
     axes[1, 0].set_ylim([0, 100])
     axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
     
     # 5. Balls collected
-    axes[1, 1].plot(episodes, history['balls_collected_per_episode'], 'red', linewidth=2)
+    axes[1, 1].plot(episodes, history['balls_collected_per_episode'], 'red', linewidth=2, alpha=0.7, label='Balls')
+    ma_balls = moving_average(history['balls_collected_per_episode'])
+    if len(ma_balls) > 0:
+        axes[1, 1].plot(range(20, 20 + len(ma_balls)), ma_balls, 'k-', linewidth=2, label='MA(20)')
     axes[1, 1].axhline(y=trainer.env.total_balls, color='g', linestyle='--', 
                        alpha=0.5, label='All balls')
     axes[1, 1].set_title('Balls Collected per Episode')
@@ -1771,7 +1793,10 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     axes[1, 1].legend()
     
     # 6. Manager rewards
-    axes[1, 2].plot(episodes, history['manager_rewards_mean'], 'b-', linewidth=2, label='Mean')
+    axes[1, 2].plot(episodes, history['manager_rewards_mean'], 'b-', linewidth=2, alpha=0.7, label='Mean')
+    ma_manager_rew = moving_average(history['manager_rewards_mean'])
+    if len(ma_manager_rew) > 0:
+        axes[1, 2].plot(range(20, 20 + len(ma_manager_rew)), ma_manager_rew, 'k-', linewidth=2, label='MA(20)')
     axes[1, 2].fill_between(episodes, 
                             np.array(history['manager_rewards_mean']) - np.array(history['manager_rewards_std']),
                             np.array(history['manager_rewards_mean']) + np.array(history['manager_rewards_std']),
@@ -1786,25 +1811,37 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     # 7. Distance to balls
     if len(history['goal_distance_to_balls']) > 0:
         axes[2, 0].plot(episodes[:len(history['goal_distance_to_balls'])], 
-                        history['goal_distance_to_balls'], 'brown', linewidth=2)
+                        history['goal_distance_to_balls'], 'brown', linewidth=2, alpha=0.7, label='Distance')
+        ma_distance = moving_average(history['goal_distance_to_balls'])
+        if len(ma_distance) > 0:
+            axes[2, 0].plot(range(20, 20 + len(ma_distance)), ma_distance, 'k-', linewidth=2, label='MA(20)')
         axes[2, 0].set_title('Avg Distance: Manager Goals → Balls')
         axes[2, 0].set_xlabel('Episode')
         axes[2, 0].set_ylabel('Manhattan Distance')
         axes[2, 0].grid(True, alpha=0.3)
+        axes[2, 0].legend()
     
     # 8. Manager values
-    axes[2, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2)
+    axes[2, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2, alpha=0.7, label='Value')
+    ma_manager_val = moving_average(history['manager_value_mean'])
+    if len(ma_manager_val) > 0:
+        axes[2, 1].plot(range(20, 20 + len(ma_manager_val)), ma_manager_val, 'k-', linewidth=2, label='MA(20)')
     axes[2, 1].set_title('Manager Value Estimates')
     axes[2, 1].set_xlabel('Episode')
     axes[2, 1].set_ylabel('Average Value')
     axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].legend()
     
     # 9. Worker values
-    axes[2, 2].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2)
+    axes[2, 2].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2, alpha=0.7, label='Value')
+    ma_worker_val = moving_average(history['worker_value_mean'])
+    if len(ma_worker_val) > 0:
+        axes[2, 2].plot(range(20, 20 + len(ma_worker_val)), ma_worker_val, 'k-', linewidth=2, label='MA(20)')
     axes[2, 2].set_title('Worker Value Estimates')
     axes[2, 2].set_xlabel('Episode')
     axes[2, 2].set_ylabel('Average Value')
     axes[2, 2].grid(True, alpha=0.3)
+    axes[2, 2].legend()
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -1817,18 +1854,18 @@ def train_full_phase1_phase2():
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters
     config = {
-        'maze_size': EnvSizes.SMALL,
+        'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 2,
-        'max_steps_per_episode': 500,
-        'manager_horizon': 10,
+        'phase2_episodes': 20,
+        'max_steps_per_episode': 1000,
+        'manager_horizon': 200,
         'neighborhood_size': 5,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3, 
         'vae_mu0': 8.0,
-        'diagnostic_interval': 10000000,  # NEW: Print diagnostics every K steps
+        'diagnostic_interval': 5000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
-        'full_breakdown_every': 10  # NEW: Full breakdown every N episodes
+        'full_breakdown_every': 100  # NEW: Full breakdown every N episodes
     }
 
     
@@ -1839,7 +1876,7 @@ def train_full_phase1_phase2():
         print(f"  {k}: {v}")
     
     # Phase 1
-    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL)
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'])
     env.phase = 1
     env.randomgen = True
     
