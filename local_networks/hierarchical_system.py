@@ -1401,8 +1401,6 @@ class HierarchicalTrainer:
             # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(horizon_env_reward)
             
-            # In train_episode(), at the end:
-            print(f"Episode {self.global_episode_counter}: {total_horizons} horizons")
 
             
             # Update Manager after EVERY horizon

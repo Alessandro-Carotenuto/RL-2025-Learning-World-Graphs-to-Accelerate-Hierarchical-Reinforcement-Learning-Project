@@ -1711,16 +1711,17 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
     print("\n" + "="*70)
     return episode_diagnostics
 
-def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.png'):
+def plot_training_diagnostics(trainer, config, save_path=None):
     """Plot comprehensive training diagnostics with moving averages."""
     import matplotlib.pyplot as plt
+
     
     def moving_average(data, window=20):
         """Compute moving average with specified window size."""
         if len(data) < window:
-            return data  # Return original if not enough data
+            return np.array([])  # Return empty array, not original data
         return np.convolve(data, np.ones(window)/window, mode='valid')
-    
+        
     history = trainer.diagnostic_history
     num_episodes = len(history['episode_rewards'])
     episodes = range(1, num_episodes + 1)
@@ -1844,6 +1845,9 @@ def plot_training_diagnostics(trainer, save_path='training_diagnostics_detailed.
     axes[2, 2].legend()
     
     plt.tight_layout()
+    if save_path is None:
+        # Build filename from config
+        save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase2_episodes']}.png"
     plt.savefig(save_path, dpi=150)
     print(f"\nDiagnostic plots saved to {save_path}")
     plt.close()
@@ -1856,16 +1860,16 @@ def train_full_phase1_phase2():
     config = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 20,
-        'max_steps_per_episode': 1000,
-        'manager_horizon': 200,
+        'phase2_episodes': 5,
+        'max_steps_per_episode': 2500,
+        'manager_horizon': 50,
         'neighborhood_size': 5,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3, 
         'vae_mu0': 8.0,
-        'diagnostic_interval': 5000,  # NEW: Print diagnostics every K steps
+        'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
-        'full_breakdown_every': 100  # NEW: Full breakdown every N episodes
+        'full_breakdown_every': 50  # NEW: Full breakdown every N episodes
     }
 
     
@@ -1968,7 +1972,7 @@ def train_full_phase1_phase2():
     print("TRAINING COMPLETE - Generating diagnostic plots...")
     print("="*70)
     
-    plot_training_diagnostics(trainer)  # ← HERE, after the loop
+    plot_training_diagnostics(trainer,config)  # ← HERE, after the loop
 
     # Results
     print("\n" + "="*70)
@@ -2010,8 +2014,15 @@ def train_full_phase1_phase2():
     axes[1, 1].set_ylabel('Seconds')
     axes[1, 1].grid(True, alpha=0.3)
     
+
+    # Plots - BOTH with config in filename
+    simple_plot_path = (f"training_simple_"
+                       f"size{config['maze_size'].name}_"
+                       f"h{config['manager_horizon']}_"
+                       f"ep{config['phase2_episodes']}.png")
+    
     plt.tight_layout()
-    plt.savefig('training_diagnostics.png')
+    plt.savefig(simple_plot_path)
     print("\nPlots saved to training_diagnostics.png")
 
 def main():
