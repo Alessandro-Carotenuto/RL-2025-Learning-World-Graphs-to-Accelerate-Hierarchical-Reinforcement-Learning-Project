@@ -1854,13 +1854,10 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 
 # ACTUAL TRAINING CODE ----------------------------------------------------
 
-def train_full_phase1_phase2():
-    """Complete training with comprehensive diagnostics."""
-    # Hyperparameters
-    config = {
+externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 5,
+        'phase2_episodes': 2000,
         'max_steps_per_episode': 2500,
         'manager_horizon': 50,
         'neighborhood_size': 5,
@@ -1871,6 +1868,10 @@ def train_full_phase1_phase2():
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
         'full_breakdown_every': 50  # NEW: Full breakdown every N episodes
     }
+
+def train_full_phase1_phase2(config=externalconfig):
+    """Complete training with comprehensive diagnostics."""
+    # Hyperparameters setted up in externalconfig
 
     
     print("="*70)
