@@ -1756,7 +1756,7 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].legend()
     
-    # 3. Manager entropy
+    # 3. Manager e
     axes[0, 2].plot(episodes, history['manager_entropy'], 'purple', linewidth=2, alpha=0.7, label='Entropy')
     ma_entropy = moving_average(history['manager_entropy'])
     if len(ma_entropy) > 0:
@@ -1858,10 +1858,10 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 8,
-        'phase2_episodes': 50,
-        'max_steps_per_episode': 2500,
-        'manager_horizon': 50,
-        'neighborhood_size': 5,
+        'phase2_episodes': 100,
+        'max_steps_per_episode': 300,
+        'manager_horizon': 10,
+        'neighborhood_size': 20,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3, 
         'vae_mu0': 10.0,

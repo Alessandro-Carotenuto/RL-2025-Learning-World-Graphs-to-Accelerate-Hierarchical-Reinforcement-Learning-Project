@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict, Optional
 import random
 import numpy as np
 from utils.optimal_reward_computer import compute_optimal_reward_for_episode
+from collections import Counter
 
 diag=False
 diag2=False
@@ -66,7 +67,7 @@ class HierarchicalManager(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.1
         self.value_coef = 0.5
 
         # Diagnostic parameters
@@ -261,23 +262,16 @@ class HierarchicalManager(nn.Module):
         print(f"Manager initialized with standard scaling (gain=1.0)")
 
     def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0):
-        """
-        Update Manager policy with comprehensive diagnostics.
-        
-        Args:
-            step_count: Global step counter for conditional printing
-        """
+        """Update Manager policy with wide + narrow entropy regularization."""
         if len(rewards) == 0:
             return
         
-
-        # Configurable diagnostic printing
+        # Diagnostic printing
         if self.diagnostic_checkstart and step_count < 15:
             verbose = True
         elif step_count % self.diagnostic_interval == 0:
             verbose = True
         else:
-            verbose = False
             verbose = False
         
         if verbose:
@@ -289,9 +283,9 @@ class HierarchicalManager(nn.Module):
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         values_tensor = torch.stack(values).squeeze()
         log_probs_tensor = torch.stack(log_probs)
-        entropies_tensor = torch.stack(entropies)
-
-        # Fix dimension mismatch
+        wide_entropies_tensor = torch.stack(entropies)  # These are wide entropies from get_manager_action
+        
+        # Fix dimensions
         if values_tensor.dim() == 0:
             values_tensor = values_tensor.unsqueeze(0)
         if rewards_tensor.dim() == 0:
@@ -300,10 +294,7 @@ class HierarchicalManager(nn.Module):
         if verbose:
             print(f"Batch size: {len(rewards)}")
             print(f"Rewards: {rewards_tensor.tolist()}")
-            print(f"Values: {values_tensor.tolist()}")
-            print(f"Log probs: {log_probs_tensor.tolist()}")
-            print(f"Entropies: {entropies_tensor.tolist()}")
-
+        
         # Compute returns
         returns = []
         R = 0
@@ -312,111 +303,67 @@ class HierarchicalManager(nn.Module):
             returns.insert(0, R)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
         
-        if verbose:
-            print(f"Returns (discounted): {returns.tolist()}")
-        
         # GAE
         gae_lambda = 0.95
         advantages = torch.zeros_like(rewards_tensor)
-        
         gae = 0
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
                 delta = rewards_tensor[t] - values_tensor[t]
             else:
                 delta = rewards_tensor[t] + self.gamma * values_tensor[t + 1] - values_tensor[t]
-            
             gae = delta + self.gamma * gae_lambda * gae
             advantages[t] = gae
         
-        if verbose:
-            print(f"Advantages (raw): min={advantages.min().item():.3f}, max={advantages.max().item():.3f}, mean={advantages.mean().item():.3f}")
-        
         # Normalize advantages
-        advantages_prenorm = advantages.clone()
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            if verbose:
-                print(f"Advantages (normalized): min={advantages.min().item():.3f}, max={advantages.max().item():.3f}, mean={advantages.mean().item():.3f}")
-        else:
-            if verbose:
-                print(f"Advantages: Single sample, no normalization applied")
-
-        # Store pre-update weights for comparison
-        if verbose:
-            pre_weights = {}
-            for name, param in self.named_parameters():
-                if 'lstm' in name or 'wide_head' in name:
-                    pre_weights[name] = param.data.clone()
-
-        # Policy loss
+        
+        # Policy and value losses
         policy_loss = -(advantages.detach() * log_probs_tensor).mean()
-
-        # Value loss
         value_loss = F.mse_loss(values_tensor, returns)
-
-        # Entropy (pre-computed)
-        avg_entropy = entropies_tensor.mean()
-
+        
+        # Compute narrow entropy: E_gw[H(π^n|gw)]
+        narrow_entropies = []
+        for i, (state, wide_goal) in enumerate(zip(states, wide_goals)):
+            # Recompute narrow distribution for this state and wide goal
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
+            wide_logits, features, _ = self.forward(state)
+            
+            # Get narrow logits
+            wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
+            narrow_input = torch.cat([features, wide_goal_tensor])
+            narrow_logits = self.narrow_head(narrow_input)
+            
+            # Compute entropy
+            narrow_probs = F.softmax(narrow_logits, dim=0)
+            narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
+            narrow_entropies.append(narrow_entropy)
+        
+        narrow_entropy_mean = torch.stack(narrow_entropies).mean()
+        wide_entropy_mean = wide_entropies_tensor.mean()
+        
         if verbose:
             print(f"\nLoss components:")
             print(f"  Policy loss: {policy_loss.item():.6f}")
             print(f"  Value loss: {value_loss.item():.6f}")
-            print(f"  Avg entropy: {avg_entropy.item():.6f}")
+            print(f"  Wide entropy: {wide_entropy_mean.item():.6f}")
+            print(f"  Narrow entropy: {narrow_entropy_mean.item():.6f}")
             print(f"  Entropy coef: {self.entropy_coef}")
-            print(f"  Value coef: {self.value_coef}")
-
-        # Combined loss
-        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * avg_entropy
-
+        
+        # Combined loss with both entropies (paper: H(π^ω) + H(π^n|gw))
+        total_loss = (policy_loss + 
+                    self.value_coef * value_loss - 
+                    self.entropy_coef * (wide_entropy_mean + narrow_entropy_mean))
+        
         if verbose:
             print(f"  Total loss: {total_loss.item():.6f}")
-
+        
         # Optimization
         self.optimizer.zero_grad()
         total_loss.backward()
-        
-        # Check gradients before clipping
-        if verbose:
-            print(f"\nGradients (before clipping):")
-            total_grad_norm = 0
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    total_grad_norm += grad_norm ** 2
-                    if grad_norm > 0.01 or 'lstm' in name or 'wide_head' in name:
-                        print(f"  {name}: {grad_norm:.6f}")
-            total_grad_norm = total_grad_norm ** 0.5
-            print(f"  Total grad norm: {total_grad_norm:.6f}")
-        
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
-        
-        # Check gradients after clipping
-        if verbose:
-            print(f"\nGradients (after clipping):")
-            total_grad_norm_clipped = 0
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    total_grad_norm_clipped += grad_norm ** 2
-                    if grad_norm > 0.01 or 'lstm' in name or 'wide_head' in name:
-                        print(f"  {name}: {grad_norm:.6f}")
-            total_grad_norm_clipped = total_grad_norm_clipped ** 0.5
-            print(f"  Total grad norm (clipped): {total_grad_norm_clipped:.6f}")
-        
         self.optimizer.step()
-        
-        if diag3:
-            print(f"  [UPDATE VERIFY] Manager update completed, loss={total_loss.item():.6f}")
-        
-        # Check weight changes
-        if verbose:
-            print(f"\nWeight changes:")
-            for name, param in self.named_parameters():
-                if name in pre_weights:
-                    weight_change = (param.data - pre_weights[name]).norm().item()
-                    weight_norm = param.data.norm().item()
-                    print(f"  {name}: change={weight_change:.6f}, norm={weight_norm:.6f}")
         
         if verbose:
             print(f"{'='*70}\n")
@@ -1252,7 +1199,9 @@ class HierarchicalTrainer:
         episode_steps = 0
         manager_updates = 0
         worker_updates = 0
-        
+        manager_selection_counts = Counter()
+
+
         # NEW: Diagnostic tracking for this episode
         manager_entropies = []
         unique_manager_goals = set()
@@ -1282,6 +1231,8 @@ class HierarchicalTrainer:
                 state, step_count=self.global_step_counter
             )
             
+            manager_selection_counts[wide_goal] += 1
+
             # ADD THIS DIAGNOSTIC HERE:
             if diag2:
                 balls_before_horizon = len(self.env.active_balls)
@@ -1434,6 +1385,9 @@ class HierarchicalTrainer:
         
         self.global_episode_counter += 1
         
+        # # After episode
+        # print(f"Manager selections: {manager_selection_counts.most_common(5)}")
+
         # NEW: Compute episode-level diagnostics
         balls_collected = self.env.total_balls - len(self.env.active_balls)
         worker_success_rate = worker_goal_reached_count / total_horizons if total_horizons > 0 else 0

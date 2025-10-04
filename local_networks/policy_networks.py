@@ -539,6 +539,19 @@ class GoalConditionedPolicy(nn.Module):
             Dict of (start, end) -> (refined_path, weight)
         """
         refined_edges = {}
+
+        for (start_state, end_state), raw_path in raw_edges.items():
+            # Validate adjacency
+            valid = True
+            for i in range(len(raw_path) - 1):
+                dist = abs(raw_path[i+1][0] - raw_path[i][0]) + abs(raw_path[i+1][1] - raw_path[i][1])
+                if dist != 1:
+                    print(f"  ⚠️  Skipping edge {start_state}->{end_state}: non-adjacent nodes {raw_path[i]}->{raw_path[i+1]}")
+                    valid = False
+                    break
+            
+            if not valid:
+                continue  # Skip this edge entirely
         
         print("Refining edge paths with goal-conditioned policy...")
         
