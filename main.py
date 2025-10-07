@@ -57,7 +57,7 @@ from utils.optimal_reward_computer import compute_optimal_reward_for_episode, co
 
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8):
     """
-    Main alternating training loop - UPDATED to include world graph construction.
+    Main alternating training loop with persistent KL annealing.
     """
     print("Starting Alternating Training Loop:")
     print("=" * 50)
@@ -65,13 +65,22 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     reconstruction_losses = []
     all_pivotal_states = []
     pivotal_states = []
+    metrics = {
+    'num_pivotal_states_per_iteration': [],
+    'policy_success_rates': []
+    }
+
+    
+    # NEW: Persistent KL weight across iterations
+    persistent_kl_weight = 0.0
+    total_epochs = max_iterations * 25  # Assuming 25 epochs per iteration
+    kl_ramp_rate = 1.0 / (total_epochs * 0.5)  # Ramp over first 50% of total
     
     for iteration in range(max_iterations):
         print(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
+        print(f"Current KL weight: {persistent_kl_weight:.3f}")
         
-        # Phase 1: Train VAE on current trajectory buffer
-        print(f"Phase 1: Training VAE on {buffer.episodes_in_buffer} episodes...")
-        
+        # Collect initial data if needed
         if buffer.episodes_in_buffer < 3:
             print("Not enough episodes for VAE training, collecting initial data...")
             for _ in range(5):
@@ -84,27 +93,39 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                     buffer.add_episodes(episodes)
             continue
         
-        # Train VAE and get pivotal states
+        # Train VAE with persistent KL weight
+        print(f"Phase 1: Training VAE on {buffer.episodes_in_buffer} episodes...")
         try:
-            pivotal_states = vae_system.train(buffer, num_epochs=25, batch_size=3)
+            pivotal_states = vae_system.train(
+                buffer, 
+                num_epochs=25, 
+                batch_size=3,
+                initial_kl_weight=persistent_kl_weight  # NEW
+            )
         except Exception as e:
             print(f"VAE training failed: {e}")
             continue
         
-        # Track reconstruction loss for plateau detection
+        # Update KL weight for next iteration
+        persistent_kl_weight = min(1.0, persistent_kl_weight + kl_ramp_rate * 25)
+        
+        # Track metrics
         if vae_system.training_history:
             current_loss = vae_system.training_history[-1]['reconstruction_loss']
             reconstruction_losses.append(current_loss)
             print(f"Current reconstruction loss: {current_loss:.4f}")
         
+        metrics['num_pivotal_states_per_iteration'].append(len(pivotal_states))
+
         all_pivotal_states.append(pivotal_states.copy())
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
-        # Phase 2: Collect trajectories starting from pivotal states
-        print(f"Phase 2: Collecting trajectories from top {min(5, len(pivotal_states))} pivotal states...")
+        # Phase 2: Collect trajectories from pivotal states
+        print(f"Phase 2: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
         
         episodes_collected = 0
-        for i, start_state in enumerate(pivotal_states[:5]):
+        success_count = 0  # ADD THIS LINE
+        for i, start_state in enumerate(pivotal_states[:10]):  # Increased from 5
             print(f"  Collecting from pivotal state {i+1}: {start_state}")
             
             curiosity_weight = max(0.2, 0.8 - (iteration * 0.1))
@@ -113,6 +134,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 episodes = policy.collect_episodes_from_position(
                     env, start_state,
                     num_episodes=2,
+                    max_episode_length=40,  # Increased from 25
                     vae_system=vae_system,
                     curiosity_weight=curiosity_weight
                 )
@@ -120,14 +142,23 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 if episodes:
                     buffer.add_episodes(episodes)
                     episodes_collected += len(episodes)
+                    success_count += sum(1 for ep in episodes if ep.get('goal_reached', False))
             except Exception as e:
                 print(f"  Failed to collect from {start_state}: {e}")
                 continue
-        
+            
+        # ADD THIS BLOCK - Track success rate
+        if episodes_collected > 0:
+            success_rate = success_count / episodes_collected
+            metrics['policy_success_rates'].append(success_rate)
+        else:
+            metrics['policy_success_rates'].append(0.0)
+
+
         print(f"  Collected {episodes_collected} new episodes")
         print(f"  Total episodes in buffer: {buffer.episodes_in_buffer}")
         
-        # Phase 3: Check for plateau (convergence)
+        # Check for convergence
         if len(reconstruction_losses) >= 3:
             recent_losses = reconstruction_losses[-3:]
             loss_changes = [abs(recent_losses[i] - recent_losses[i-1]) for i in range(1, len(recent_losses))]
@@ -139,7 +170,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 print("Reconstruction loss has plateaued - training converged!")
                 break
         
-        # Phase 4: Optional diversity collection
+        # Optional diversity collection
         if iteration % 2 == 0:
             print("Phase 4: Adding diversity with random exploration...")
             obs = env.reset()
@@ -153,7 +184,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             except Exception as e:
                 print(f"Random exploration failed: {e}")
     
-    # PHASE 1 COMPLETION: Construct world graph
+
+    # Construct world graph
     world_graph = policy.complete_world_graph_discovery(env, pivotal_states)
     
     # Final summary
@@ -162,12 +194,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     print(f"Final episodes in buffer: {buffer.episodes_in_buffer}")
     print(f"Final pivotal states ({len(pivotal_states)}): {pivotal_states}")
     
-    if len(all_pivotal_states) > 1:
-        print(f"\nPivotal state progression:")
-        for i, states in enumerate(all_pivotal_states):
-            print(f"  Iteration {i+1}: {len(states)} states - {states[:3]}...")
-    
-    return pivotal_states, world_graph
+    # CHANGE RETURN - Add metrics
+    return pivotal_states, world_graph, metrics
 
 #-----------------------------------------------------------------------------
 # TEST FUNCTIONS FOR EACH COMPONENT, BEFORE SPLITTING IN FILES
@@ -1855,24 +1883,16 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 
 def test_phase1_with_diagnostics(config=None):
     """
-    Test Phase 1 (World Graph Discovery) with detailed diagnostics.
-    Returns metrics for parameter tuning.
+    Test Phase 1 using alternating_training_loop with diagnostic tracking.
     """
     default_config = {
         'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 8,
-        'vae_epochs': 50,
-        'vae_batch_size': 3,
-        'vae_mu0': 5.0,
-        'goal_policy_lr': 5e-3,
-        'curiosity_weight_start': 1.0,
-        'curiosity_weight_end': 0.3,
-        'episodes_per_iteration': 3,
-        'max_episode_length': 30,
+        'vae_mu0': 10.0,
+        'goal_policy_lr': 5e-4,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
     
-    # Merge with user config
     if config is not None:
         default_config.update(config)
     config = default_config
@@ -1897,100 +1917,26 @@ def test_phase1_with_diagnostics(config=None):
     )
     buffer = StatBuffer()
     
-    # Tracking
+    # Run alternating training (now with persistent KL)
+    pivotal_states, world_graph, loop_metrics = alternating_training_loop(
+        env, policy, vae_system, buffer, 
+        max_iterations=config['phase1_iterations']
+    )
+    
+    # Extract metrics from VAE training history
     metrics = {
-        'vae_losses': [],
-        'vae_reconstruction': [],
-        'vae_kl': [],
-        'vae_l0': [],
-        'num_pivotal_states': [],
-        'policy_episodes': 0,
-        'policy_success_rate': []
+        'vae_losses': [h['total_loss'] for h in vae_system.training_history],
+        'vae_reconstruction': [h['reconstruction_loss'] for h in vae_system.training_history],
+        'vae_kl': [h['kl_divergence'] for h in vae_system.training_history],
+        'vae_l0': [h['expected_l0'] for h in vae_system.training_history],
+        'num_pivotal_states': loop_metrics['num_pivotal_states_per_iteration'],  # CHANGED
+        'policy_episodes': buffer.episodes_in_buffer,
+        'policy_success_rate': loop_metrics['policy_success_rates']  # CHANGED
     }
     
-    # Phase 1 iterations
-    for iteration in range(config['phase1_iterations']):
-        print(f"\n{'='*70}")
-        print(f"ITERATION {iteration + 1}/{config['phase1_iterations']}")
-        print(f"{'='*70}")
-        
-        # Collect trajectories
-        print(f"\n[COLLECTION] Collecting episodes...")
-        curiosity_weight = config['curiosity_weight_start'] - (
-            iteration / config['phase1_iterations']
-        ) * (config['curiosity_weight_start'] - config['curiosity_weight_end'])
-        
-        start_positions = []
-        if iteration == 0:
-            # First iteration: random starts
-            obs = env.reset()
-            start_positions = [tuple(env.agent_pos)]
-        else:
-            # Later iterations: start from pivotal states
-            start_positions = pivotal_states[:min(5, len(pivotal_states))]
-        
-        success_count = 0
-        for start_pos in start_positions:
-            try:
-                episodes = policy.collect_episodes_from_position(
-                    env, start_pos,
-                    num_episodes=config['episodes_per_iteration'],
-                    vae_system=vae_system if iteration > 0 else None,
-                    curiosity_weight=curiosity_weight
-                )
-                
-                if episodes:
-                    buffer.add_episodes(episodes)
-                    # Count successful episodes (goal reached)
-                    success_count += sum(1 for ep in episodes if ep.get('goal_reached', False))
-                    metrics['policy_episodes'] += len(episodes)
-                    
-            except Exception as e:
-                print(f"  Failed from {start_pos}: {e}")
-        
-        success_rate = success_count / (len(start_positions) * config['episodes_per_iteration'])
-        metrics['policy_success_rate'].append(success_rate)
-        
-        print(f"  Collected: {buffer.episodes_in_buffer} total episodes")
-        print(f"  Goal success rate: {success_rate*100:.1f}%")
-        print(f"  Curiosity weight: {curiosity_weight:.2f}")
-        
-        # Train VAE
-        if buffer.episodes_in_buffer >= 3:
-            print(f"\n[VAE] Training on {buffer.episodes_in_buffer} episodes...")
-            
-            pivotal_states = vae_system.train(
-                buffer,
-                num_epochs=config['vae_epochs'],
-                batch_size=config['vae_batch_size']
-            )
-            
-            # Extract metrics
-            if vae_system.training_history:
-                latest = vae_system.training_history[-1]
-                metrics['vae_losses'].append(latest['total_loss'])
-                metrics['vae_reconstruction'].append(latest['reconstruction_loss'])
-                metrics['vae_kl'].append(latest['kl_divergence'])
-                metrics['vae_l0'].append(latest['expected_l0'])
-                metrics['num_pivotal_states'].append(len(pivotal_states))
-                
-                print(f"  Final loss: {latest['total_loss']:.4f}")
-                print(f"  Reconstruction: {latest['reconstruction_loss']:.4f}")
-                print(f"  KL divergence: {latest['kl_divergence']:.4f}")
-                print(f"  Expected L0: {latest['expected_l0']:.2f} (target: {config['vae_mu0']:.2f})")
-                print(f"  Pivotal states: {len(pivotal_states)}")
-        else:
-            print(f"  Skipping VAE (need ≥3 episodes, have {buffer.episodes_in_buffer})")
-            pivotal_states = []
-    
-    # Build world graph
-    print(f"\n{'='*70}")
-    print("BUILDING WORLD GRAPH")
-    print(f"{'='*70}")
-    
+    # Graph statistics
+    graph_stats = None
     if len(pivotal_states) > 0:
-        world_graph = policy.complete_world_graph_discovery(env, pivotal_states)
-        
         graph_stats = {
             'nodes': len(world_graph.nodes),
             'edges': len(world_graph.edges),
@@ -2013,61 +1959,51 @@ def test_phase1_with_diagnostics(config=None):
         print(f"  Nodes: {graph_stats['nodes']}")
         print(f"  Edges: {graph_stats['edges']}")
         print(f"  Connectivity: {graph_stats['connectivity']*100:.1f}%")
-    else:
-        world_graph = None
-        graph_stats = None
-        print("No pivotal states discovered!")
     
-    # Visualizations
-    print(f"\n{'='*70}")
-    print("GENERATING VISUALIZATIONS")
-    print(f"{'='*70}")
-    
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # 1. VAE Total Loss
+    # Generate plots (around line 800)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))  # Changed from (2, 2)
+
+    # Plot 1: VAE Total Loss
     if metrics['vae_losses']:
         axes[0, 0].plot(metrics['vae_losses'], 'b-', linewidth=2)
         axes[0, 0].set_title('VAE Total Loss')
-        axes[0, 0].set_xlabel('Iteration')
-        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_xlabel('Epoch')
         axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. VAE Reconstruction Loss
+
+    # Plot 2: Reconstruction Loss
     if metrics['vae_reconstruction']:
         axes[0, 1].plot(metrics['vae_reconstruction'], 'r-', linewidth=2)
         axes[0, 1].set_title('Reconstruction Loss')
-        axes[0, 1].set_xlabel('Iteration')
-        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. VAE KL Divergence
+
+    # Plot 3: KL Divergence
     if metrics['vae_kl']:
         axes[0, 2].plot(metrics['vae_kl'], 'g-', linewidth=2)
-        axes[0, 2].set_title('KL Divergence')
-        axes[0, 2].set_xlabel('Iteration')
-        axes[0, 2].set_ylabel('KL Div')
+        axes[0, 2].set_title('KL Divergence (Should Stay > 0.01)')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].axhline(y=0.01, color='orange', linestyle='--', label='Floor')
+        axes[0, 2].legend()
         axes[0, 2].grid(True, alpha=0.3)
-    
-    # 4. Expected L0 vs Target
+
+    # Plot 4: Expected L0
     if metrics['vae_l0']:
         axes[1, 0].plot(metrics['vae_l0'], 'purple', linewidth=2, label='Actual')
         axes[1, 0].axhline(y=config['vae_mu0'], color='orange', linestyle='--', label='Target')
         axes[1, 0].set_title('Expected L0 (Sparsity)')
-        axes[1, 0].set_xlabel('Iteration')
-        axes[1, 0].set_ylabel('L0 Norm')
+        axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
-    
-    # 5. Number of Pivotal States
+
+    # Plot 5: Pivotal States Discovered (NEW)
     if metrics['num_pivotal_states']:
         axes[1, 1].plot(metrics['num_pivotal_states'], 'cyan', linewidth=2, marker='o')
         axes[1, 1].set_title('Pivotal States Discovered')
         axes[1, 1].set_xlabel('Iteration')
         axes[1, 1].set_ylabel('Count')
         axes[1, 1].grid(True, alpha=0.3)
-    
-    # 6. Policy Success Rate
+
+    # Plot 6: Policy Success Rate (NEW)
     if metrics['policy_success_rate']:
         axes[1, 2].plot(metrics['policy_success_rate'], 'magenta', linewidth=2, marker='s')
         axes[1, 2].set_title('Goal Policy Success Rate')
@@ -2075,29 +2011,23 @@ def test_phase1_with_diagnostics(config=None):
         axes[1, 2].set_ylabel('Success Rate')
         axes[1, 2].set_ylim([0, 1])
         axes[1, 2].grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png', dpi=150)
     print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
     plt.close()
-    
-    # Visualize world graph
-    if world_graph and len(pivotal_states) > 0:
-        viz = GraphVisualizer(world_graph)
-        fig, ax = viz.visualize(title=f"World Graph ({len(pivotal_states)} nodes)")
-        plt.savefig(f'phase1_graph_mu{config["vae_mu0"]:.1f}.png', dpi=150)
-        print(f"Saved graph to phase1_graph_mu{config['vae_mu0']:.1f}.png")
-        plt.close()
     
     # Summary
     print(f"\n{'='*70}")
     print("PHASE 1 TEST COMPLETE")
     print(f"{'='*70}")
     print(f"Episodes collected: {metrics['policy_episodes']}")
-    print(f"Final pivotal states: {len(pivotal_states) if pivotal_states else 0}")
+    print(f"Final pivotal states: {len(pivotal_states)}")
     if graph_stats:
         print(f"Graph connectivity: {graph_stats['connectivity']*100:.1f}%")
-    print(f"Final VAE loss: {metrics['vae_losses'][-1]:.4f}" if metrics['vae_losses'] else "N/A")
+    if metrics['vae_losses']:
+        print(f"Final VAE loss: {metrics['vae_losses'][-1]:.4f}")
+        print(f"Final KL divergence: {metrics['vae_kl'][-1]:.4f}")
     
     return {
         'metrics': metrics,
@@ -2426,17 +2356,17 @@ def main():
     # Compare different mu0 values
     runs = {}
     for mu0 in [3.0, 5.0, 10.0, 15.0]:
-        config = {'vae_mu0': mu0, 'phase1_iterations': 6}
+        config = {'vae_mu0': mu0, 'phase1_iterations': 50, 'maze_size': EnvSizes.MEDIUM}
         runs[f'mu0={mu0}'] = test_phase1_with_diagnostics(config)
 
-    compare_phase1_runs(runs)
+    # compare_phase1_runs(runs)
 
-    runs = {}
-    for size in [EnvSizes.SMALL, EnvSizes.MEDIUM]:
-        config = {'maze_size': size}
-        runs[f'{size.name}'] = test_phase1_with_diagnostics(config)
+    # runs = {}
+    # for size in [EnvSizes.SMALL, EnvSizes.MEDIUM]:
+    #     config = {'maze_size': size}
+    #     runs[f'{size.name}'] = test_phase1_with_diagnostics(config)
 
-    compare_phase1_runs(runs)
+    # compare_phase1_runs(runs)
 
 if __name__ == "__main__":
     main()

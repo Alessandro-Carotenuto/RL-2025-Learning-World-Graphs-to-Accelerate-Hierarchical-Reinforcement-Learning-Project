@@ -395,6 +395,7 @@ class GoalConditionedPolicy(nn.Module):
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
                                      num_episodes: int = 3, 
+                                     max_episode_length: int = 40,  # ADD THIS
                                      vae_system=None,
                                      curiosity_weight: float = 0.5) -> List:
         """
@@ -417,7 +418,7 @@ class GoalConditionedPolicy(nn.Module):
             try:
                 states, actions, rewards, goal_reached = self.train_goal_policy_episode(
                     env, start_pos,
-                    max_episode_length=25,  # Shorter episodes for efficiency
+                    max_episode_length=max_episode_length,  # USE IT
                     vae_system=vae_system,
                     curiosity_weight=curiosity_weight
                 )

@@ -295,6 +295,8 @@ class VAESystem(nn.Module):
         """
         super().__init__()  # Initialize nn.Module
         
+        self.current_kl_weight = 0.0  # Add this
+        
         self.device = device
         self.mu0 = mu0
         self.state_dim = state_dim
@@ -378,7 +380,7 @@ class VAESystem(nn.Module):
         return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_discrete.to(self.device)
         #                                                                    ↑ Return discrete actions
     
-    def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions):
+    def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions, kl_weight ):
         """
         Compute the Evidence Lower Bound (ELBO) loss with all regularization terms.
         
@@ -429,7 +431,14 @@ class VAESystem(nn.Module):
         beta_dist = BetaDistribution(alpha_prior, beta_prior)
         kl_divergence = hardkuma_dist.kl_divergence(beta_dist)
         masked_kl = torch.where(mask, kl_divergence, torch.zeros_like(kl_divergence))
-        kl_divergence = masked_kl.sum() / mask.sum().clamp(min=1)
+        raw_kl = masked_kl.sum() / mask.sum().clamp(min=1)
+
+        # After computing KL divergence
+
+        #print(f"  Raw KL: {raw_kl:.6f}")  # DEBUG
+        kl_divergence = torch.clamp(raw_kl, min=0.01)  # Then floor
+        
+ 
         
         # 8. Compute L0 regularization (sparsity constraint)
         expected_l0 = hardkuma_dist.expected_l0_norm()
@@ -447,7 +456,7 @@ class VAESystem(nn.Module):
         # 10. Combine all losses using Lagrangian multipliers
         total_loss = (
             reconstruction_loss + 
-            torch.abs(self.lambda_kl) * kl_divergence + 
+            kl_weight * torch.abs(self.lambda_kl) * kl_divergence + 
             torch.abs(self.lambda_l0) * l0_loss + 
             torch.abs(self.lambda_lt) * lt_loss
         )
@@ -465,10 +474,11 @@ class VAESystem(nn.Module):
             'alpha_posterior': alpha_posterior.detach()
         }
     
-    def train_step(self, trajectories):
+    def train_step(self, trajectories,kl_weight ):
+        
         # Forward pass
         states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
-        loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions)
+        loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions, kl_weight)
         
         # Compute both gradients BEFORE any optimizer steps
         self.vae_optimizer.zero_grad()
@@ -477,6 +487,7 @@ class VAESystem(nn.Module):
         # VAE gradients (minimize loss)
         vae_params = (
             list(self.state_encoder.parameters()) + 
+            list(self.action_encoder.parameters()) + # <-- MODIFIED: Included action_encoder parameters
             list(self.prior_net.parameters()) +
             list(self.inference_net.parameters()) +
             list(self.generation_net.parameters())
@@ -578,7 +589,8 @@ class VAESystem(nn.Module):
         num_epochs: int = 100,
         batch_size: int = 8,
         convergence_threshold: float = 1e-4,
-        patience: int = 10
+        patience: int = 10,
+        initial_kl_weight: float = 0.0
     ) -> List[Tuple]:
         """
         Full training loop for pivotal state discovery.
@@ -600,6 +612,13 @@ class VAESystem(nn.Module):
         
         best_loss = float('inf')
         patience_counter = 0
+
+         # <-- MODIFIED: Initialize KL annealing schedule
+        kl_weight = initial_kl_weight
+        self.current_kl_weight = kl_weight  # Store for curiosity
+        # Anneal over the first 50% of epochs
+        anneal_epochs = max(1, num_epochs * 0.75)
+        annealing_rate = 1.0 / anneal_epochs
         
         for epoch in range(num_epochs):
             epoch_losses = []
@@ -613,7 +632,7 @@ class VAESystem(nn.Module):
                 batch_trajectories = all_trajectories[start_idx:end_idx]
                 
                 # Train step
-                loss_dict = self.train_step(batch_trajectories)
+                loss_dict = self.train_step(batch_trajectories,kl_weight)
                 epoch_losses.append(loss_dict)
             
             # Average losses for the epoch
@@ -624,12 +643,18 @@ class VAESystem(nn.Module):
             # Store training history
             self.training_history.append(avg_losses)
             
+            # Update KL weight
+            kl_weight = min(1.0, kl_weight + annealing_rate)
+            self.current_kl_weight = kl_weight  # ← ADD THIS
+
+
             # Print progress
             if epoch % 10 == 0:
                 print(f"Epoch {epoch:3d}: Loss={avg_losses['total_loss']:.4f}, "
                       f"Recon={avg_losses['reconstruction_loss']:.4f}, "
                       f"KL={avg_losses['kl_divergence']:.4f}, "
-                      f"L0={avg_losses['expected_l0']:.2f}")
+                      f"L0={avg_losses['expected_l0']:.2f}, "
+                      f"KL_Weight={kl_weight:.2f}") # <-- MODIFIED: Log the weight
             
             # Check for convergence
             current_loss = avg_losses['total_loss']
@@ -709,7 +734,7 @@ class VAESystem(nn.Module):
                 states, actions, seq_lengths, discrete = self.encode_trajectories([fake_trajectory])
                 
                 # Compute reconstruction loss (without gradients)
-                loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete)
+                loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete, self.current_kl_weight)
                 reconstruction_error = loss_dict['reconstruction_loss'].item()
                 
                 # Reduced scale and cap for better balance

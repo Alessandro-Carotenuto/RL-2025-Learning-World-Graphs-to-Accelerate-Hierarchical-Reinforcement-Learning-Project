@@ -748,5 +748,3 @@ class MinigridWrapper(MiniGridEnv):
     def _process_obs(self, obs):
         # EXTRACT AND PROCESS THE OBSERVATIONS
         return obs
-
-print(105//20)
