@@ -34,6 +34,7 @@ class EnvSizes(Enum):
     LARGE=36
     EXTRALARGE=52
 
+
 #----------------------------------------------------------------------------#
 #                            CUSTOM MINIGRID WRAPPER                         #
 #----------------------------------------------------------------------------#
@@ -747,3 +748,5 @@ class MinigridWrapper(MiniGridEnv):
     def _process_obs(self, obs):
         # EXTRACT AND PROCESS THE OBSERVATIONS
         return obs
+
+print(105//20)

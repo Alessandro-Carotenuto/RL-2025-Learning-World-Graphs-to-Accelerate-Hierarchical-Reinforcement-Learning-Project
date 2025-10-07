@@ -341,56 +341,44 @@ class VAESystem(nn.Module):
         self.training_history = []
         self.current_pivotal_states = set()
         
-    def encode_trajectories(self, trajectories: List[List[Tuple]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode raw trajectories into neural network inputs.
-        
-        Args:
-            trajectories: List of trajectories, each trajectory is list of (state, action) tuples
-            
-        Returns:
-            tuple: (encoded_states, encoded_actions) tensors
-        """
+    def encode_trajectories(self, trajectories):
         batch_states = []
         batch_actions = []
+        batch_discrete_actions = []  # ← Add this
         
         for trajectory in trajectories:
-            # Extract states and actions from trajectory
             states = [state for state, action in trajectory]
             actions = [action for state, action in trajectory]
             
-            # Convert to tensors
-            state_tensor = torch.tensor(states, dtype=torch.float32)  # [seq_len, 2] for coordinates
-            action_tensor = torch.tensor(actions, dtype=torch.long)   # [seq_len] for discrete actions
+            state_tensor = torch.tensor(states, dtype=torch.float32)
+            action_tensor = torch.tensor(actions, dtype=torch.long)
             
             batch_states.append(state_tensor)
             batch_actions.append(action_tensor)
+            batch_discrete_actions.append(action_tensor)  # ← Store discrete actions
         
-        # Pad sequences to same length
+        # Pad sequences
         max_len = max(len(states) for states in batch_states)
         
         padded_states = torch.zeros(len(trajectories), max_len, 2)
         padded_actions = torch.zeros(len(trajectories), max_len, dtype=torch.long)
+        padded_discrete = torch.zeros(len(trajectories), max_len, dtype=torch.long)  # ← Add
         seq_lengths = []
         
-        for i, (states, actions) in enumerate(zip(batch_states, batch_actions)):
+        for i, (states, actions, discrete) in enumerate(zip(batch_states, batch_actions, batch_discrete_actions)):
             seq_len = len(states)
             padded_states[i, :seq_len] = states
             padded_actions[i, :seq_len] = actions
+            padded_discrete[i, :seq_len] = discrete  # ← Pad discrete actions
             seq_lengths.append(seq_len)
         
-        # Encode using the encoder networks
-        encoded_states = self.state_encoder(padded_states.to(self.device))  # [batch, max_len, state_dim]
-        encoded_actions = self.action_encoder(padded_actions.to(self.device))  # [batch, max_len, action_dim]
+        encoded_states = self.state_encoder(padded_states.to(self.device))
+        encoded_actions = self.action_encoder(padded_actions.to(self.device))
         
-        return encoded_states, encoded_actions, torch.tensor(seq_lengths)
+        return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_discrete.to(self.device)
+        #                                                                    ↑ Return discrete actions
     
-    def compute_elbo_loss(
-        self, 
-        states: torch.Tensor, 
-        actions: torch.Tensor, 
-        seq_lengths: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
+    def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions):
         """
         Compute the Evidence Lower Bound (ELBO) loss with all regularization terms.
         
@@ -422,12 +410,8 @@ class VAESystem(nn.Module):
         action_logits = self.generation_net(masked_states)  # [batch_size, seq_len, action_vocab_size]
         
         # 6. Compute reconstruction loss
-        # Create dummy actions for testing (in real use, pass original discrete actions)
-        original_actions = torch.randint(0, self.action_vocab_size, (batch_size, seq_len)).to(self.device)
-        
-        # Reshape for cross entropy (avoid inplace operations)
         action_logits_flat = action_logits.view(-1, self.action_vocab_size)
-        original_actions_flat = original_actions.view(-1)
+        original_actions_flat = original_discrete_actions.view(-1)  # ← Use parameter
         
         reconstruction_loss_flat = F.cross_entropy(
             action_logits_flat,
@@ -493,8 +477,8 @@ class VAESystem(nn.Module):
             """
             # First pass: Update VAE networks
             self.vae_optimizer.zero_grad()
-            states, actions, seq_lengths = self.encode_trajectories(trajectories)
-            loss_dict = self.compute_elbo_loss(states, actions, seq_lengths)
+            states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
+            loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions)
             loss_dict['total_loss'].backward()
             self.vae_optimizer.step()
             
@@ -514,8 +498,8 @@ class VAESystem(nn.Module):
             
             # Second pass: Update Lagrangian multipliers (completely fresh computation)
             self.lambda_optimizer.zero_grad()
-            states_fresh, actions_fresh, seq_lengths_fresh = self.encode_trajectories(trajectories)
-            loss_dict_lambda = self.compute_elbo_loss(states_fresh, actions_fresh, seq_lengths_fresh)
+            states_fresh, actions_fresh, seq_lengths_fresh, discrete_fresh = self.encode_trajectories(trajectories)
+            loss_dict_lambda = self.compute_elbo_loss(states_fresh, actions_fresh, seq_lengths_fresh, discrete_fresh)
             lambda_loss = -loss_dict_lambda['total_loss']  # Maximize total loss w.r.t. lambdas
             lambda_loss.backward()
             self.lambda_optimizer.step()
@@ -540,7 +524,7 @@ class VAESystem(nn.Module):
         
         with torch.no_grad():
             for trajectory in trajectories:
-                states, _, seq_lengths = self.encode_trajectories([trajectory])
+                states, _, seq_lengths, _ = self.encode_trajectories([trajectory])
                 
                 # Get prior importance scores
                 alpha_prior, beta_prior = self.prior_net(states)
@@ -567,8 +551,9 @@ class VAESystem(nn.Module):
         }
         
         # Select top threshold_percentile% as pivotal states
+        threshold_percentage=100-threshold_percentile
         sorted_states = sorted(avg_importance.items(), key=lambda x: x[1], reverse=True)
-        num_pivotal = max(1, int(len(sorted_states) * (threshold_percentile / 100)))
+        num_pivotal = max(1, int(len(sorted_states) * (threshold_percentage / 100)))
         
         pivotal_states = [coord for coord, score in sorted_states[:num_pivotal]]
         
@@ -709,10 +694,10 @@ class VAESystem(nn.Module):
             
             with torch.no_grad():
                 # Encode the trajectory
-                states, actions, seq_lengths = self.encode_trajectories([fake_trajectory])
+                states, actions, seq_lengths, discrete = self.encode_trajectories([fake_trajectory])
                 
                 # Compute reconstruction loss (without gradients)
-                loss_dict = self.compute_elbo_loss(states, actions, seq_lengths)
+                loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete)
                 reconstruction_error = loss_dict['reconstruction_loss'].item()
                 
                 # Reduced scale and cap for better balance

@@ -1856,10 +1856,10 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 # ACTUAL TRAINING CODE ----------------------------------------------------
 
 externalconfig = {
-        'maze_size': EnvSizes.MEDIUM,
+        'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 8,
         'phase2_episodes': 100,
-        'max_steps_per_episode': 300,
+        'max_steps_per_episode': 500,
         'manager_horizon': 10,
         'neighborhood_size': 20,
         'manager_lr': 1e-4,
