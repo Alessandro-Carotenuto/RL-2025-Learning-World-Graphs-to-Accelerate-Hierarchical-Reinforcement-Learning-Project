@@ -1853,6 +1853,376 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     print(f"\nDiagnostic plots saved to {save_path}")
     plt.close()
 
+def test_phase1_with_diagnostics(config=None):
+    """
+    Test Phase 1 (World Graph Discovery) with detailed diagnostics.
+    Returns metrics for parameter tuning.
+    """
+    default_config = {
+        'maze_size': EnvSizes.SMALL,
+        'phase1_iterations': 8,
+        'vae_epochs': 50,
+        'vae_batch_size': 3,
+        'vae_mu0': 5.0,
+        'goal_policy_lr': 5e-3,
+        'curiosity_weight_start': 1.0,
+        'curiosity_weight_end': 0.3,
+        'episodes_per_iteration': 3,
+        'max_episode_length': 30,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    }
+    
+    # Merge with user config
+    if config is not None:
+        default_config.update(config)
+    config = default_config
+    
+    print("PHASE 1 DIAGNOSTIC TEST")
+    print("="*70)
+    for k, v in config.items():
+        print(f"  {k}: {v}")
+    
+    # Setup
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL)
+    env.phase = 1
+    env.randomgen = True
+    
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
+    vae_system = VAESystem(
+        state_dim=16, 
+        action_vocab_size=7, 
+        mu0=config['vae_mu0'], 
+        grid_size=env.size,
+        device=config['device']
+    )
+    buffer = StatBuffer()
+    
+    # Tracking
+    metrics = {
+        'vae_losses': [],
+        'vae_reconstruction': [],
+        'vae_kl': [],
+        'vae_l0': [],
+        'num_pivotal_states': [],
+        'policy_episodes': 0,
+        'policy_success_rate': []
+    }
+    
+    # Phase 1 iterations
+    for iteration in range(config['phase1_iterations']):
+        print(f"\n{'='*70}")
+        print(f"ITERATION {iteration + 1}/{config['phase1_iterations']}")
+        print(f"{'='*70}")
+        
+        # Collect trajectories
+        print(f"\n[COLLECTION] Collecting episodes...")
+        curiosity_weight = config['curiosity_weight_start'] - (
+            iteration / config['phase1_iterations']
+        ) * (config['curiosity_weight_start'] - config['curiosity_weight_end'])
+        
+        start_positions = []
+        if iteration == 0:
+            # First iteration: random starts
+            obs = env.reset()
+            start_positions = [tuple(env.agent_pos)]
+        else:
+            # Later iterations: start from pivotal states
+            start_positions = pivotal_states[:min(5, len(pivotal_states))]
+        
+        success_count = 0
+        for start_pos in start_positions:
+            try:
+                episodes = policy.collect_episodes_from_position(
+                    env, start_pos,
+                    num_episodes=config['episodes_per_iteration'],
+                    vae_system=vae_system if iteration > 0 else None,
+                    curiosity_weight=curiosity_weight
+                )
+                
+                if episodes:
+                    buffer.add_episodes(episodes)
+                    # Count successful episodes (goal reached)
+                    success_count += sum(1 for ep in episodes if ep.get('goal_reached', False))
+                    metrics['policy_episodes'] += len(episodes)
+                    
+            except Exception as e:
+                print(f"  Failed from {start_pos}: {e}")
+        
+        success_rate = success_count / (len(start_positions) * config['episodes_per_iteration'])
+        metrics['policy_success_rate'].append(success_rate)
+        
+        print(f"  Collected: {buffer.episodes_in_buffer} total episodes")
+        print(f"  Goal success rate: {success_rate*100:.1f}%")
+        print(f"  Curiosity weight: {curiosity_weight:.2f}")
+        
+        # Train VAE
+        if buffer.episodes_in_buffer >= 3:
+            print(f"\n[VAE] Training on {buffer.episodes_in_buffer} episodes...")
+            
+            pivotal_states = vae_system.train(
+                buffer,
+                num_epochs=config['vae_epochs'],
+                batch_size=config['vae_batch_size']
+            )
+            
+            # Extract metrics
+            if vae_system.training_history:
+                latest = vae_system.training_history[-1]
+                metrics['vae_losses'].append(latest['total_loss'])
+                metrics['vae_reconstruction'].append(latest['reconstruction_loss'])
+                metrics['vae_kl'].append(latest['kl_divergence'])
+                metrics['vae_l0'].append(latest['expected_l0'])
+                metrics['num_pivotal_states'].append(len(pivotal_states))
+                
+                print(f"  Final loss: {latest['total_loss']:.4f}")
+                print(f"  Reconstruction: {latest['reconstruction_loss']:.4f}")
+                print(f"  KL divergence: {latest['kl_divergence']:.4f}")
+                print(f"  Expected L0: {latest['expected_l0']:.2f} (target: {config['vae_mu0']:.2f})")
+                print(f"  Pivotal states: {len(pivotal_states)}")
+        else:
+            print(f"  Skipping VAE (need ≥3 episodes, have {buffer.episodes_in_buffer})")
+            pivotal_states = []
+    
+    # Build world graph
+    print(f"\n{'='*70}")
+    print("BUILDING WORLD GRAPH")
+    print(f"{'='*70}")
+    
+    if len(pivotal_states) > 0:
+        world_graph = policy.complete_world_graph_discovery(env, pivotal_states)
+        
+        graph_stats = {
+            'nodes': len(world_graph.nodes),
+            'edges': len(world_graph.edges),
+            'connectivity': 0
+        }
+        
+        # Check connectivity
+        connected_pairs = 0
+        total_pairs = len(pivotal_states) * (len(pivotal_states) - 1)
+        for i, start in enumerate(pivotal_states):
+            for j, end in enumerate(pivotal_states):
+                if i != j:
+                    path, dist = world_graph.shortest_path(start, end)
+                    if path:
+                        connected_pairs += 1
+        
+        graph_stats['connectivity'] = connected_pairs / total_pairs if total_pairs > 0 else 0
+        
+        print(f"\nGraph Statistics:")
+        print(f"  Nodes: {graph_stats['nodes']}")
+        print(f"  Edges: {graph_stats['edges']}")
+        print(f"  Connectivity: {graph_stats['connectivity']*100:.1f}%")
+    else:
+        world_graph = None
+        graph_stats = None
+        print("No pivotal states discovered!")
+    
+    # Visualizations
+    print(f"\n{'='*70}")
+    print("GENERATING VISUALIZATIONS")
+    print(f"{'='*70}")
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. VAE Total Loss
+    if metrics['vae_losses']:
+        axes[0, 0].plot(metrics['vae_losses'], 'b-', linewidth=2)
+        axes[0, 0].set_title('VAE Total Loss')
+        axes[0, 0].set_xlabel('Iteration')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. VAE Reconstruction Loss
+    if metrics['vae_reconstruction']:
+        axes[0, 1].plot(metrics['vae_reconstruction'], 'r-', linewidth=2)
+        axes[0, 1].set_title('Reconstruction Loss')
+        axes[0, 1].set_xlabel('Iteration')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. VAE KL Divergence
+    if metrics['vae_kl']:
+        axes[0, 2].plot(metrics['vae_kl'], 'g-', linewidth=2)
+        axes[0, 2].set_title('KL Divergence')
+        axes[0, 2].set_xlabel('Iteration')
+        axes[0, 2].set_ylabel('KL Div')
+        axes[0, 2].grid(True, alpha=0.3)
+    
+    # 4. Expected L0 vs Target
+    if metrics['vae_l0']:
+        axes[1, 0].plot(metrics['vae_l0'], 'purple', linewidth=2, label='Actual')
+        axes[1, 0].axhline(y=config['vae_mu0'], color='orange', linestyle='--', label='Target')
+        axes[1, 0].set_title('Expected L0 (Sparsity)')
+        axes[1, 0].set_xlabel('Iteration')
+        axes[1, 0].set_ylabel('L0 Norm')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # 5. Number of Pivotal States
+    if metrics['num_pivotal_states']:
+        axes[1, 1].plot(metrics['num_pivotal_states'], 'cyan', linewidth=2, marker='o')
+        axes[1, 1].set_title('Pivotal States Discovered')
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('Count')
+        axes[1, 1].grid(True, alpha=0.3)
+    
+    # 6. Policy Success Rate
+    if metrics['policy_success_rate']:
+        axes[1, 2].plot(metrics['policy_success_rate'], 'magenta', linewidth=2, marker='s')
+        axes[1, 2].set_title('Goal Policy Success Rate')
+        axes[1, 2].set_xlabel('Iteration')
+        axes[1, 2].set_ylabel('Success Rate')
+        axes[1, 2].set_ylim([0, 1])
+        axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png', dpi=150)
+    print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
+    plt.close()
+    
+    # Visualize world graph
+    if world_graph and len(pivotal_states) > 0:
+        viz = GraphVisualizer(world_graph)
+        fig, ax = viz.visualize(title=f"World Graph ({len(pivotal_states)} nodes)")
+        plt.savefig(f'phase1_graph_mu{config["vae_mu0"]:.1f}.png', dpi=150)
+        print(f"Saved graph to phase1_graph_mu{config['vae_mu0']:.1f}.png")
+        plt.close()
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("PHASE 1 TEST COMPLETE")
+    print(f"{'='*70}")
+    print(f"Episodes collected: {metrics['policy_episodes']}")
+    print(f"Final pivotal states: {len(pivotal_states) if pivotal_states else 0}")
+    if graph_stats:
+        print(f"Graph connectivity: {graph_stats['connectivity']*100:.1f}%")
+    print(f"Final VAE loss: {metrics['vae_losses'][-1]:.4f}" if metrics['vae_losses'] else "N/A")
+    
+    return {
+        'metrics': metrics,
+        'pivotal_states': pivotal_states,
+        'world_graph': world_graph,
+        'graph_stats': graph_stats,
+        'buffer': buffer,
+        'policy': policy,
+        'vae_system': vae_system
+    }
+
+def analyze_phase1_metrics(results):
+    """Extract key metrics and diagnose Phase 1 issues."""
+    
+    metrics = results['metrics']
+    graph_stats = results['graph_stats']
+    
+    # Extract final values
+    final_vae_loss = metrics['vae_losses'][-1] if metrics['vae_losses'] else None
+    final_recon = metrics['vae_reconstruction'][-1] if metrics['vae_reconstruction'] else None
+    final_l0 = metrics['vae_l0'][-1] if metrics['vae_l0'] else None
+    final_success = metrics['policy_success_rate'][-1] if metrics['policy_success_rate'] else None
+    
+    # Convergence checks
+    vae_converged = False
+    if len(metrics['vae_losses']) >= 3:
+        recent = metrics['vae_losses'][-3:]
+        vae_converged = (max(recent) - min(recent)) < 0.01
+    
+    l0_on_target = False
+    if final_l0 and results.get('vae_system'):
+        target = results['vae_system'].mu0
+        l0_on_target = abs(final_l0 - target) < target * 0.2  # Within 20%
+    
+    # Issue detection
+    issues = []
+    warnings = []
+    
+    if final_vae_loss and final_vae_loss > 10:
+        issues.append(f"VAE loss very high ({final_vae_loss:.2f}) - may not converge")
+    
+    if final_recon and final_recon > 5:
+        issues.append(f"Reconstruction loss high ({final_recon:.2f}) - poor action prediction")
+    
+    if not l0_on_target and final_l0:
+        target = results['vae_system'].mu0
+        warnings.append(f"L0 ({final_l0:.1f}) far from target ({target:.1f}) - adjust mu0 or training")
+    
+    if graph_stats and graph_stats['connectivity'] < 0.3:
+        issues.append(f"Graph poorly connected ({graph_stats['connectivity']*100:.1f}%) - pivotal states isolated")
+    
+    if final_success and final_success < 0.3:
+        warnings.append(f"Low policy success ({final_success*100:.1f}%) - goals may be too far")
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("PHASE 1 METRICS ANALYSIS")
+    print("="*70)
+    
+    print("\n[VAE Performance]")
+    print(f"  Final loss: {final_vae_loss:.4f}" if final_vae_loss else "  No data")
+    print(f"  Reconstruction: {final_recon:.4f}" if final_recon else "  No data")
+    print(f"  L0 sparsity: {final_l0:.2f}" if final_l0 else "  No data")
+    print(f"  Converged: {'✓' if vae_converged else '✗'}")
+    print(f"  L0 on target: {'✓' if l0_on_target else '✗'}")
+    
+    if graph_stats:
+        print("\n[Graph Quality]")
+        print(f"  Nodes: {graph_stats['nodes']}")
+        print(f"  Edges: {graph_stats['edges']}")
+        print(f"  Connectivity: {graph_stats['connectivity']*100:.1f}%")
+        print(f"  Avg edges/node: {graph_stats['edges']/graph_stats['nodes']:.1f}" if graph_stats['nodes'] > 0 else "  N/A")
+    
+    print("\n[Policy Performance]")
+    print(f"  Final success rate: {final_success*100:.1f}%" if final_success else "  No data")
+    print(f"  Total episodes: {metrics['policy_episodes']}")
+    
+    if issues:
+        print("\n[❌ ISSUES]")
+        for issue in issues:
+            print(f"  • {issue}")
+    
+    if warnings:
+        print("\n[⚠️  WARNINGS]")
+        for warning in warnings:
+            print(f"  • {warning}")
+    
+    if not issues and not warnings:
+        print("\n[✓ All checks passed]")
+    
+    return {
+        'final_vae_loss': final_vae_loss,
+        'final_reconstruction': final_recon,
+        'final_l0': final_l0,
+        'vae_converged': vae_converged,
+        'l0_on_target': l0_on_target,
+        'graph_stats': graph_stats,
+        'issues': issues,
+        'warnings': warnings
+    }
+
+def compare_phase1_runs(runs_dict):
+    """Compare multiple Phase 1 runs with different parameters."""
+    
+    print("\n" + "="*70)
+    print("PHASE 1 COMPARISON")
+    print("="*70)
+    
+    # Header
+    print(f"\n{'Config':<20} {'Loss':<10} {'Recon':<10} {'L0':<8} {'Nodes':<8} {'Conn%':<8} {'Succ%':<8}")
+    print("-" * 70)
+    
+    # Rows
+    for name, results in runs_dict.items():
+        m = results['metrics']
+        g = results['graph_stats']
+        
+        loss = m['vae_losses'][-1] if m['vae_losses'] else float('nan')
+        recon = m['vae_reconstruction'][-1] if m['vae_reconstruction'] else float('nan')
+        l0 = m['vae_l0'][-1] if m['vae_l0'] else float('nan')
+        nodes = g['nodes'] if g else 0
+        conn = g['connectivity']*100 if g else 0
+        succ = m['policy_success_rate'][-1]*100 if m['policy_success_rate'] else 0
+        
+        print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 # ACTUAL TRAINING CODE ----------------------------------------------------
 
 externalconfig = {
@@ -1860,8 +2230,8 @@ externalconfig = {
         'phase1_iterations': 8,
         'phase2_episodes': 100,
         'max_steps_per_episode': 500,
-        'manager_horizon': 10,
-        'neighborhood_size': 20,
+        'manager_horizon': 20,
+        'neighborhood_size': 5,
         'manager_lr': 1e-4,
         'worker_lr': 5e-3,
         'vae_mu0': 10.0,
@@ -2051,8 +2421,22 @@ def main():
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
 
-    train_full_phase1_phase2()
-    #test_phase2_ball_spawning()
+    #train_full_phase1_phase2()
+    # Compare maze sizes
+    # Compare different mu0 values
+    runs = {}
+    for mu0 in [3.0, 5.0, 10.0, 15.0]:
+        config = {'vae_mu0': mu0, 'phase1_iterations': 6}
+        runs[f'mu0={mu0}'] = test_phase1_with_diagnostics(config)
+
+    compare_phase1_runs(runs)
+
+    runs = {}
+    for size in [EnvSizes.SMALL, EnvSizes.MEDIUM]:
+        config = {'maze_size': size}
+        runs[f'{size.name}'] = test_phase1_with_diagnostics(config)
+
+    compare_phase1_runs(runs)
 
 if __name__ == "__main__":
     main()

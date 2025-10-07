@@ -465,48 +465,60 @@ class VAESystem(nn.Module):
             'alpha_posterior': alpha_posterior.detach()
         }
     
-    def train_step(self, trajectories: List[List[Tuple]]) -> Dict[str, float]:
-            """
-            Single training step on a batch of trajectories.
-            
-            Args:
-                trajectories: Batch of trajectories from StatBuffer
-                
-            Returns:
-                Dict of loss values for monitoring
-            """
-            # First pass: Update VAE networks
-            self.vae_optimizer.zero_grad()
-            states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
-            loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions)
-            loss_dict['total_loss'].backward()
-            self.vae_optimizer.step()
-            
-            # Store loss values for logging (detached from graph)
-            logged_losses = {}
-            for k, v in loss_dict.items():
-                if torch.is_tensor(v):
-                    if v.numel() == 1:  # Only scalar tensors
-                        logged_losses[k] = v.detach().clone()
-                    else:  # Multi-element tensors - take mean or skip
-                        if k in ['z_samples', 'alpha_prior', 'alpha_posterior']:
-                            continue  # Skip these for logging
-                        else:
-                            logged_losses[k] = v.mean().detach().clone()
-                else:
-                    logged_losses[k] = v
-            
-            # Second pass: Update Lagrangian multipliers (completely fresh computation)
-            self.lambda_optimizer.zero_grad()
-            states_fresh, actions_fresh, seq_lengths_fresh, discrete_fresh = self.encode_trajectories(trajectories)
-            loss_dict_lambda = self.compute_elbo_loss(states_fresh, actions_fresh, seq_lengths_fresh, discrete_fresh)
-            lambda_loss = -loss_dict_lambda['total_loss']  # Maximize total loss w.r.t. lambdas
-            lambda_loss.backward()
-            self.lambda_optimizer.step()
-            
-            # Convert to float for logging (use the first computation)
-            return {k: v.item() if torch.is_tensor(v) else v for k, v in logged_losses.items()}
-    
+    def train_step(self, trajectories):
+        # Forward pass
+        states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
+        loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions)
+        
+        # Compute both gradients BEFORE any optimizer steps
+        self.vae_optimizer.zero_grad()
+        self.lambda_optimizer.zero_grad()
+        
+        # VAE gradients (minimize loss)
+        vae_params = (
+            list(self.state_encoder.parameters()) + 
+            list(self.prior_net.parameters()) +
+            list(self.inference_net.parameters()) +
+            list(self.generation_net.parameters())
+        )
+        vae_grads = torch.autograd.grad(
+            loss_dict['total_loss'], vae_params, 
+            retain_graph=True, create_graph=False
+        )
+        
+        # Lambda gradients 
+        lambda_grads = torch.autograd.grad(
+            loss_dict['total_loss'], 
+            [self.lambda_kl, self.lambda_l0, self.lambda_lt],
+            create_graph=False
+        )
+        
+        # Apply VAE gradients manually
+        for param, grad in zip(vae_params, vae_grads):
+            param.grad = grad
+        torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
+        self.vae_optimizer.step()
+        
+        # Apply lambda gradients manually
+        for param, grad in zip([self.lambda_kl, self.lambda_l0, self.lambda_lt], lambda_grads):
+            param.grad = grad
+        self.lambda_optimizer.step()
+        
+        # Clamp lambdas
+        with torch.no_grad():
+            self.lambda_kl.data.clamp_(0.1, 10.0)
+            self.lambda_l0.data.clamp_(0.01, 5.0)
+            self.lambda_lt.data.clamp_(0.01, 5.0)
+        
+        # Logging
+        logged_losses = {
+            k: v.detach().item() if torch.is_tensor(v) and v.numel() == 1 else v
+            for k, v in loss_dict.items()
+            if k not in ['z_samples', 'alpha_prior', 'alpha_posterior']
+        }
+        
+        return logged_losses
+        
     def extract_pivotal_states(self, trajectories: List[List[Tuple]], threshold_percentile: float = 80) -> List[Tuple]:
         """
         Extract pivotal states after training by analyzing prior means.
