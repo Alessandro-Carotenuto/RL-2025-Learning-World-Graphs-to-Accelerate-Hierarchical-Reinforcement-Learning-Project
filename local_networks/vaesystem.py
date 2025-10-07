@@ -701,7 +701,8 @@ class VAESystem(nn.Module):
                 reconstruction_error = loss_dict['reconstruction_loss'].item()
                 
                 # Reduced scale and cap for better balance
-                curiosity_reward = min(0.05, reconstruction_error * scale_factor)  # Cap at 0.05 instead of 0.2
+                scale_factor = 0.1
+                curiosity_reward = min(2.0, reconstruction_error * scale_factor)  # Cap at 0.05 instead of 0.2
                 
                 return curiosity_reward
                 

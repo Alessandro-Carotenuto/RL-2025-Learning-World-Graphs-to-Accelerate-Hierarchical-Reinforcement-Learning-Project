@@ -121,7 +121,7 @@ class GoalConditionedPolicy(nn.Module):
             if vae_system is not None and len(visited_states) > 1:
                 recent_states = visited_states[-3:]
                 base_curiosity = vae_system.compute_curiosity_reward(recent_states)
-                curiosity_reward = base_curiosity * curiosity_weight * 0.1  # Reduced from 0.5
+                curiosity_reward = base_curiosity * curiosity_weight # Scale by weight
             
             total_reward = goal_reward + progress_reward + step_penalty + curiosity_reward
             rewards.append(total_reward)

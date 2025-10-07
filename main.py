@@ -1863,7 +1863,7 @@ externalconfig = {
         'manager_horizon': 10,
         'neighborhood_size': 20,
         'manager_lr': 1e-4,
-        'worker_lr': 5e-3, 
+        'worker_lr': 5e-3,
         'vae_mu0': 10.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps

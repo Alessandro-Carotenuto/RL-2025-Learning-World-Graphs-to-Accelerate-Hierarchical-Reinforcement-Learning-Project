@@ -1225,7 +1225,6 @@ class HierarchicalTrainer:
         
         while episode_steps < max_steps:
             # Manager selects goals
-            self.manager.reset_manager_state()  # ← Force fresh decision each horizon
 
             wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
                 state, step_count=self.global_step_counter
@@ -1263,9 +1262,9 @@ class HierarchicalTrainer:
             manager_states.append(state)
             manager_wide_goals.append(wide_goal)
             manager_narrow_goals.append(narrow_goal)
-            manager_log_probs.append(manager_log_prob)
-            manager_values.append(manager_value)
-            manager_entropies_for_update.append(entropy)
+            manager_log_probs.append(manager_log_prob.detach())  # ← Add .detach()
+            manager_values.append(manager_value.detach())        # ← Add .detach()
+            manager_entropies_for_update.append(entropy.detach())  # ← Add .detach()
             
             # Worker executes for horizon steps
             worker_states = []
