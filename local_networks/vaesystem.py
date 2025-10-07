@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 
 from local_distributions.hardkuma import HardKumaraswamy, BetaDistribution
+
 
 
 class PriorNetwork(nn.Module):
@@ -48,6 +50,16 @@ class PriorNetwork(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Softplus()  # Ensure positive beta
         )
+    
+        # Add this initialization
+        self._initialize_to_uniform()
+    
+    def _initialize_to_uniform(self):
+        """Start with near-uniform prior to avoid extreme values."""
+        for head in [self.alpha_head, self.beta_head]:
+            if isinstance(head[-1], nn.Linear):
+                nn.init.constant_(head[-1].weight, 0.01)
+                nn.init.constant_(head[-1].bias, 0.0)    
     
     def forward(self, states):
         """
@@ -320,8 +332,8 @@ class VAESystem(nn.Module):
         self.generation_net = GenerationNetwork(state_dim, action_vocab_size, hidden_dim).to(device)
         
         # Lagrangian multipliers (learnable parameters for automatic weight tuning)
-        self.lambda_kl = nn.Parameter(torch.tensor(1.0))      # KL divergence weight
-        self.lambda_l0 = nn.Parameter(torch.tensor(1.0))      # L0 sparsity weight  
+        self.lambda_kl = nn.Parameter(torch.tensor(2.0))      # KL divergence weight
+        self.lambda_l0 = nn.Parameter(torch.tensor(0.1))      # L0 sparsity weight  
         self.lambda_lt = nn.Parameter(torch.tensor(1.0))      # Transition weight
         
         # Optimizers
@@ -380,80 +392,126 @@ class VAESystem(nn.Module):
         return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_discrete.to(self.device)
         #                                                                    ↑ Return discrete actions
     
-    def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions, kl_weight ):
+    def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions, kl_weight):
         """
-        Compute the Evidence Lower Bound (ELBO) loss with all regularization terms.
-        
-        Args:
-            states: Encoded states [batch_size, seq_len, state_dim]
-            actions: Encoded actions [batch_size, seq_len, action_dim]  
-            seq_lengths: Actual sequence lengths for each trajectory
-            
-        Returns:
-            Dict containing all loss components
+        Compute the Evidence Lower Bound (ELBO) loss using the "Path A" method.
+        The decoder operates on a shorter sequence of only pivotal states.
         """
-        batch_size, seq_len = states.shape[:2]
-        
-        # 1. Prior network: get Beta parameters
-        alpha_prior, beta_prior = self.prior_net(states)  # [batch_size, seq_len]
-        
-        # 2. Inference network: get HardKuma parameters
-        alpha_posterior = self.inference_net(states, actions)  # [batch_size, seq_len]
-        
-        # 3. Sample binary latents using HardKumaraswamy
+        batch_size, seq_len, _ = states.shape
+
+        # --- Steps 1, 2, 3: Same as before (Get z_samples) ---
+        alpha_prior, beta_prior = self.prior_net(states)
+        alpha_posterior = self.inference_net(states, actions)
         hardkuma_dist = HardKumaraswamy(alpha_posterior)
-        z_samples = hardkuma_dist.rsample()  # [batch_size, seq_len]
+        z_samples = hardkuma_dist.rsample()
+
+        # --- Step 4a: Dynamic Selection of Pivotal States ---
+        # This is the core of Path A. We create a "ragged" batch of only pivotal states.
+        pivotal_states_batch = []
+        pivotal_indices_batch = [] # Store original indices for reconstruction
         
-        # 4. Mask states based on binary samples (avoid inplace operations)
-        z_expanded = z_samples.unsqueeze(-1).expand(-1, -1, self.state_dim)
-        masked_states = torch.mul(states, z_expanded)  # [batch_size, seq_len, state_dim]
+        # Use a threshold to binarize z_samples for selection
+        z_binary = (z_samples > 0.5).bool()
+
+        for i in range(batch_size):
+            # Select states and their original indices for this specific trajectory
+            true_seq_len = seq_lengths[i]
+            pivotal_indices = torch.where(z_binary[i, :true_seq_len])[0]
+            
+            # Ensure we have at least one pivotal state to avoid errors
+            if len(pivotal_indices) == 0:
+                # If no states are selected, pick the first one as a fallback
+                pivotal_indices = torch.tensor([0], device=self.device, dtype=torch.long)
+                
+            pivotal_states = states[i, pivotal_indices]
+
+            pivotal_states_batch.append(pivotal_states)
+            pivotal_indices_batch.append(pivotal_indices)
+
+        # --- Step 4b: Padding and Packing for the Decoder LSTM ---
+        # Get the lengths of our new, shorter pivotal sequences
+        pivotal_lengths = torch.tensor([len(p) for p in pivotal_states_batch], device=self.device)
         
-        # 5. Generation network: reconstruct actions
-        action_logits = self.generation_net(masked_states)  # [batch_size, seq_len, action_vocab_size]
+        # Pad the list of tensors to create a single batch tensor
+        padded_pivotal_states = pad_sequence(pivotal_states_batch, batch_first=True, padding_value=0)
         
-        # 6. Compute reconstruction loss
+        # Pack the padded sequence to let the LSTM ignore padding
+        packed_pivotal_input = pack_padded_sequence(padded_pivotal_states, pivotal_lengths, batch_first=True, enforce_sorted=False)
+
+        # --- Step 5: Generation / Decoding ---
+        # The BiLSTM now operates ONLY on the packed pivotal states
+        packed_pivotal_lstm_out, _ = self.generation_net.bilstm(packed_pivotal_input)
+        
+        # Unpack the output to get a padded tensor of hidden states
+        pivotal_lstm_out, _ = pad_packed_sequence(packed_pivotal_lstm_out, batch_first=True)
+
+        # --- Step 6: The "Scatter" Operation for Reconstruction ---
+        # This is the most complex part. We map the hidden states from the pivotal-only
+        # sequence back to the full original sequence length.
+        
+        # Create a tensor to hold the full-sequence hidden states
+        hidden_dim = self.generation_net.bilstm.hidden_size * 2 # Bidirectional
+        full_sequence_hidden_states = torch.zeros(batch_size, seq_len, hidden_dim, device=self.device)
+
+        for i in range(batch_size):
+            # Get the pivotal indices and corresponding hidden states for this trajectory
+            indices = pivotal_indices_batch[i]
+            pivotal_hs = pivotal_lstm_out[i, :pivotal_lengths[i]]
+            
+            # Place the pivotal hidden states at their original positions
+            full_sequence_hidden_states[i, indices] = pivotal_hs
+            
+            # "Forward-fill" the hidden states. The hidden state from a pivotal state
+            # is used to predict actions for all steps until the next pivotal state.
+            for j in range(len(indices) - 1):
+                start_idx = indices[j]
+                end_idx = indices[j+1]
+                if start_idx + 1 < end_idx:
+                    # Fill the gap between two pivotal states
+                    fill_hs = pivotal_hs[j].unsqueeze(0).expand(end_idx - (start_idx + 1), -1)
+                    full_sequence_hidden_states[i, start_idx + 1 : end_idx] = fill_hs
+            
+            # Fill from the last pivotal state to the end of the sequence
+            last_pivotal_idx = indices[-1]
+            true_seq_len = seq_lengths[i]
+            if last_pivotal_idx + 1 < true_seq_len:
+                fill_hs = pivotal_hs[-1].unsqueeze(0).expand(true_seq_len - (last_pivotal_idx + 1), -1)
+                full_sequence_hidden_states[i, last_pivotal_idx + 1 : true_seq_len] = fill_hs
+
+        # Now, use the final action_head on the full-length scattered hidden states
+        action_logits = self.generation_net.action_head(full_sequence_hidden_states)
+
+        # --- Step 7: Loss Calculation (same as before, but on new logits) ---
         action_logits_flat = action_logits.view(-1, self.action_vocab_size)
-        original_actions_flat = original_discrete_actions.view(-1)  # ← Use parameter
+        original_actions_flat = original_discrete_actions.view(-1)
         
-        reconstruction_loss_flat = F.cross_entropy(
-            action_logits_flat,
-            original_actions_flat,
-            reduction='none'
-        )
+        reconstruction_loss_flat = F.cross_entropy(action_logits_flat, original_actions_flat, reduction='none')
         reconstruction_loss = reconstruction_loss_flat.view(batch_size, seq_len)
         
-        # Apply sequence length masking
         mask = torch.arange(seq_len, device=self.device).unsqueeze(0) < seq_lengths.unsqueeze(1).to(self.device)
         masked_recon_loss = torch.where(mask, reconstruction_loss, torch.zeros_like(reconstruction_loss))
         reconstruction_loss = masked_recon_loss.sum() / mask.sum().clamp(min=1)
-        
-        # 7. Compute KL divergence
+
+        # --- Step 8: KL, L0, LT Losses (same as before) ---
         beta_dist = BetaDistribution(alpha_prior, beta_prior)
         kl_divergence = hardkuma_dist.kl_divergence(beta_dist)
         masked_kl = torch.where(mask, kl_divergence, torch.zeros_like(kl_divergence))
         raw_kl = masked_kl.sum() / mask.sum().clamp(min=1)
 
-        # After computing KL divergence
+        # Clamp KL to prevent collapse
+        kl_floor = 0.01  # Prevents complete collapse
+        kl_divergence = torch.clamp(raw_kl, min=kl_floor)
 
-        #print(f"  Raw KL: {raw_kl:.6f}")  # DEBUG
-        kl_divergence = torch.clamp(raw_kl, min=0.01)  # Then floor
-        
- 
-        
-        # 8. Compute L0 regularization (sparsity constraint)
         expected_l0 = hardkuma_dist.expected_l0_norm()
         l0_loss = torch.pow(expected_l0 - self.mu0, 2)
         
-        # 9. Compute LT regularization (transition constraint) 
-        # Encourage isolated activations - transitions between 0 and 1 should be ~2*mu0
-        z_diff = torch.abs(z_samples[:, 1:] - z_samples[:, :-1])  # [batch_size, seq_len-1]
+        z_diff = torch.abs(z_samples[:, 1:] - z_samples[:, :-1])
         seq_mask = torch.arange(seq_len-1, device=self.device).unsqueeze(0) < (seq_lengths-1).unsqueeze(1).to(self.device)
-        
         masked_transitions = torch.where(seq_mask, z_diff, torch.zeros_like(z_diff))
         expected_transitions = masked_transitions.sum() / seq_mask.sum().clamp(min=1)
         lt_loss = torch.pow(expected_transitions - 2 * self.mu0, 2)
         
-        # 10. Combine all losses using Lagrangian multipliers
+        # --- Step 9: Final Loss Combination ---
         total_loss = (
             reconstruction_loss + 
             kl_weight * torch.abs(self.lambda_kl) * kl_divergence + 
@@ -469,48 +527,45 @@ class VAESystem(nn.Module):
             'lt_loss': lt_loss,
             'expected_l0': expected_l0,
             'expected_transitions': expected_transitions,
-            'z_samples': z_samples.detach(),  # Detach for logging
-            'alpha_prior': alpha_prior.detach(),
-            'alpha_posterior': alpha_posterior.detach()
+            'z_samples': z_samples.detach(),
         }
     
-    def train_step(self, trajectories,kl_weight ):
-        
-        # Forward pass
+    def train_step(self, trajectories, kl_weight):
         states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
         loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions, kl_weight)
         
-        # Compute both gradients BEFORE any optimizer steps
         self.vae_optimizer.zero_grad()
         self.lambda_optimizer.zero_grad()
         
-        # VAE gradients (minimize loss)
         vae_params = (
             list(self.state_encoder.parameters()) + 
-            list(self.action_encoder.parameters()) + # <-- MODIFIED: Included action_encoder parameters
+            list(self.action_encoder.parameters()) +
             list(self.prior_net.parameters()) +
             list(self.inference_net.parameters()) +
             list(self.generation_net.parameters())
         )
+        
         vae_grads = torch.autograd.grad(
             loss_dict['total_loss'], vae_params, 
             retain_graph=True, create_graph=False
         )
         
-        # Lambda gradients 
+        # ⚠️ CRITICAL FIX: Negate for gradient ASCENT on lambdas
+        lambda_loss = -loss_dict['total_loss']  # This makes it max instead of min!
+        
         lambda_grads = torch.autograd.grad(
-            loss_dict['total_loss'], 
+            lambda_loss,  # Use negated loss
             [self.lambda_kl, self.lambda_l0, self.lambda_lt],
             create_graph=False
         )
         
-        # Apply VAE gradients manually
+        # Apply VAE gradients
         for param, grad in zip(vae_params, vae_grads):
             param.grad = grad
         torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
         self.vae_optimizer.step()
         
-        # Apply lambda gradients manually
+        # Apply lambda gradients
         for param, grad in zip([self.lambda_kl, self.lambda_l0, self.lambda_lt], lambda_grads):
             param.grad = grad
         self.lambda_optimizer.step()
@@ -521,7 +576,6 @@ class VAESystem(nn.Module):
             self.lambda_l0.data.clamp_(0.01, 5.0)
             self.lambda_lt.data.clamp_(0.01, 5.0)
         
-        # Logging
         logged_losses = {
             k: v.detach().item() if torch.is_tensor(v) and v.numel() == 1 else v
             for k, v in loss_dict.items()
@@ -655,6 +709,9 @@ class VAESystem(nn.Module):
                       f"KL={avg_losses['kl_divergence']:.4f}, "
                       f"L0={avg_losses['expected_l0']:.2f}, "
                       f"KL_Weight={kl_weight:.2f}") # <-- MODIFIED: Log the weight
+                print(f"λ_KL: {self.lambda_kl.item():.3f}, "
+                    f"λ_L0: {self.lambda_l0.item():.3f}, "
+                    f"KL: {avg_losses['kl_divergence']:.4f}")
             
             # Check for convergence
             current_loss = avg_losses['total_loss']
@@ -668,6 +725,7 @@ class VAESystem(nn.Module):
                 print(f"Converged after {epoch} epochs (patience={patience})")
                 break
         
+            
         # Extract final pivotal states
         pivotal_states = self.extract_pivotal_states(all_trajectories)
         

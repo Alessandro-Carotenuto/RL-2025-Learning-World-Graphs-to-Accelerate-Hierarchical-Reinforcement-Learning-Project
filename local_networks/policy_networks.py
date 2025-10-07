@@ -395,9 +395,10 @@ class GoalConditionedPolicy(nn.Module):
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
                                      num_episodes: int = 3, 
-                                     max_episode_length: int = 40,  # ADD THIS
+                                     max_episode_length: int = 50,  # ADD THIS
                                      vae_system=None,
-                                     curiosity_weight: float = 0.5) -> List:
+                                     curiosity_weight: float = 0.5,
+                                     use_curiosity: bool = True) -> List:
         """
         Collect multiple episodes starting from a specific position (pivotal state).
         Used in alternating training to explore from discovered pivotal states.

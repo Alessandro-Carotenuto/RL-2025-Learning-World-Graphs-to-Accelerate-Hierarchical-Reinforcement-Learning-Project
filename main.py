@@ -123,18 +123,28 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         # Phase 2: Collect trajectories from pivotal states
         print(f"Phase 2: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
         
+        # Use fewer pivotal states early, more as training progresses
+        num_pivotal_to_use = min(5 + iteration, len(pivotal_states))
+
+
         episodes_collected = 0
         success_count = 0  # ADD THIS LINE
         for i, start_state in enumerate(pivotal_states[:10]):  # Increased from 5
             print(f"  Collecting from pivotal state {i+1}: {start_state}")
             
-            curiosity_weight = max(0.2, 0.8 - (iteration * 0.1))
+            # Start curiosity only after first iteration
+            if iteration == 0:
+                curiosity_weight = 0.0  # Pure goal-seeking first
+                use_curiosity = False
+            else:
+                curiosity_weight = max(0.15, 0.5 - (iteration * 0.05))  # Decay: 0.5→0.15
+                use_curiosity = True
             
             try:
                 episodes = policy.collect_episodes_from_position(
                     env, start_state,
-                    num_episodes=2,
-                    max_episode_length=40,  # Increased from 25
+                    num_episodes=4,
+                    max_episode_length=50,  # Increased from 25
                     vae_system=vae_system,
                     curiosity_weight=curiosity_weight
                 )
