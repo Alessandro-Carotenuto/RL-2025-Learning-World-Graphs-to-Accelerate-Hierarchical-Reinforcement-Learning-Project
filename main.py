@@ -87,7 +87,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 obs = env.reset()
                 start_pos = tuple(env.agent_pos)
                 episodes = policy.collect_episodes_from_position(
-                    env, start_pos, num_episodes=1, vae_system=vae_system
+                    env, start_pos, num_episodes=6, vae_system=vae_system
                 )
                 if episodes:
                     buffer.add_episodes(episodes)
@@ -100,7 +100,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 buffer, 
                 num_epochs=25, 
                 batch_size=3,
-                initial_kl_weight=persistent_kl_weight  # NEW
+                initial_kl_weight=persistent_kl_weight,
+                annealing_rate=0.01  # ADD THIS
             )
         except Exception as e:
             print(f"VAE training failed: {e}")
@@ -143,7 +144,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             try:
                 episodes = policy.collect_episodes_from_position(
                     env, start_state,
-                    num_episodes=4,
+                    num_episodes=10,
                     max_episode_length=50,  # Increased from 25
                     vae_system=vae_system,
                     curiosity_weight=curiosity_weight
@@ -187,7 +188,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             random_start = tuple(env.agent_pos)
             try:
                 random_episodes = policy.collect_episodes_from_position(
-                    env, random_start, num_episodes=1, vae_system=vae_system
+                    env, random_start, num_episodes=6, vae_system=vae_system
                 )
                 if random_episodes:
                     buffer.add_episodes(random_episodes)
@@ -612,7 +613,11 @@ def test_goal_policy_with_curiosity():
         # Train one episode with curiosity-driven goal policy
         try:
             # Adjust curiosity weight over time (start high, decay)
-            curiosity_weight = max(0.5, 2.0 - (episode / 15))  # Decay from 2.0 to 0.5
+            # Start HIGH to encourage exploration, decay as policy improves
+            if iteration == 0:
+                curiosity_weight = 2.0  # Pure exploration first
+            else:
+                curiosity_weight = max(0.3, 2.0 * (0.8 ** iteration))  # Exponential decay
             
             states, actions, rewards, goal_reached = policy.train_goal_policy_episode(
                 env, start_pos, 
@@ -1891,15 +1896,30 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     print(f"\nDiagnostic plots saved to {save_path}")
     plt.close()
 
+def save_separate_graph_visualization(world_graph, pivotal_states, config):
+    """Save standalone graph visualization using GraphVisualizer."""
+    if len(pivotal_states) > 0 and world_graph is not None:
+        from utils.graph_manager import GraphVisualizer
+        
+        viz = GraphVisualizer(world_graph, figsize=(10, 10))
+        fig, ax = viz.visualize(
+            show_weights=True,
+            show_labels=True,
+            title=f'World Graph (mu0={config["vae_mu0"]})'
+        )
+        plt.savefig(f'world_graph_mu{config["vae_mu0"]:.1f}.png', dpi=150)
+        plt.close()
+        print(f"Saved graph to world_graph_mu{config['vae_mu0']:.1f}.png")
+
 def test_phase1_with_diagnostics(config=None):
     """
     Test Phase 1 using alternating_training_loop with diagnostic tracking.
     """
     default_config = {
         'maze_size': EnvSizes.SMALL,
-        'phase1_iterations': 8,
+        'phase1_iterations': 15,
         'vae_mu0': 10.0,
-        'goal_policy_lr': 5e-4,
+        'goal_policy_lr': 5e-3,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
     
@@ -2027,6 +2047,8 @@ def test_phase1_with_diagnostics(config=None):
     print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
     plt.close()
     
+    save_separate_graph_visualization(world_graph, pivotal_states, config)
+    
     # Summary
     print(f"\n{'='*70}")
     print("PHASE 1 TEST COMPLETE")
@@ -2038,6 +2060,7 @@ def test_phase1_with_diagnostics(config=None):
     if metrics['vae_losses']:
         print(f"Final VAE loss: {metrics['vae_losses'][-1]:.4f}")
         print(f"Final KL divergence: {metrics['vae_kl'][-1]:.4f}")
+
     
     return {
         'metrics': metrics,
@@ -2369,6 +2392,7 @@ def main():
         config = {'vae_mu0': mu0, 'phase1_iterations': 50, 'maze_size': EnvSizes.MEDIUM}
         runs[f'mu0={mu0}'] = test_phase1_with_diagnostics(config)
 
+    
     # compare_phase1_runs(runs)
 
     # runs = {}

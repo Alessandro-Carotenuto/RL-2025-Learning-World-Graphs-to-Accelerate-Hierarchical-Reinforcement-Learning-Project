@@ -40,11 +40,11 @@ class GoalConditionedPolicy(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99           # Discount factor
-        self.entropy_coef = 0.01    # Entropy regularization
+        self.entropy_coef = 0.05    # Entropy regularization
         self.value_coef = 0.5       # Value loss coefficient
         
     def train_goal_policy_episode(self, env, start_pos: Tuple[int, int], 
-                        max_episode_length: int = 35,
+                        max_episode_length: int = 50,
                         vae_system=None, 
                         curiosity_weight: float = 1.0) -> Tuple[List, List, List, bool]:
         """
@@ -76,11 +76,12 @@ class GoalConditionedPolicy(nn.Module):
         total_goal_reward = 0
         distance_changes = []
         
+        episode_trajectory = []  # Store (state, action) pairs
         # Run episode
         for step in range(max_episode_length):
             # Get action from policy
             action, log_prob, value = self.get_action(current_pos, goal_pos)
-            
+            episode_trajectory.append((current_pos, action))
             # Store state-action data
             states.append((current_pos, goal_pos))
             actions.append(action)
@@ -112,16 +113,20 @@ class GoalConditionedPolicy(nn.Module):
             goal_reward = 10.0 if next_pos == goal_pos else 0.0  # Was 1.0
             
             # Progress reward: reward getting closer to goal
-            progress_reward = 0.1 if new_distance < old_distance else 0.0
+            progress_reward = 0.2 if new_distance < old_distance else 0.0
             
             step_penalty = -0.01
             
             # Curiosity reward computation (reduced since goal reward increased)
             curiosity_reward = 0.0
             if vae_system is not None and len(visited_states) > 1:
-                recent_states = visited_states[-3:]
-                base_curiosity = vae_system.compute_curiosity_reward(recent_states)
+                # CORRECT - uses episode_trajectory (state-action pairs) + new method
+                window_size = min(5, len(episode_trajectory))
+                recent_trajectory = episode_trajectory[-window_size:]
+                base_curiosity = vae_system.compute_curiosity_reward_from_trajectory(recent_trajectory)
+
                 curiosity_reward = base_curiosity * curiosity_weight # Scale by weight
+                curiosity_reward = min(1.0, curiosity_reward)  # Cap curiosity reward to prevent spikes
             
             total_reward = goal_reward + progress_reward + step_penalty + curiosity_reward
             rewards.append(total_reward)
@@ -394,7 +399,7 @@ class GoalConditionedPolicy(nn.Module):
         return diagnostics
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
-                                     num_episodes: int = 3, 
+                                     num_episodes: int = 6, 
                                      max_episode_length: int = 50,  # ADD THIS
                                      vae_system=None,
                                      curiosity_weight: float = 0.5,
@@ -441,7 +446,7 @@ class GoalConditionedPolicy(nn.Module):
         return episodes_data
     
     def discover_edges_between_pivotal_states(self, env, pivotal_states: List[Tuple[int, int]], 
-                                            max_walk_length: int = 50,
+                                            max_walk_length: int = 20,
                                             num_attempts: int = 50) -> Dict[Tuple, List[Tuple]]:
         """
         Discover edges between pivotal states using random walks.
@@ -542,18 +547,6 @@ class GoalConditionedPolicy(nn.Module):
         """
         refined_edges = {}
 
-        for (start_state, end_state), raw_path in raw_edges.items():
-            # Validate adjacency
-            valid = True
-            for i in range(len(raw_path) - 1):
-                dist = abs(raw_path[i+1][0] - raw_path[i][0]) + abs(raw_path[i+1][1] - raw_path[i][1])
-                if dist != 1:
-                    print(f"  ⚠️  Skipping edge {start_state}->{end_state}: non-adjacent nodes {raw_path[i]}->{raw_path[i+1]}")
-                    valid = False
-                    break
-            
-            if not valid:
-                continue  # Skip this edge entirely
         
         print("Refining edge paths with goal-conditioned policy...")
         
