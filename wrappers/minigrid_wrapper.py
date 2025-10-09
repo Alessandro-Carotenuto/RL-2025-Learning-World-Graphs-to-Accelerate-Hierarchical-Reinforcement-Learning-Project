@@ -640,7 +640,36 @@ class MinigridWrapper(MiniGridEnv):
        self.placeable_grid[playerpos[0]][playerpos[1]]=False
        self.NoiseFiller(0.65)  # noise and reserves
        return
-                
+
+    def ascii_encode_gridelement(self,obj):
+        if obj is None:
+            return '-'
+        elif isinstance(obj, Wall):
+            return '#'
+        elif isinstance(obj, Goal):
+            return 'G'
+        elif isinstance(obj, Key):
+            return 'K'
+        elif isinstance(obj, Door):
+            return 'D'
+        elif isinstance(obj, Ball):
+            return 'B'
+        else:
+            return '.'
+
+    def getGridState(self,view=False):
+        ASCIIGRID=[]
+        for y in range(self.h):
+            row = []
+            for x in range(self.w):
+                EL=self.ascii_encode_gridelement(self.grid.get(x,y))
+                if view:
+                    print(EL, end='')
+                row.append(EL)
+            ASCIIGRID.append(row)
+            print()
+        return ASCIIGRID
+    
     # STARTS GRID GENERATION
     def _gen_grid(self, width, height):
 
