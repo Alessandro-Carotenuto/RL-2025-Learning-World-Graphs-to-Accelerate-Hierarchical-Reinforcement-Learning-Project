@@ -69,7 +69,6 @@ def print_grid_image(GRIDTEXT,name=' '):
     
     plt.tight_layout()
     plt.savefig('grid'+name+'.png', dpi=150, bbox_inches='tight')
-    plt.show()
 
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8):
     """
@@ -115,7 +114,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             pivotal_states = vae_system.train(
                 buffer, 
                 num_epochs=25, 
-                batch_size=3,
+                batch_size=8,
                 initial_kl_weight=persistent_kl_weight,
                 annealing_rate=0.01  # ADD THIS
             )
@@ -576,7 +575,7 @@ def test_phase1_with_diagnostics(config=None):
         print(f"  {k}: {v}")
     
     # Setup
-    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL)
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,phase_one_eps=config['phase1_iterations']*1000)
     env.phase = 1
     env.randomgen = True
     

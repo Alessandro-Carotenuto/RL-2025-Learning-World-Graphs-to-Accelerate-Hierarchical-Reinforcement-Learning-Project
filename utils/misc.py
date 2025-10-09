@@ -8,8 +8,23 @@ def manhattan_distance(pos1, pos2):
 
 #-----------------------------------------------------------------------------
 
+# New SAMPLING (RANDOM WALK)
+def sample_goal_position(env, start_pos, max_distance=20):
+    """Sample goal by doing random walk."""
+    walk_length = max_distance
+    env.agent_pos = start_pos
+    env.agent_dir = 0
+    
+    for _ in range(walk_length):
+        action = random.choice([0, 1, 2])  # navigation only
+        obs, _, term, trunc, _ = env.step(action)
+        if term or trunc:
+            break
+    
+    return tuple(env.agent_pos)
 
-def sample_goal_position(env, agent_pos: Tuple[int, int], max_distance: int = 6) -> Tuple[int, int]:
+# OLD SAMPLING (REACHABLE)
+#def sample_goal_position(env, agent_pos: Tuple[int, int], max_distance: int = 6) -> Tuple[int, int]:
     """Sample a reachable goal position within max_distance from agent."""
     
     try:

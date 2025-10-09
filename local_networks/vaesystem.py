@@ -508,7 +508,7 @@ class VAESystem(nn.Module):
         )
 
         expected_l0 = hardkuma_dist.expected_l0_norm() / batch_size
-        target_l0 = self.mu0 * seq_lengths.float().mean()  # Scale by trajectory length
+        target_l0 = self.mu0 
         l0_loss = torch.pow(expected_l0 - target_l0, 2)
         
         z_diff = torch.abs(z_samples[:, 1:] - z_samples[:, :-1])
@@ -558,7 +558,7 @@ class VAESystem(nn.Module):
                 loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete, self.current_kl_weight)
                 reconstruction_error = loss_dict['reconstruction_loss'].item()
                 
-                curiosity_reward = min(5.0, reconstruction_error * scale_factor)
+                curiosity_reward = min(1.0, reconstruction_error * scale_factor)
                 return curiosity_reward
                 
         except Exception as e:
@@ -774,60 +774,3 @@ class VAESystem(nn.Module):
         self.prior_net.train()
         self.inference_net.train()
         self.generation_net.train()
-
-
-    def compute_curiosity_reward(self, episode_states: List[Tuple[int, int]], scale_factor: float = 0.01) -> float:
-        """
-        Compute curiosity reward based on VAE reconstruction error.
-        High reconstruction error = novel area = high curiosity reward.
-        
-        Args:
-            episode_states: List of (x, y) coordinates visited in current episode
-            scale_factor: Scaling factor for curiosity rewards (reduced from 0.05 to 0.01)
-            
-        Returns:
-            float: Curiosity reward value
-        """
-        if len(episode_states) == 0:
-            return 0.0
-        
-        # Filter out any invalid positions that might cause crashes
-        valid_states = []
-        for x, y in episode_states:
-            # Ensure positions are within valid maze bounds (1 to size-2)
-            if 1 <= x <= 8 and 1 <= y <= 8:  # For 10x10 maze, valid range is 1-8
-                valid_states.append((x, y))
-        
-        if len(valid_states) == 0:
-            return 0.0
-        
-        # Create fake trajectory for VAE processing
-        dummy_actions = [0] * len(valid_states)  # Use action 0 (turn_left) as dummy
-        fake_trajectory = list(zip(valid_states, dummy_actions))
-        
-        try:
-            # Set to evaluation mode to avoid training
-            self.eval()
-            
-            with torch.no_grad():
-                # Encode the trajectory
-                states, actions, seq_lengths, discrete = self.encode_trajectories([fake_trajectory])
-                
-                # Compute reconstruction loss (without gradients)
-                loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete, self.current_kl_weight)
-                reconstruction_error = loss_dict['reconstruction_loss'].item()
-                
-                # Reduced scale and cap for better balance
-                scale_factor = 0.1
-                curiosity_reward = min(2.0, reconstruction_error * scale_factor)  # Cap at 0.05 instead of 0.2
-                
-                return curiosity_reward
-                
-        except Exception as e:
-            # If VAE computation fails, return zero curiosity
-            print(f"    Curiosity computation failed: {e}")
-            return 0.0
-        
-        finally:
-            # Return to training mode
-            self.train_mode()
