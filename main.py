@@ -87,9 +87,11 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
 
     
     # NEW: Persistent KL weight across iterations
-    persistent_kl_weight = 0.0
-    total_epochs = max_iterations * 25  # Assuming 25 epochs per iteration
-    kl_ramp_rate = 1.0 / (total_epochs * 0.5)  # Ramp over first 50% of total
+    persistent_kl_weight = 1.0
+
+    # Ramping parameters (not used now)
+    # total_epochs = max_iterations * 25  # Assuming 25 epochs per iteration
+    # kl_ramp_rate = -0.5 / (total_epochs * 0.5) # Ramp from 0.5 to 1.0 over half the total epochs
     
     for iteration in range(max_iterations):
         print(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
@@ -116,14 +118,14 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 num_epochs=25, 
                 batch_size=8,
                 initial_kl_weight=persistent_kl_weight,
-                annealing_rate=0.01  # ADD THIS
+                annealing_rate=0.0  # No annealing within iteration
             )
         except Exception as e:
             print(f"VAE training failed: {e}")
             continue
         
-        # Update KL weight for next iteration
-        persistent_kl_weight = min(1.0, persistent_kl_weight + kl_ramp_rate * 25)
+        # do not update persistent_kl_weight here
+        # persistent_kl_weight = max(0.5, persistent_kl_weight + kl_ramp_rate * 25)
         
         # Track metrics
         if vae_system.training_history:
@@ -1036,7 +1038,7 @@ def main():
     # Compare maze sizes
     # Compare different mu0 values
     runs = {}
-    for mu0 in [3.0, 5.0, 10.0, 15.0]:
+    for mu0 in [5.0, 10.0 , 15.0]:
           config = {'vae_mu0': mu0, 'phase1_iterations': 50, 'maze_size': EnvSizes.MEDIUM}
           runs[f'mu0={mu0}'] = test_phase1_with_diagnostics(config)
 

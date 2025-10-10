@@ -140,6 +140,7 @@ class HardKumaraswamy:
             torch.log(alpha_kuma + eps)
         )
         
+        #print(f"KL before relu: min={kl.min():.4f}, max={kl.max():.4f}, mean={kl.mean():.4f}")
         # The kl should be non-negative
         return F.relu(kl)
         

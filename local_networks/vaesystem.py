@@ -56,11 +56,14 @@ class PriorNetwork(nn.Module):
         self._initialize_to_uniform()
     
     def _initialize_to_uniform(self):
-        """Start with near-uniform prior to avoid extreme values."""
-        for head in [self.alpha_head, self.beta_head]:
-            if isinstance(head[0], nn.Linear):  # Now head[0] is the Linear layer
-                nn.init.constant_(head[0].weight, 0.01)
-                nn.init.constant_(head[0].bias, 0.0)
+        """Initialize to slightly favor α > β to break symmetry."""
+        # Alpha head: bias toward α ≈ 2-3
+        nn.init.normal_(self.alpha_head[0].weight, 0, 0.01)
+        nn.init.constant_(self.alpha_head[0].bias, 1.5)  # Softplus(1.5) ≈ 2.1
+        
+        # Beta head: bias toward β ≈ 1-2  
+        nn.init.normal_(self.beta_head[0].weight, 0, 0.01)
+        nn.init.constant_(self.beta_head[0].bias, 0.7)  # Softplus(0.7) ≈ 1.2
     
     def forward(self, states):
         """
@@ -308,7 +311,7 @@ class VAESystem(nn.Module):
         """
         super().__init__()  # Initialize nn.Module
         
-        self.current_kl_weight = 0.0  # Add this
+        self.current_kl_weight = 1.0  # Add this
         
         self.device = device
         self.mu0 = mu0
@@ -344,12 +347,12 @@ class VAESystem(nn.Module):
             list(self.prior_net.parameters()) +
             list(self.inference_net.parameters()) +
             list(self.generation_net.parameters()),
-            lr=1e-3
+            lr=1e-4
         )
         
         self.lambda_optimizer = optim.Adam(
             [self.lambda_kl, self.lambda_l0, self.lambda_lt],
-            lr=1e-2
+            lr=1e-1
         )
         
         # Training state
@@ -390,6 +393,7 @@ class VAESystem(nn.Module):
         encoded_states = self.state_encoder(padded_states.to(self.device))
         encoded_actions = self.action_encoder(padded_actions.to(self.device))
         
+
         return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_discrete.to(self.device)
         #                                                                    ↑ Return discrete actions
     
@@ -405,6 +409,16 @@ class VAESystem(nn.Module):
         alpha_posterior = self.inference_net(states, actions)
         hardkuma_dist = HardKumaraswamy(alpha_posterior)
         z_samples = hardkuma_dist.rsample()
+
+        # In vaesystem.py, compute_elbo_loss(), around line 290:
+        alpha_prior, beta_prior = self.prior_net(states)
+        alpha_posterior = self.inference_net(states, actions)
+
+        # Add here:
+        if torch.rand(1) < 0.01:  # Print 10% of batches
+            print(f"  α_post: {alpha_posterior.min():.1f}-{alpha_posterior.max():.1f} (mean {alpha_posterior.mean():.1f})")
+            print(f"  α_prior: {alpha_prior.min():.1f}-{alpha_prior.max():.1f}")
+            print(f"  β_prior: {beta_prior.min():.1f}-{beta_prior.max():.1f}")
 
         # --- Step 4a: Dynamic Selection of Pivotal States ---
         # This is the core of Path A. We create a "ragged" batch of only pivotal states.
@@ -500,8 +514,15 @@ class VAESystem(nn.Module):
         raw_kl = masked_kl.sum() / mask.sum().clamp(min=1)
 
         kl_divergence = raw_kl
-        # Free bits: only penalize KL above the threshold
-        free_bits_threshold = 0.5
+        kl_loss_contribution = kl_divergence  # Default to full KL if no free bits
+        # # Free bits: only penalize KL above the threshold
+        # free_bits_threshold = 0.1
+        # kl_loss_contribution = torch.maximum(
+        #     kl_divergence - free_bits_threshold, 
+        #     torch.tensor(0.0, device=self.device)
+        # )
+
+        free_bits_threshold = 0.3  # KL should stay above this
         kl_loss_contribution = torch.maximum(
             kl_divergence - free_bits_threshold, 
             torch.tensor(0.0, device=self.device)
@@ -517,6 +538,8 @@ class VAESystem(nn.Module):
         expected_transitions = masked_transitions.sum() / (seq_mask.sum().clamp(min=1) * batch_size)
         lt_loss = torch.pow(expected_transitions - 2 * self.mu0, 2)
         
+
+
         # --- Step 9: Final Loss Combination ---
         total_loss = (
             reconstruction_loss + 
@@ -525,10 +548,12 @@ class VAESystem(nn.Module):
             torch.abs(self.lambda_lt) * lt_loss
         )
         
+        total_loss
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
             'kl_divergence': kl_divergence,
+            'kl_contribution': kl_loss_contribution,  # ADD THIS
             'l0_loss': l0_loss,
             'lt_loss': lt_loss,
             'expected_l0': expected_l0,
@@ -536,7 +561,7 @@ class VAESystem(nn.Module):
             'z_samples': z_samples.detach(),
         }
     
-    def compute_curiosity_reward_from_trajectory(self, trajectory: List[Tuple[Tuple[int, int], int]], scale_factor: float = 0.5) -> float:
+    def compute_curiosity_reward_from_trajectory(self, trajectory: List[Tuple[Tuple[int, int], int]], scale_factor: float = 0.3) -> float:
         """
         Compute curiosity reward from real (state, action) trajectory.
         
@@ -558,7 +583,7 @@ class VAESystem(nn.Module):
                 loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete, self.current_kl_weight)
                 reconstruction_error = loss_dict['reconstruction_loss'].item()
                 
-                curiosity_reward = min(1.0, reconstruction_error * scale_factor)
+                curiosity_reward = min(5.0, reconstruction_error * scale_factor)
                 return curiosity_reward
                 
         except Exception as e:
@@ -570,16 +595,24 @@ class VAESystem(nn.Module):
     
     def train_step(self, trajectories, kl_weight):
         states, actions, seq_lengths, discrete_actions = self.encode_trajectories(trajectories)
+
+        # ✅ SINGLE forward pass (one set of random samples)
         loss_dict = self.compute_elbo_loss(states, actions, seq_lengths, discrete_actions, kl_weight)
         
-        # Zero gradients
+        # ============================================================
+        # Compute gradients for BOTH model and lambdas
+        # ============================================================
         self.vae_optimizer.zero_grad()
         self.lambda_optimizer.zero_grad()
         
-        # Joint minimization: both optimize the same objective
-        loss_dict['total_loss'].backward()
+        loss_dict['total_loss'].backward()  # Compute gradients for everything
+
+        total_grad = sum(p.grad.norm().item() for p in self.prior_net.parameters() if p.grad is not None)
+        print(f"  Prior grad norm: {total_grad:.4f}")
         
-        # Clip gradients for VAE parameters only
+        # ============================================================
+        # STEP 1: VAE update (minimize)
+        # ============================================================
         vae_params = (
             list(self.state_encoder.parameters()) + 
             list(self.action_encoder.parameters()) +
@@ -587,19 +620,37 @@ class VAESystem(nn.Module):
             list(self.inference_net.parameters()) +
             list(self.generation_net.parameters())
         )
-        torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
+
+        torch.nn.utils.clip_grad_norm_(self.prior_net.parameters(), max_norm=5.0) # Clip prior gradients separately
         
-        # Update both optimizers
-        self.vae_optimizer.step()
-        self.lambda_optimizer.step()
+        # Clip OTHER networks to 1.0 (excluding prior)
+        other_params = (
+            list(self.state_encoder.parameters()) + 
+            list(self.action_encoder.parameters()) +
+            list(self.inference_net.parameters()) +
+            list(self.generation_net.parameters())
+        )
+        torch.nn.utils.clip_grad_norm_(other_params, max_norm=1.0)
+        self.vae_optimizer.step()  # Gradient descent (minimize)
         
-        # Clamp lambdas to reasonable ranges
+        # ============================================================
+        # STEP 2: Lambda update (maximize) - FLIP THE GRADIENTS
+        # ============================================================
+        # Manually negate lambda gradients to maximize instead of minimize
         with torch.no_grad():
-            self.lambda_kl.data.clamp_(0.1, 10.0)
-            self.lambda_l0.data.clamp_(0.01, 5.0)
-            self.lambda_lt.data.clamp_(0.01, 5.0)
+            self.lambda_kl.grad = -self.lambda_kl.grad
+            self.lambda_l0.grad = -self.lambda_l0.grad
+            self.lambda_lt.grad = -self.lambda_lt.grad
         
-        # Log losses (exclude non-scalar tensors)
+        self.lambda_optimizer.step()  # Now it maximizes!
+        
+        # Clamp lambdas
+        with torch.no_grad():
+            self.lambda_kl.data.clamp_(0.1, 500.0)
+            self.lambda_l0.data.clamp_(0.01, 10.0)
+            self.lambda_lt.data.clamp_(0.01, 10.0)
+        
+        # Log losses
         logged_losses = {
             k: v.detach().item() if torch.is_tensor(v) and v.numel() == 1 else v
             for k, v in loss_dict.items()
@@ -669,7 +720,7 @@ class VAESystem(nn.Module):
         convergence_threshold: float = 1e-4,
         patience: int = 10,
         initial_kl_weight: float = 1.0,
-        annealing_rate: float = 0.01  
+        annealing_rate: float = 0.00 # <-- MODIFIED: Annealing rate  
     ) -> List[Tuple]:
         """
         Full training loop for pivotal state discovery.
@@ -698,7 +749,7 @@ class VAESystem(nn.Module):
 
         for epoch in range(num_epochs):
             epoch_losses = []
-            
+
             # Sample batches of trajectories
             num_batches = max(1, len(all_trajectories) // batch_size)
             
@@ -725,15 +776,15 @@ class VAESystem(nn.Module):
 
 
             # Print progress
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 print(f"Epoch {epoch:3d}: Loss={avg_losses['total_loss']:.4f}, "
                       f"Recon={avg_losses['reconstruction_loss']:.4f}, "
-                      f"KL={avg_losses['kl_divergence']:.4f}, "
+                      f"KL Contribution={avg_losses['kl_contribution']:.4f}, "
                       f"L0={avg_losses['expected_l0']:.2f}, "
                       f"KL_Weight={kl_weight:.2f}") # <-- MODIFIED: Log the weight
                 print(f"λ_KL: {self.lambda_kl.item():.3f}, "
                     f"λ_L0: {self.lambda_l0.item():.3f}, "
-                    f"KL: {avg_losses['kl_divergence']:.4f}")
+                    f"KL divergence: {avg_losses['kl_divergence']:.4f}")
             
             # Check for convergence
             current_loss = avg_losses['total_loss']

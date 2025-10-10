@@ -10,6 +10,7 @@ from typing import List, Tuple, Dict, Optional
 from utils.misc import manhattan_distance,sample_goal_position
 from utils.graph_manager import GraphManager
 
+old_diag_phase_1 = False  # Toggle detailed diagnostics in phase 1
 #-----------------------------------------------------------------------------
 
 class GoalConditionedPolicy(nn.Module):
@@ -70,7 +71,8 @@ class GoalConditionedPolicy(nn.Module):
         current_pos = start_pos
         goal_reached = False
         
-        print(f"    Goal: {goal_pos}, Distance: {manhattan_distance(start_pos, goal_pos)}")
+        if old_diag_phase_1:
+            print(f"    Goal: {goal_pos}, Distance: {manhattan_distance(start_pos, goal_pos)}")
         
         # DIAGNOSTICS: Track policy behavior
         total_goal_reward = 0
@@ -142,12 +144,14 @@ class GoalConditionedPolicy(nn.Module):
                     reward_breakdown += f", cur:{curiosity_reward:.3f}"
                 reward_breakdown += f") = {total_reward:.2f}"
                 if self.verbose:    
-                    print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
+                    if old_diag_phase_1:
+                        print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
             
             # Check if goal reached or episode ended
             if goal_reward > 0:
                 goal_reached = True
-                print(f"    GOAL REACHED in {step+1} steps! Total goal reward: {total_goal_reward}")
+                if old_diag_phase_1:
+                    print(f"    GOAL REACHED in {step+1} steps! Total goal reward: {total_goal_reward}")
                 break
                 
             if terminated or truncated:
@@ -157,7 +161,8 @@ class GoalConditionedPolicy(nn.Module):
         
         # DIAGNOSTICS: Print episode summary
         avg_distance_change = sum(distance_changes) / len(distance_changes) if distance_changes else 0
-        print(f"    Episode summary: {len(actions)} steps, goal_reward: {total_goal_reward:.1f}, avg_dist_change: {avg_distance_change:.2f}")
+        if old_diag_phase_1:
+            print(f"    Episode summary: {len(actions)} steps, goal_reward: {total_goal_reward:.1f}, avg_dist_change: {avg_distance_change:.2f}")
         
         # Update policy with collected data
         policy_losses = self.update_policy_with_diagnostics(states, actions, rewards, values, log_probs)
@@ -394,7 +399,8 @@ class GoalConditionedPolicy(nn.Module):
         
         # Print diagnostics every few episodes (could be controlled with a flag)
         if len(states) > 5:  # Only for longer episodes
-            print(f"    Policy update: loss={total_loss:.4f}, adv_mean={advantage_mean:.3f}, grad_norm={total_grad_norm:.4f}, param_change={param_change_norm:.6f}")
+            if old_diag_phase_1:
+                print(f"    Policy update: loss={total_loss:.4f}, adv_mean={advantage_mean:.3f}, grad_norm={total_grad_norm:.4f}, param_change={param_change_norm:.6f}")
         
         return diagnostics
         
