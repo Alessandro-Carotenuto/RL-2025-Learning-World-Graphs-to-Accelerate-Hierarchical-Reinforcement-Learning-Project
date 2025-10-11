@@ -1038,10 +1038,9 @@ def main():
     # Compare maze sizes
     # Compare different mu0 values
     runs = {}
-    for mu0 in [5.0, 10.0 , 15.0]:
-          config = {'vae_mu0': mu0, 'phase1_iterations': 50, 'maze_size': EnvSizes.MEDIUM}
-          runs[f'mu0={mu0}'] = test_phase1_with_diagnostics(config)
-
+    for currsize in [EnvSizes.MEDIUM]:
+          config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
+          runs[f'size={currsize}'] = test_phase1_with_diagnostics(config)
     
     # compare_phase1_runs(runs)
 

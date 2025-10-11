@@ -10,7 +10,7 @@ import numpy as np
 
 from local_distributions.hardkuma import HardKumaraswamy, BetaDistribution
 
-
+diagvae=False
 
 class PriorNetwork(nn.Module):
     """
@@ -352,7 +352,7 @@ class VAESystem(nn.Module):
         
         self.lambda_optimizer = optim.Adam(
             [self.lambda_kl, self.lambda_l0, self.lambda_lt],
-            lr=1e-4
+            lr=1e-5
         )
         
         # Training state
@@ -504,7 +504,7 @@ class VAESystem(nn.Module):
         lt_loss = torch.pow(expected_transitions - 2 * self.mu0, 2)
 
         # Optional diagnostics
-        if torch.rand(1) < 0.01:
+        if torch.rand(1) < 0.01 and diagvae==True:
             # diagnostics on distributions
             print(f"  α_post std: {alpha_posterior.std():.4f}")
             print(f"  α_prior std: {alpha_prior.std():.4f}")
@@ -587,7 +587,8 @@ class VAESystem(nn.Module):
         loss_dict['total_loss'].backward()  # Compute gradients for everything
 
         total_grad = sum(p.grad.norm().item() for p in self.prior_net.parameters() if p.grad is not None)
-        print(f"  Prior grad norm: {total_grad:.4f}")
+        if diagvae==True:
+            print(f"  Prior grad norm: {total_grad:.4f}")
         
         # ============================================================
         # STEP 1: VAE update (minimize)
