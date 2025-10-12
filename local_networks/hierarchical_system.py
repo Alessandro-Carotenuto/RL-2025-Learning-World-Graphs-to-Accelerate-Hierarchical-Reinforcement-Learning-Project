@@ -67,7 +67,7 @@ class HierarchicalManager(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 0.1
+        self.entropy_coef = 0.3    # NEW: Increased entropy regularization
         self.value_coef = 0.5
 
         # Diagnostic parameters

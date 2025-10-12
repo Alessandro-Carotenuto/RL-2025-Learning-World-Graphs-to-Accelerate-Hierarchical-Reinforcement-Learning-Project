@@ -64,6 +64,7 @@ class GoalConditionedPolicy(nn.Module):
         Train the goal-conditioned policy with enhanced reward structure and diagnostics.
         """
         # Sample goal position
+        self.hidden_state = None  # Reset LSTM hidden state at episode start
         goal_pos = sample_goal_position(env, start_pos, max_distance=20)
         
         # Initialize episode data
