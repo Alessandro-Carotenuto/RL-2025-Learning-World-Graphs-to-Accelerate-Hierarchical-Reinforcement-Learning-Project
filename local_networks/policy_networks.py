@@ -26,13 +26,25 @@ class GoalConditionedPolicy(nn.Module):
         self.device = device
         
         # Neural network components
-        self.net = nn.Sequential(
-            nn.Linear(4, 64),     # [state_x, state_y, goal_x, goal_y]
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU()
-        ).to(device)
+        # self.net = nn.Sequential(
+        #     nn.Linear(4, 64),     # [state_x, state_y, goal_x, goal_y]
+        #     nn.ReLU(),
+        #     nn.Linear(64, 64),
+        #     nn.ReLU()
+        # ).to(device)
         
+        # LSTM instead of Sequential
+        self.lstm = nn.LSTM(
+            input_size=4,  # [state_x, state_y, goal_x, goal_y]
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True
+        ).to(device)
+
+         # LSTM hidden state
+        self.hidden_state = None
+
+
         self.actor = nn.Linear(64, 7).to(device)    # 7 MiniGrid actions
         self.critic = nn.Linear(64, 1).to(device)   # Value function
         
@@ -188,10 +200,14 @@ class GoalConditionedPolicy(nn.Module):
             goal = goal.unsqueeze(0)
             
         # Combine state and goal
-        combined = torch.cat([state, goal], dim=-1)  # [batch_size, 4]
+        #combined = torch.cat([state, goal], dim=-1)  # [batch_size, 4]
         
+        combined = torch.cat([state, goal], dim=-1).unsqueeze(1)  # [batch_size, 1, 4] for LSTM
+        
+        lstm_out, self.hidden_state = self.lstm(combined, self.hidden_state) 
         # Process through network
-        features = self.net(combined)               # [batch_size, 64]
+        #features = self.net(combined)               # [batch_size, 64]
+        features = lstm_out.squeeze(1)              # [batch_size, 64]
         action_logits = self.actor(features)        # [batch_size, 7]
         value = self.critic(features)               # [batch_size, 1]
         

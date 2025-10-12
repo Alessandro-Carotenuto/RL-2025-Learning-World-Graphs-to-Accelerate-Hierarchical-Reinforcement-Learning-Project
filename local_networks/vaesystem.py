@@ -483,14 +483,14 @@ class VAESystem(nn.Module):
         raw_kl = masked_kl.sum() / mask.sum().clamp(min=1)
 
         # Free bits for λ_KL term
-        free_bits_threshold = 0.01
+        free_bits_threshold = 0.01  # Minimum KL per timestep
         kl_loss_contribution = torch.maximum(
             raw_kl - free_bits_threshold, 
             torch.tensor(0.0, device=self.device)
         )
 
         # NEW: KL floor penalty (uses raw KL, not free-bits version)
-        kl_floor = 0.2  # Target minimum KL per timestep
+        kl_floor = 0.2 # Target minimum KL per timestep
         kl_penalty = F.relu(kl_floor - raw_kl) * 25.0  # Penalty if KL drops too low
 
         expected_l0 = hardkuma_dist.expected_l0_norm() / batch_size

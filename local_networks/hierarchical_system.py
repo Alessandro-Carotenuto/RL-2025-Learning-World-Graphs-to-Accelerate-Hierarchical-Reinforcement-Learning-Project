@@ -231,35 +231,61 @@ class HierarchicalManager(nn.Module):
         
         return wide_goal, narrow_goal, combined_log_prob, value
         
+    # Transfer learning initialization (broken? just copying heads i guess)
+    # def initialize_from_goal_policy(self, goal_policy):
+    #     """
+    #     Transfer learning: Initialize Manager with better scaling.
+    #     """
+    #     with torch.no_grad():
+    #         # Use standard initialization (gain=1.0, not 0.1)
+    #         for name, param in self.lstm.named_parameters():
+    #             if 'weight_ih' in name:
+    #                 nn.init.xavier_uniform_(param, gain=1.0)  # ← FIX: gain=1.0
+    #             elif 'weight_hh' in name:
+    #                 nn.init.orthogonal_(param, gain=1.0)  # ← Better for recurrent
+    #             elif 'bias' in name:
+    #                 nn.init.zeros_(param)
+            
+    #         # Initialize output heads with standard gain
+    #         nn.init.xavier_uniform_(self.wide_head.weight, gain=1.0)
+    #         nn.init.zeros_(self.wide_head.bias)
+    #         nn.init.xavier_uniform_(self.narrow_head.weight, gain=1.0)
+    #         nn.init.zeros_(self.narrow_head.bias)
+            
+    #         # Initialize critic
+    #         if hasattr(goal_policy, 'critic'):
+    #             self.critic.weight.copy_(goal_policy.critic.weight)
+    #             self.critic.bias.copy_(goal_policy.critic.bias)
+    #         else:
+    #             nn.init.xavier_uniform_(self.critic.weight, gain=1.0)
+    #             nn.init.zeros_(self.critic.bias) 
+        
+    #     print(f"Manager initialized with standard scaling (gain=1.0)")
+
+    # Actual initialization from goal policy (LSTM copying)
     def initialize_from_goal_policy(self, goal_policy):
-        """
-        Transfer learning: Initialize Manager with better scaling.
-        """
         with torch.no_grad():
-            # Use standard initialization (gain=1.0, not 0.1)
-            for name, param in self.lstm.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param, gain=1.0)  # ← FIX: gain=1.0
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param, gain=1.0)  # ← Better for recurrent
-                elif 'bias' in name:
-                    nn.init.zeros_(param)
+            # Similar LSTM copying logic as Worker
+            if hasattr(goal_policy, 'lstm'):
+                for name, param in goal_policy.lstm.named_parameters():
+                    if name in dict(self.lstm.named_parameters()):
+                        manager_param = dict(self.lstm.named_parameters())[name]
+                        if param.shape == manager_param.shape:
+                            manager_param.copy_(param)
             
-            # Initialize output heads with standard gain
-            nn.init.xavier_uniform_(self.wide_head.weight, gain=1.0)
-            nn.init.zeros_(self.wide_head.bias)
-            nn.init.xavier_uniform_(self.narrow_head.weight, gain=1.0)
-            nn.init.zeros_(self.narrow_head.bias)
-            
-            # Initialize critic
+            # Copy critic only (manager has different heads)
             if hasattr(goal_policy, 'critic'):
                 self.critic.weight.copy_(goal_policy.critic.weight)
                 self.critic.bias.copy_(goal_policy.critic.bias)
-            else:
-                nn.init.xavier_uniform_(self.critic.weight, gain=1.0)
-                nn.init.zeros_(self.critic.bias)
+            
+            # Initialize manager heads with small weights
+            nn.init.xavier_uniform_(self.wide_head.weight, gain=0.5)
+            nn.init.zeros_(self.wide_head.bias)
+            nn.init.xavier_uniform_(self.narrow_head.weight, gain=0.5)
+            nn.init.zeros_(self.narrow_head.bias)
         
-        print(f"Manager initialized with standard scaling (gain=1.0)")
+        print("Manager initialized from goal policy LSTM")
+
 
     def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0):
         """Update Manager policy with wide + narrow entropy regularization."""
@@ -845,38 +871,74 @@ class HierarchicalWorker(nn.Module):
         else:
             return -0.001  # Step penalty
     
-    def initialize_from_goal_policy(self, goal_policy):
-        """
-        Transfer learning: Initialize Worker with πg weights.
-        Paper: "initializing task-specific Worker and Manager with weights from πg"
-        """
-        with torch.no_grad():
-            # Initialize LSTM with small weights
-            for name, param in self.lstm.named_parameters():
-                if 'weight' in name:
-                    nn.init.xavier_uniform_(param, gain=0.1)
-                elif 'bias' in name:
-                    nn.init.zeros_(param)
+    # Transfer learning initialization (broken? just copying heads i guess)
+    # def initialize_from_goal_policy(self, goal_policy):
+    #     """
+    #     Transfer learning: Initialize Worker with πg weights.
+    #     Paper: "initializing task-specific Worker and Manager with weights from πg"
+    #     """
+    #     with torch.no_grad():
+    #         # Initialize LSTM with small weights
+    #         for name, param in self.lstm.named_parameters():
+    #             if 'weight' in name:
+    #                 nn.init.xavier_uniform_(param, gain=0.1)
+    #             elif 'bias' in name:
+    #                 nn.init.zeros_(param)
             
-            # Copy actor head from goal policy if compatible
-            if hasattr(goal_policy, 'actor') and goal_policy.actor.out_features == 7:
-                # Goal policy has 7 actions, Worker uses 3 navigation actions
-                # Copy first 3 action weights
+    #         # Copy actor head from goal policy if compatible
+    #         if hasattr(goal_policy, 'actor') and goal_policy.actor.out_features == 7:
+    #             # Goal policy has 7 actions, Worker uses 3 navigation actions
+    #             # Copy first 3 action weights
+    #             self.actor.weight.copy_(goal_policy.actor.weight[:3, :])
+    #             self.actor.bias.copy_(goal_policy.actor.bias[:3])
+    #         else:
+    #             nn.init.xavier_uniform_(self.actor.weight, gain=0.1)
+    #             nn.init.constant_(self.actor.bias, 0)
+            
+    #         # Copy critic
+    #         if hasattr(goal_policy, 'critic'):
+    #             self.critic.weight.copy_(goal_policy.critic.weight)
+    #             self.critic.bias.copy_(goal_policy.critic.bias)
+    #         else:
+    #             nn.init.xavier_uniform_(self.critic.weight, gain=1.0)
+    #             nn.init.constant_(self.critic.bias, 0)
+        
+    #     print(f"Worker initialized from goal policy (transfer learning)")
+
+    #     # Transfer learning initialization from goal policy (copying LSTM and heads)
+    
+    # Actual working version:
+    def initialize_from_goal_policy(self, goal_policy):
+        with torch.no_grad():
+            # Copy LSTM weights
+            if hasattr(goal_policy, 'lstm'):
+                # Goal policy LSTM: input=4, Worker LSTM: input=6
+                # Copy what we can
+                for name, param in goal_policy.lstm.named_parameters():
+                    if name in dict(self.lstm.named_parameters()):
+                        worker_param = dict(self.lstm.named_parameters())[name]
+                        if param.shape == worker_param.shape:
+                            worker_param.copy_(param)
+                        elif 'weight_ih' in name:  # Input weights - partial copy
+                            # Copy first 4 input dims (state_x, state_y, goal_x, goal_y)
+                            worker_param[:, :4].copy_(param)
+                            # Randomly init the extra 2 dims for narrow goal
+                            nn.init.xavier_uniform_(worker_param[:, 4:])
+                        else:  # Other weights match exactly
+                            worker_param.copy_(param)
+            
+            # Copy actor (first 3 actions)
+            if hasattr(goal_policy, 'actor'):
                 self.actor.weight.copy_(goal_policy.actor.weight[:3, :])
                 self.actor.bias.copy_(goal_policy.actor.bias[:3])
-            else:
-                nn.init.xavier_uniform_(self.actor.weight, gain=0.1)
-                nn.init.constant_(self.actor.bias, 0)
             
             # Copy critic
             if hasattr(goal_policy, 'critic'):
                 self.critic.weight.copy_(goal_policy.critic.weight)
                 self.critic.bias.copy_(goal_policy.critic.bias)
-            else:
-                nn.init.xavier_uniform_(self.critic.weight, gain=1.0)
-                nn.init.constant_(self.critic.bias, 0)
         
-        print(f"Worker initialized from goal policy (transfer learning)")
+        print("Worker initialized from goal policy LSTM")
+
 
     def update_policy(self, states: List, actions: List, rewards: List, 
                      values: List[torch.Tensor], log_probs: List[torch.Tensor]):

@@ -287,8 +287,12 @@ def diagnose_graph_connectivity(world_graph, pivotal_states, env):
                 if path:
                     connected_pairs += 1
     
-    connectivity_pct = 100 * connected_pairs / total_pairs
-    print(f"  Connected pairs: {connected_pairs}/{total_pairs} ({connectivity_pct:.1f}%)")
+    if total_pairs > 0:
+        connectivity_pct = 100 * connected_pairs / total_pairs
+        print(f"  Connected pairs: {connected_pairs}/{total_pairs} ({connectivity_pct:.1f}%)")
+    else:
+        connectivity_pct = 100.0
+        print(f"  Only one pivotal state, trivially connected.")
     
     if connectivity_pct < 50:
         print(f"  ⚠ WARNING: Graph is poorly connected!")
@@ -839,14 +843,14 @@ def compare_phase1_runs(runs_dict):
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 8,
+        'phase1_iterations': 50,
         'phase2_episodes': 100,
         'max_steps_per_episode': 2500,
         'manager_horizon': 20,
         'neighborhood_size': 5,
-        'manager_lr': 1e-4,
+        'manager_lr': 5e-4,
         'worker_lr': 5e-3,
-        'vae_mu0': 10.0,
+        'vae_mu0': 9.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
         'full_breakdown_every': 50,  # NEW: Full breakdown every N episodes
@@ -894,10 +898,16 @@ def train_full_phase1_phase2(config=externalconfig):
     print(f"  Pivotal states: {len(pivotal_states)}")
     print(f"  Graph edges: {len(world_graph.edges)}")
     
+
+
     # Diagnose graph connectivity
     reachable, unreachable = diagnose_graph_connectivity(
         world_graph, pivotal_states, env
     )
+
+    GRIDSTATE=env.getGridState()
+    print_grid_image(GRIDSTATE,name=str(config['vae_mu0']))
+    save_separate_graph_visualization(world_graph, pivotal_states, config)
 
     # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
     manager = HierarchicalManager(
@@ -1033,14 +1043,16 @@ def main():
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
 
-    # train_full_phase1_phase2()
+    train_full_phase1_phase2()
+    # config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
+    # test_phase1_with_diagnostics(config)
 
     # Compare maze sizes
     # Compare different mu0 values
-    runs = {}
-    for currsize in [EnvSizes.MEDIUM]:
-          config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
-          runs[f'size={currsize}'] = test_phase1_with_diagnostics(config)
+    # runs = {}
+    # for currsize in [EnvSizes.MEDIUM]:
+        #   config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
+        #   runs[f'size={currsize}'] = test_phase1_with_diagnostics(config)
     
     # compare_phase1_runs(runs)
 
