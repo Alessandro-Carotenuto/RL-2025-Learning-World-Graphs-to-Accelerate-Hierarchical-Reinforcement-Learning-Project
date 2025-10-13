@@ -7,10 +7,13 @@ import random
 import numpy as np
 from utils.optimal_reward_computer import compute_optimal_reward_for_episode
 from collections import Counter
+from utils.misc import manhattan_distance
 
 diag=False
 diag2=False
 diag3=False
+
+dist_reward_abilitate = True  # NEW: Enable distance-based shaping in Worker reward
 
 class HierarchicalManager(nn.Module):
     """
@@ -869,7 +872,19 @@ class HierarchicalWorker(nn.Module):
         elif current_state == wide_goal:
             return 0.5  # Partial success (reached wide goal)
         else:
-            return -0.001  # Step penalty
+            if dist_reward_abilitate==False:
+                return -0.001
+            else:
+                # ADD THIS: Distance-based shaping
+                dist_to_narrow = manhattan_distance(current_state, narrow_goal)
+                dist_to_wide = manhattan_distance(current_state, wide_goal)
+                
+                # Reward progress toward closest goal
+                min_dist = min(dist_to_narrow, dist_to_wide)
+                distance_penalty = -0.01 * min_dist  # Closer = less penalty
+                step_penalty = -0.001
+                
+                return distance_penalty + step_penalty
     
     # Transfer learning initialization (broken? just copying heads i guess)
     # def initialize_from_goal_policy(self, goal_policy):
