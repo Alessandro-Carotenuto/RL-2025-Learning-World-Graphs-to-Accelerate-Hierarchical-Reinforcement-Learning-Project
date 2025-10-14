@@ -70,7 +70,7 @@ def print_grid_image(GRIDTEXT,name=' '):
     plt.tight_layout()
     plt.savefig('grid'+name+'.png', dpi=150, bbox_inches='tight')
 
-def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8):
+def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, fast_training=True):
     """
     Main alternating training loop with persistent KL annealing.
     """
@@ -111,7 +111,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             continue
         
         # Train VAE with persistent KL weight
-        print(f"Phase 1: Training VAE on {buffer.episodes_in_buffer} episodes...")
+        print(f"First Half: Training VAE on {buffer.episodes_in_buffer} episodes...")
         try:
             pivotal_states = vae_system.train(
                 buffer, 
@@ -139,7 +139,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
         # Phase 2: Collect trajectories from pivotal states
-        print(f"Phase 2: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
+        print(f"Second Half: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
         
         # Use fewer pivotal states early, more as training progresses
         num_pivotal_to_use = min(5 + iteration, len(pivotal_states))
@@ -147,7 +147,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
 
         episodes_collected = 0
         success_count = 0  # ADD THIS LINE
-        for i, start_state in enumerate(pivotal_states[:10]):  # Increased from 5
+        for i, start_state in enumerate(pivotal_states[:10]):  
             print(f"  Collecting from pivotal state {i+1}: {start_state}")
             
             # Start curiosity only after first iteration
@@ -194,7 +194,12 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             
             print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
             
-            if avg_change < 0.005:
+            if fast_training:
+                threshold_reconstruction_loss=0.05
+            else:
+                threshold_reconstruction_loss=0.005
+
+            if avg_change < threshold_reconstruction_loss:
                 print("Reconstruction loss has plateaued - training converged!")
                 break
         
@@ -848,8 +853,8 @@ externalconfig = {
         'max_steps_per_episode': 2500,
         'manager_horizon': 20,
         'neighborhood_size': 5,
-        'manager_lr': 5e-4,
-        'worker_lr': 5e-4,
+        'manager_lr': 1e-3,
+        'worker_lr': 1e-3,
         'vae_mu0': 9.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
@@ -874,15 +879,16 @@ def train_full_phase1_phase2(config=externalconfig):
     print("="*70)
     print("FULL TRAINING with Diagnostics")
     print("="*70)
+    
     for k, v in config.items():
         print(f"  {k}: {v}")
     
     # Phase 1
-    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'])
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'],phase_one_eps=config['phase1_iterations']*1000)
     env.phase = 1
     env.randomgen = True
     
-    policy = GoalConditionedPolicy(lr=config['manager_lr'],device=config['device'])
+    policy = GoalConditionedPolicy(lr=5e-3,device=config['device']) # Hardcoded learning rate for goal policy
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
     buffer = StatBuffer()
     

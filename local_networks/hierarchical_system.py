@@ -13,8 +13,6 @@ diag=False
 diag2=False
 diag3=False
 
-dist_reward_abilitate = True  # NEW: Enable distance-based shaping in Worker reward
-
 class HierarchicalManager(nn.Module):
     """
     Phase 2: Hierarchical Manager implementing Wide-then-Narrow goal selection.
@@ -872,19 +870,7 @@ class HierarchicalWorker(nn.Module):
         elif current_state == wide_goal:
             return 0.5  # Partial success (reached wide goal)
         else:
-            if dist_reward_abilitate==False:
-                return -0.001
-            else:
-                # ADD THIS: Distance-based shaping
-                dist_to_narrow = manhattan_distance(current_state, narrow_goal)
-                dist_to_wide = manhattan_distance(current_state, wide_goal)
-                
-                # Reward progress toward closest goal
-                min_dist = min(dist_to_narrow, dist_to_wide)
-                distance_penalty = -0.01 * min_dist  # Closer = less penalty
-                step_penalty = -0.001
-                
-                return distance_penalty + step_penalty
+            return -0.001  # Step penalty
     
     # Transfer learning initialization (broken? just copying heads i guess)
     # def initialize_from_goal_policy(self, goal_policy):
@@ -1242,6 +1228,8 @@ class HierarchicalTrainer:
             'worker_value_mean': [],
             'episode_rewards': []
         }
+
+        self.manhattan_distance_rew_shaping=True
     
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
         """Train one episode with comprehensive diagnostics."""
@@ -1354,11 +1342,15 @@ class HierarchicalTrainer:
             goal_reached_this_horizon = False
             
             for h in range(self.horizon):
+                # BEFORE taking action, record distance FOR SHAPING
+                old_dist_narrow = manhattan_distance(state, narrow_goal)
+                old_dist_wide = manhattan_distance(state, wide_goal)
+
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
                     state, wide_goal, narrow_goal,
                     agent_dir=self.env.agent_dir  # ← ADD THIS
-)
+                )
                 
                 # NEW: Track Worker values
                 worker_values_list.append(worker_value.item())
@@ -1379,8 +1371,20 @@ class HierarchicalTrainer:
                             f"horizon_total={horizon_env_reward + env_reward:.3f}, "
                             f"agent_pos={next_state}, balls_remaining={len(self.env.active_balls)}")
 
+                # Compute progress reward FOR SHAPING
+                new_dist_narrow = manhattan_distance(next_state, narrow_goal)
+                new_dist_wide = manhattan_distance(next_state, wide_goal)
+
+                progress_narrow = (old_dist_narrow - new_dist_narrow) * 0.05
+                progress_wide = (old_dist_wide - new_dist_wide) * 0.05
+                progress_bonus = max(progress_narrow, progress_wide)  # Reward best progress
+
                 # Worker reward (internal)
                 worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
+                # Add Manhattan Shaping
+
+                if self.manhattan_distance_rew_shaping:
+                    worker_reward += progress_bonus  
                 
                 # NEW: Track if Worker reached goal
                 if worker_reward > 0:
