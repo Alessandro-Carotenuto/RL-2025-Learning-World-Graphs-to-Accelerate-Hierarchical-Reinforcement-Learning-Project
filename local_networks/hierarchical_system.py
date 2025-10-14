@@ -1231,6 +1231,7 @@ class HierarchicalTrainer:
             'episode_rewards': []
         }
 
+        self.shaping_weight=0.5
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -1391,7 +1392,7 @@ class HierarchicalTrainer:
                 # Add Manhattan Shaping
 
                 if self.manhattan_distance_rew_shaping:
-                    worker_reward += progress_bonus  
+                    worker_reward += progress_bonus * self.shaping_weight
                 
                 # NEW: Track if Worker reached goal
                 if worker_reward > 0:

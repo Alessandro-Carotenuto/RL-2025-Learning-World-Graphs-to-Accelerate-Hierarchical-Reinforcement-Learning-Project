@@ -862,7 +862,9 @@ externalconfig = {
         'device': 'cuda'  # <-- ADD THIS: 'cpu' or 'cuda'
     }
 
-def train_full_phase1_phase2(config=externalconfig):
+fast_training_toggle=True
+
+def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_toggle):
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
 
@@ -896,7 +898,8 @@ def train_full_phase1_phase2(config=externalconfig):
     start_time = time.time()
     
     pivotal_states, world_graph, stat_buffer = alternating_training_loop(
-        env, policy, vae_system, buffer, max_iterations=config['phase1_iterations']
+        env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
+        fast_training=fast_training
     )
     
     phase1_time = time.time() - start_time
@@ -944,9 +947,7 @@ def train_full_phase1_phase2(config=externalconfig):
     manager, worker, env, 
     horizon=config['manager_horizon'],
     diagnostic_interval=config['diagnostic_interval'],  # NEW
-    diagnostic_checkstart=config['diagnostic_checkstart'],
-    managershaping=True
-    )
+    diagnostic_checkstart=config['diagnostic_checkstart'])
     
     print("\nPHASE 2: Hierarchical Training")
     
