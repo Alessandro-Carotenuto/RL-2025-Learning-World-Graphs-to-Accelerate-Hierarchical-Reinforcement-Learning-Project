@@ -68,7 +68,7 @@ class HierarchicalManager(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 0.1    # NEW: Increased entropy regularization
+        self.entropy_coef = 0.01    # NEW: Increased entropy regularization
         self.value_coef = 0.5
 
         # Diagnostic parameters
@@ -1205,7 +1205,9 @@ class HierarchicalTrainer:
     def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker, 
                  env, horizon: int = 15,
                  diagnostic_interval: int = 30,
-                 diagnostic_checkstart: bool = True):
+                 diagnostic_checkstart: bool = True,
+                 workershaping=True,
+                 managershaping=True):
         self.manager = manager
         self.worker = worker
         self.env = env
@@ -1229,7 +1231,8 @@ class HierarchicalTrainer:
             'episode_rewards': []
         }
 
-        self.manhattan_distance_rew_shaping=True
+        self.manhattan_distance_rew_shaping=workershaping
+        self.manager_reward_shaping=managershaping
     
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
         """Train one episode with comprehensive diagnostics."""
@@ -1346,6 +1349,10 @@ class HierarchicalTrainer:
                 old_dist_narrow = manhattan_distance(state, narrow_goal)
                 old_dist_wide = manhattan_distance(state, wide_goal)
 
+                # Save starting state for Manager reward shaping
+                starting_state_snapshot = state
+                starting_balls_snapshot = list(self.env.active_balls)
+
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
                     state, wide_goal, narrow_goal,
@@ -1429,12 +1436,41 @@ class HierarchicalTrainer:
                 worker_goal_reached_count += 1
             total_horizons += 1
             
-            # Manager receives horizon reward
-            manager_rewards.append(horizon_env_reward)
+
+            # Shaping
+
+            if self.manager_reward_shaping:
+                # AFTER - Add progress-based shaping:
+                # Calculate how much closer we got to nearest ball during this horizon
+                if len(self.env.active_balls) > 0:
+                    balls_before_start = starting_balls_snapshot  # Save at horizon start
+                    balls_after_end = list(self.env.active_balls)
+                    
+                    # Distance to nearest ball at horizon start vs end
+                    start_pos_horizon = starting_state_snapshot
+                    end_pos_horizon = state
+                    
+                    dist_before = min(manhattan_distance(start_pos_horizon, ball) 
+                                    for ball in balls_before_start) if balls_before_start else 0
+                    dist_after = min(manhattan_distance(end_pos_horizon, ball) 
+                                    for ball in balls_after_end) if balls_after_end else 0
+                    
+                    progress_reward = (dist_before - dist_after) * 0.1  # Reward for getting closer
+                    manager_reward = horizon_env_reward + progress_reward
+                else:
+                    manager_reward = horizon_env_reward
+            else:
+                manager_reward = horizon_env_reward
+
+            # Manager collects reward
+            manager_rewards.append(manager_reward)
             horizon_counter += 1
 
             # ADD THIS - save for diagnostics before resetting
-            all_manager_rewards_this_episode.append(horizon_env_reward)
+            all_manager_rewards_this_episode.append(manager_reward)
+                
+
+
             # Add after this line:
             if diag3:
                 if horizon_counter % 10 == 0:  # Print every 10 horizons

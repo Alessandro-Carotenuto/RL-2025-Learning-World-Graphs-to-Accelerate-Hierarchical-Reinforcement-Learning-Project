@@ -853,8 +853,8 @@ externalconfig = {
         'max_steps_per_episode': 2500,
         'manager_horizon': 20,
         'neighborhood_size': 5,
-        'manager_lr': 1e-3,
-        'worker_lr': 1e-3,
+        'manager_lr': 1e-5,
+        'worker_lr': 1e-5,
         'vae_mu0': 9.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
@@ -944,7 +944,8 @@ def train_full_phase1_phase2(config=externalconfig):
     manager, worker, env, 
     horizon=config['manager_horizon'],
     diagnostic_interval=config['diagnostic_interval'],  # NEW
-    diagnostic_checkstart=config['diagnostic_checkstart']  # NEW
+    diagnostic_checkstart=config['diagnostic_checkstart'],
+    managershaping=True
     )
     
     print("\nPHASE 2: Hierarchical Training")
