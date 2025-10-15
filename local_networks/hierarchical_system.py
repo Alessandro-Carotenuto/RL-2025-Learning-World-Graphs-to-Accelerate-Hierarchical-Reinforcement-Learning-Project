@@ -975,17 +975,13 @@ class HierarchicalTrainer:
             manager_narrow_goals_list.append(narrow_goal)
             manager_values_list.append(manager_value.item())
             
-            # Detach Manager's hidden state
-            if self.manager.hidden_state is not None:
-                self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
-            
             # ACCUMULATE Manager experience
             manager_states.append(state)
             manager_wide_goals.append(wide_goal)
             manager_narrow_goals.append(narrow_goal)
-            manager_log_probs.append(manager_log_prob.detach())  # ← Add .detach()
-            manager_values.append(manager_value.detach())        # ← Add .detach()
-            manager_entropies_for_update.append(entropy.detach())  # ← Add .detach()
+            manager_log_probs.append(manager_log_prob)  # ← REMOVE .detach()
+            manager_values.append(manager_value)        # ← REMOVE .detach()
+            manager_entropies_for_update.append(entropy.detach())  # Keep this
             
             # Worker executes for horizon steps
             worker_states = []
@@ -1140,6 +1136,10 @@ class HierarchicalTrainer:
                 )
                 manager_updates += 1
                 
+                # ADD THIS: Detach AFTER update
+                if self.manager.hidden_state is not None:
+                    self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
+
                 # Reset Manager experience
                 manager_states = []
                 manager_wide_goals = []

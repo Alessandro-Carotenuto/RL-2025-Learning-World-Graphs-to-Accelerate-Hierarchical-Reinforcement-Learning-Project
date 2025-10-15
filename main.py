@@ -48,7 +48,6 @@ from local_networks.vaesystem import StateEncoder, ActionEncoder, VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance,sample_goal_position
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
-from local_networks.hierarchical_system import hierarchical_system_tests, test_phase2_with_real_environment
 from utils.optimal_reward_computer import compute_optimal_reward_for_episode, compute_optimal_reward_bruteforce_small
 
 #---------------------------------------------------------------------------------------
@@ -195,7 +194,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
             
             if fast_training:
-                threshold_reconstruction_loss=0.05
+                #threshold_reconstruction_loss=0.05
+                threshold_reconstruction_loss=0.01
             else:
                 threshold_reconstruction_loss=0.005
 
@@ -853,8 +853,8 @@ externalconfig = {
         'max_steps_per_episode': 2500,
         'manager_horizon': 2500//30,
         'neighborhood_size': math.ceil(24/4),
-        'manager_lr': 1e-6,
-        'worker_lr': 1e-2,
+        'manager_lr': 1e-4,
+        'worker_lr': 1e-4,
         'vae_mu0': 9.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
