@@ -77,15 +77,17 @@ class GraphManager:
 
 #----------------------------------------------------------------------------
 
+
 class GraphVisualizer:
     """
-    Visualizes GraphManager objects with nodes positioned by coordinates.
+    Visualizes GraphManager objects, accurately rendering the stored coordinate
+    paths for each edge.
     """
     
-    def __init__(self, graph_manager, figsize=(12, 10)):
+    def __init__(self, graph_manager: 'GraphManager', figsize=(12, 10)):
         """
         Args:
-            graph_manager: GraphManager instance
+            graph_manager: GraphManager instance with updated edge structure
             figsize: Figure size tuple
         """
         self.graph = graph_manager
@@ -97,143 +99,142 @@ class GraphVisualizer:
                   node_size=300,
                   node_color='lightblue',
                   edge_color='gray',
-                  edge_width=1,
+                  edge_width=1.5, # Increased width for better visibility
                   highlight_nodes=None,
                   highlight_color='red',
                   title="World Graph Visualization"):
         """
-        Create graph visualization.
-        
-        Args:
-            show_weights: Show edge weights
-            show_labels: Show node coordinate labels
-            node_size: Size of nodes
-            node_color: Color of regular nodes
-            edge_color: Color of edges
-            edge_width: Width of edge lines
-            highlight_nodes: List of nodes to highlight
-            highlight_color: Color for highlighted nodes
-            title: Plot title
+        Create graph visualization, drawing the actual paths for edges.
         """
         fig, ax = plt.subplots(figsize=self.figsize)
         
-        # Extract node positions
         nodes = list(self.graph.nodes)
         if not nodes:
             print("No nodes to visualize")
             return fig, ax
         
-        # Use actual coordinates as positions
         pos = {node: node for node in nodes}
         
-        # Draw edges
-        for (start, end), weight in self.graph.edges.items():
-            if start in pos and end in pos:
+        # --- MODIFIED SECTION: Draw Edges Using Stored Paths ---
+        for (start, end), edge_data in self.graph.edges.items():
+            path = edge_data.get('path')
+            if not path:
+                # Fallback to straight line if no path is stored
                 x_coords = [pos[start][0], pos[end][0]]
                 y_coords = [pos[start][1], pos[end][1]]
-                
-                ax.plot(x_coords, y_coords, 
-                       color=edge_color, 
-                       linewidth=edge_width, 
-                       alpha=0.6,
-                       zorder=1)
-                
-                # Add weight labels
-                if show_weights:
-                    mid_x = (x_coords[0] + x_coords[1]) / 2
-                    mid_y = (y_coords[0] + y_coords[1]) / 2
-                    ax.text(mid_x, mid_y, str(weight), 
-                           fontsize=8, 
-                           ha='center', 
-                           va='center',
-                           bbox=dict(boxstyle='round,pad=0.2', 
-                                   facecolor='white', 
-                                   alpha=0.8),
-                           zorder=3)
+            else:
+                # Use the stored path coordinates
+                x_coords = [p[0] for p in path]
+                y_coords = [p[1] for p in path]
+            
+            # Draw the actual path line
+            ax.plot(x_coords, y_coords, 
+                    color=edge_color, 
+                    linewidth=edge_width, 
+                    alpha=0.7,
+                    zorder=1)
+            
+            # --- MODIFIED SECTION: Place Weight Labels on Path Midpoint ---
+            if show_weights and path:
+                weight = edge_data['weight']
+                # Place label at the midpoint of the path
+                mid_point = path[len(path) // 2]
+                ax.text(mid_point[0], mid_point[1], str(weight), 
+                        fontsize=8, 
+                        ha='center', 
+                        va='center',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8),
+                        zorder=3)
         
-        # Draw nodes
+        # --- UNCHANGED SECTION: Draw Nodes and Labels ---
         for node in nodes:
             x, y = pos[node]
-            
-            # Choose color
             color = highlight_color if (highlight_nodes and node in highlight_nodes) else node_color
-            
-            # Draw node
-            ax.scatter(x, y, 
-                      s=node_size, 
-                      c=color, 
-                      edgecolors='black',
-                      linewidth=1,
-                      zorder=2)
-            
-            # Add labels
+            ax.scatter(x, y, s=node_size, c=color, edgecolors='black', linewidth=1, zorder=2)
             if show_labels:
-                ax.annotate(f'{node}', 
-                           (x, y), 
-                           xytext=(5, 5), 
-                           textcoords='offset points',
-                           fontsize=9,
-                           ha='left',
-                           zorder=4)
+                ax.annotate(f'{node}', (x, y), xytext=(5, 5), textcoords='offset points',
+                            fontsize=9, ha='left', zorder=4)
         
-        # Formatting
+        # Formatting (unchanged)
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.set_xlabel('X Coordinate', fontsize=12)
         ax.set_ylabel('Y Coordinate', fontsize=12)
         ax.grid(True, alpha=0.3)
-        ax.set_aspect('equal')
+        ax.invert_yaxis() # Often useful for grid worlds where (0,0) is top-left
         
-        # Set reasonable limits
         if nodes:
             x_coords = [node[0] for node in nodes]
             y_coords = [node[1] for node in nodes]
-            
             x_min, x_max = min(x_coords), max(x_coords)
             y_min, y_max = min(y_coords), max(y_coords)
-            
-            # Add padding
             x_pad = (x_max - x_min) * 0.1 or 1
             y_pad = (y_max - y_min) * 0.1 or 1
-            
             ax.set_xlim(x_min - x_pad, x_max + x_pad)
-            ax.set_ylim(y_min - y_pad, y_max + y_pad)
+            ax.set_ylim(y_max + y_pad, y_min - y_pad) # Inverted Y
         
         plt.tight_layout()
         return fig, ax
     
-    def show_path(self, path, path_color='red', path_width=3):
+    def show_path(self, pivotal_path: List[Tuple], path_color='red', path_width=3):
         """
-        Highlight a specific path through the graph.
+        Highlight a specific path of pivotal states by drawing their detailed sub-paths.
         
         Args:
-            path: List of nodes representing path
-            path_color: Color for path edges
-            path_width: Width of path edges
+            pivotal_path: List of pivotal state nodes representing the high-level path
+            path_color: Color for the highlighted path
+            path_width: Width of the highlighted path
         """
-        if len(path) < 2:
+        if not pivotal_path or len(pivotal_path) < 2:
+            print("Path is too short to visualize.")
             return
+
+        # Start with the base visualization, highlighting the pivotal nodes
+        fig, ax = self.visualize(highlight_nodes=pivotal_path, highlight_color='orange')
         
-        fig, ax = self.visualize(highlight_nodes=path)
-        
-        # Draw path edges
-        for i in range(len(path) - 1):
-            start, end = path[i], path[i + 1]
+        # --- MODIFIED SECTION: Draw the detailed path for each segment ---
+        for i in range(len(pivotal_path) - 1):
+            start_node, end_node = pivotal_path[i], pivotal_path[i + 1]
             
-            x_coords = [start[0], end[0]]
-            y_coords = [start[1], end[1]]
+            # Retrieve the detailed coordinate path for this edge from the graph
+            edge_path = self.graph.get_edge_path(start_node, end_node)
             
-            ax.plot(x_coords, y_coords,
-                   color=path_color,
-                   linewidth=path_width,
-                   alpha=0.8,
-                   zorder=5)
+            if edge_path:
+                x_coords = [p[0] for p in edge_path]
+                y_coords = [p[1] for p in edge_path]
+                
+                ax.plot(x_coords, y_coords,
+                       color=path_color,
+                       linewidth=path_width,
+                       alpha=0.8,
+                       zorder=5,
+                       label='Shortest Path' if i == 0 else "") # Label only once
         
-        ax.set_title(f"Path: {path[0]} → {path[-1]}", 
+        ax.set_title(f"Shortest Path: {pivotal_path[0]} → {pivotal_path[-1]}", 
                     fontsize=14, fontweight='bold')
+        ax.legend()
         
         return fig, ax
     
     def show_statistics(self):
+        """Display graph statistics."""
+        nodes = list(self.graph.nodes)
+        edges = self.graph.edges
+        
+        print(f"Graph Statistics:")
+        print(f"  Nodes: {len(nodes)}")
+        print(f"  Edges: {len(edges)}")
+        
+        if edges:
+            # --- MODIFIED SECTION: Correctly extract weights ---
+            weights = [data['weight'] for data in edges.values()]
+            print(f"  Edge weights: min={min(weights)}, max={max(weights)}, avg={np.mean(weights):.1f}")
+        
+        connectivity = {node: len(self.graph.get_neighbors(node)) for node in nodes}
+        
+        if connectivity:
+            print(f"  Node connectivity: min={min(connectivity.values())}, max={max(connectivity.values())}")
+            sorted_nodes = sorted(connectivity.items(), key=lambda x: x[1], reverse=True)
+            print(f"  Most connected nodes: {sorted_nodes[:5]}")
         """Display graph statistics."""
         nodes = list(self.graph.nodes)
         edges = self.graph.edges

@@ -550,23 +550,59 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     plt.close()
 
 def save_separate_graph_visualization(world_graph, pivotal_states, config):
-    """Save standalone graph visualization using GraphVisualizer."""
-    if len(pivotal_states) > 0 and world_graph is not None:
-        from utils.graph_manager import GraphVisualizer
+    """
+    Save a standalone visualization of the world graph, rendering the
+    actual feasible paths for each edge.
+    
+    Args:
+        world_graph (GraphManager): The fully constructed world graph instance.
+        pivotal_states (list): The list of discovered pivotal states.
+        config (dict): Configuration dictionary to get parameters like vae_mu0.
+    """
+    # --- Step 1: Basic validation ---
+    if not pivotal_states:
+        print("No pivotal states to visualize. Skipping graph saving.")
+        return
         
-        viz = GraphVisualizer(world_graph, figsize=(10, 10))
+    if world_graph is None or not world_graph.nodes:
+        print("World graph is empty or not provided. Skipping graph saving.")
+        return
+
+    print("Generating and saving world graph visualization...")
+    
+    try:
+        # --- Step 2: Instantiate the UPDATED visualizer ---
+        # This visualizer now knows how to read the {'weight': w, 'path': p}
+        # structure from the world_graph.edges.
+        viz = GraphVisualizer(world_graph, figsize=(12, 12)) # Slightly larger for clarity
+        
+        # --- Step 3: Generate the visualization ---
+        # The .visualize() method will automatically plot the detailed coordinate
+        # paths instead of simple straight lines. No change is needed in this call.
         fig, ax = viz.visualize(
             show_weights=True,
             show_labels=True,
-            title=f'World Graph (mu0={config["vae_mu0"]})'
+            node_size=250,
+            edge_width=1.5,
+            title=f'World Graph (mu0={config["vae_mu0"]}) - Feasible Paths'
         )
-        plt.savefig(f'world_graph_mu{config["vae_mu0"]:.1f}.png', dpi=150)
-        plt.close()
-        print(f"Saved graph to world_graph_mu{config['vae_mu0']:.1f}.png")
+        
+        # --- Step 4: Save the figure ---
+        filename = f'world_graph_mu{config["vae_mu0"]:.1f}.png'
+        plt.savefig(filename, dpi=200, bbox_inches='tight') # Higher DPI for better quality
+        plt.close(fig)  # Important: close the figure to free up memory
+        
+        print(f"Successfully saved graph visualization to '{filename}'")
+
+    except Exception as e:
+        print(f"An error occurred while saving the graph visualization: {e}")
+        # Ensure the plot is closed even if an error occurs
+        if 'fig' in locals():
+            plt.close(fig)
 
 def test_phase1_with_diagnostics(config=None):
     """
-    Test Phase 1 using alternating_training_loop with diagnostic tracking.
+    Test Phase 1 using alternating_training_loop with diagnostic tracking. 
     """
     default_config = {
         'maze_size': EnvSizes.SMALL,
