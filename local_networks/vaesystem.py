@@ -14,19 +14,14 @@ diagvae=False
 
 class PriorNetwork(nn.Module):
     """
-    Prior network that learns state-conditioned Beta distribution parameters.
-    Paper: pψ(zt|st) = Beta(αt, βt)
+    STATE PRIOR NETWORK - LEARNS BETA DISTRIBUTION FOR STATE IMPORTANCE
     """
     
     def __init__(self, state_dim, hidden_dim=64):
-        """
-        Args:
-            state_dim (int): Dimension of state representation
-            hidden_dim (int): Hidden dimension for BiLSTM
-        """
+        # INITIALIZE PRIOR NETWORK
         super().__init__()
         
-        # Bidirectional LSTM as specified in paper
+    # BILSTM FOR SEQUENCE PROCESSING
         self.bilstm = nn.LSTM(
             input_size=state_dim,
             hidden_size=hidden_dim,
@@ -35,9 +30,7 @@ class PriorNetwork(nn.Module):
             bidirectional=True
         )
         
-        # Output layers for Beta parameters (alpha, beta)
-        # BiLSTM outputs 2*hidden_dim due to bidirectional
-        # Output layers for Beta parameters
+    # BETA PARAMETER OUTPUT NETWORKS
         self.alpha_head = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -56,7 +49,7 @@ class PriorNetwork(nn.Module):
         self._initialize_to_uniform()
     
     def _initialize_to_uniform(self):
-        """Initialize to slightly favor α > β to break symmetry."""
+        # INITIALIZE TO SLIGHTLY FAVOR ALPHA OVER BETA
         # Alpha head: bias toward α ≈ 2-3
         nn.init.normal_(self.alpha_head[0].weight, 0, 0.01)
         nn.init.constant_(self.alpha_head[0].bias, 1.5)  # Softplus(1.5) ≈ 2.1
@@ -66,16 +59,7 @@ class PriorNetwork(nn.Module):
         nn.init.constant_(self.beta_head[0].bias, 0.7)  # Softplus(0.7) ≈ 1.2
     
     def forward(self, states):
-        """
-        Forward pass to get Beta parameters.
-        
-        Args:
-            states (torch.Tensor): State sequence [batch_size, seq_len, state_dim]
-            
-        Returns:
-            tuple: (alpha, beta) parameters for Beta distribution
-                   Each has shape [batch_size, seq_len]
-        """
+        # FORWARD PASS TO GET BETA PARAMETERS
         # BiLSTM forward pass
         lstm_out, _ = self.bilstm(states)  # [batch_size, seq_len, 2*hidden_dim]
         
@@ -88,20 +72,14 @@ class PriorNetwork(nn.Module):
 
 class InferenceNetwork(nn.Module):
     """
-    Inference network (encoder) that outputs HardKuma parameters from state-action pairs.
-    Paper: qφ(zt|at,st) = HardKuma(α̃t, 1)
+    INFERENCE NETWORK (ENCODER) OUTPUTS HARDKUMA PARAMETERS FROM STATE-ACTION PAIRS
     """
     
     def __init__(self, state_dim, action_dim, hidden_dim=128):
-        """
-        Args:
-            state_dim (int): Dimension of state representation
-            action_dim (int): Dimension of action representation (usually 1 for discrete)
-            hidden_dim (int): Hidden dimension for BiLSTM
-        """
+        # INITIALIZE INFERENCE NETWORK
         super().__init__()
         
-        # Bidirectional LSTM processing state-action pairs
+    # BILSTM FOR STATE-ACTION PAIRS
         self.bilstm = nn.LSTM(
             input_size=state_dim + action_dim,
             hidden_size=hidden_dim,
@@ -110,7 +88,7 @@ class InferenceNetwork(nn.Module):
             bidirectional=True
         )
         
-        # Output layer for HardKuma alpha parameter
+    # OUTPUT LAYER FOR HARDKUMA ALPHA PARAMETER
         self.alpha_head = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -119,16 +97,7 @@ class InferenceNetwork(nn.Module):
         )
     
     def forward(self, states, actions):
-        """
-        Forward pass to get HardKuma parameters.
-        
-        Args:
-            states (torch.Tensor): State sequence [batch_size, seq_len, state_dim]
-            actions (torch.Tensor): Action sequence [batch_size, seq_len, action_dim]
-            
-        Returns:
-            torch.Tensor: Alpha parameters for HardKuma [batch_size, seq_len]
-        """
+        # FORWARD PASS TO GET HARDKUMA PARAMETERS
         # Concatenate states and actions
         state_action = torch.cat([states, actions], dim=-1)  # [batch_size, seq_len, state_dim + action_dim]
         
@@ -143,20 +112,14 @@ class InferenceNetwork(nn.Module):
 
 class GenerationNetwork(nn.Module):
     """
-    Generation network (decoder) that reconstructs actions from masked states.
-    Paper: Reconstructs {at}^(T-1)_0 using only states where zt = 1
+    GENERATION NETWORK (DECODER) RECONSTRUCTS ACTIONS FROM MASKED STATES
     """
     
     def __init__(self, state_dim, action_vocab_size, hidden_dim=64):
-        """
-        Args:
-            state_dim (int): Dimension of state representation
-            action_vocab_size (int): Number of possible actions (e.g., 7 for MiniGrid)
-            hidden_dim (int): Hidden dimension for BiLSTM
-        """
+        # INITIALIZE GENERATION NETWORK
         super().__init__()
         
-        # Bidirectional LSTM for processing masked states
+    # BILSTM FOR MASKED STATES
         self.bilstm = nn.LSTM(
             input_size=state_dim,
             hidden_size=hidden_dim,
@@ -165,7 +128,7 @@ class GenerationNetwork(nn.Module):
             bidirectional=True
         )
         
-        # Output layer for action predictions
+    # OUTPUT LAYER FOR ACTION PREDICTIONS
         self.action_head = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -174,15 +137,7 @@ class GenerationNetwork(nn.Module):
         )
     
     def forward(self, masked_states):
-        """
-        Forward pass to reconstruct actions.
-        
-        Args:
-            masked_states (torch.Tensor): States where zt=1 [batch_size, masked_seq_len, state_dim]
-            
-        Returns:
-            torch.Tensor: Action logits [batch_size, masked_seq_len, action_vocab_size]
-        """
+        # FORWARD PASS TO RECONSTRUCT ACTIONS
         # BiLSTM forward pass
         lstm_out, _ = self.bilstm(masked_states)  # [batch_size, masked_seq_len, 2*hidden_dim]
         
@@ -194,31 +149,25 @@ class GenerationNetwork(nn.Module):
 
 class StateEncoder(nn.Module):
     """
-    Helper class to encode different state representations into fixed-dimension vectors.
-    Handles various MiniGrid state formats.
+    ENCODE STATES INTO FIXED-DIMENSION VECTORS
     """
     
     def __init__(self, state_format="coordinates", grid_size=24, output_dim=32):
-        """
-        Args:
-            state_format (str): "coordinates", "grid_obs", or "flattened"
-            grid_size (int): Size of the grid (for coordinate normalization)
-            output_dim (int): Output dimension for encoded states
-        """
+        # INITIALIZE STATE ENCODER
         super().__init__()
         
         self.state_format = state_format
         self.grid_size = grid_size
         
         if state_format == "coordinates":
-            # Simple coordinate encoding (x, y) -> embedding
+            # COORDINATE ENCODING
             self.encoder = nn.Sequential(
                 nn.Linear(2, 16),
                 nn.ReLU(),
                 nn.Linear(16, output_dim)
             )
         elif state_format == "grid_obs":
-            # Grid observation encoding (assumes flattened grid)
+            # GRID OBSERVATION ENCODING
             self.encoder = nn.Sequential(
                 nn.Linear(grid_size * grid_size, 128),
                 nn.ReLU(),
@@ -227,7 +176,7 @@ class StateEncoder(nn.Module):
                 nn.Linear(64, output_dim)
             )
         else:  # flattened or custom
-            # Generic linear encoder
+            # GENERIC LINEAR ENCODER
             self.encoder = nn.Sequential(
                 nn.Linear(64, 32),  # Adjust input size as needed
                 nn.ReLU(),
@@ -235,15 +184,7 @@ class StateEncoder(nn.Module):
             )
     
     def forward(self, states):
-        """
-        Encode states to fixed dimension.
-        
-        Args:
-            states: Raw states in various formats
-            
-        Returns:
-            torch.Tensor: Encoded states [batch_size, seq_len, output_dim]
-        """
+        # ENCODE STATES TO FIXED DIMENSION
         if self.state_format == "coordinates":
             # Normalize coordinates to [0, 1]
             normalized = states.float() / self.grid_size
@@ -254,39 +195,24 @@ class StateEncoder(nn.Module):
 
 class ActionEncoder(nn.Module):
     """
-    Helper class to encode discrete actions into continuous representations.
+    ENCODE DISCRETE ACTIONS INTO CONTINUOUS REPRESENTATIONS
     """
     
     def __init__(self, num_actions=7, embedding_dim=8):
-        """
-        Args:
-            num_actions (int): Number of possible actions
-            embedding_dim (int): Dimension of action embeddings
-        """
+        # INITIALIZE ACTION ENCODER
         super().__init__()
         
-        # Embedding layer for discrete actions
+    # EMBEDDING LAYER FOR DISCRETE ACTIONS
         self.embedding = nn.Embedding(num_actions, embedding_dim)
     
     def forward(self, actions):
-        """
-        Encode discrete actions.
-        
-        Args:
-            actions (torch.Tensor): Discrete action indices [batch_size, seq_len]
-            
-        Returns:
-            torch.Tensor: Action embeddings [batch_size, seq_len, embedding_dim]
-        """
+        # ENCODE DISCRETE ACTIONS
         return self.embedding(actions.long())
 
 
 class VAESystem(nn.Module):
     """
-    Main VAE system that orchestrates pivotal state discovery.
-    
-    Combines all networks, implements ELBO loss with regularization,
-    manages training loop, and extracts final pivotal states.
+    MAIN VAE SYSTEM FOR PIVOTAL STATE DISCOVERY
     """
     
     def __init__(
@@ -298,17 +224,7 @@ class VAESystem(nn.Module):
         grid_size: int = 24,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     ):
-        """
-        Initialize the VAE system.
-        
-        Args:
-            state_dim: Dimension of encoded states
-            action_vocab_size: Number of possible actions (MiniGrid = 7)
-            hidden_dim: Hidden dimension for BiLSTM networks
-            mu0: Target sparsity (expected number of kept states)
-            grid_size: Size of the grid environment
-            device: Computing device
-        """
+        # INITIALIZE VAE SYSTEM
         super().__init__()  # Initialize nn.Module
         
         self.current_kl_weight = 1.0

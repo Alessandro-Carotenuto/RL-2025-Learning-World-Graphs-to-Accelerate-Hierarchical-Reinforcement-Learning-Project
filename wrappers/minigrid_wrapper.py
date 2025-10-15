@@ -20,7 +20,7 @@ from collections import deque
 import numpy as np
 
 #----------------------------------------------------------------------------#
-#                            ENV MODES                                       #
+#                          ENVIRONMENT MODES                                #
 #----------------------------------------------------------------------------#
 
 class EnvModes(Enum):
@@ -118,18 +118,7 @@ class MinigridWrapper(MiniGridEnv):
 
     def BFS(self, startpos, endpos, playerpos):
         """
-        Uses Breadth-First Search (BFS) to check if there's a path 
-        between two positions in the minigrid environment.
-
-        Args:
-            startpos (tuple): Starting position as (x, y)
-            endpos (tuple): Target position as (x, y)
-
-        Returns:
-            tuple: (solvability: bool, path: list)
-                   - solvability: True if path exists, False otherwise  
-                   - path: List of (x, y) coordinates from start to end, 
-                          empty list if no path found
+# BFS PATHFINDING: FINDS PATH BETWEEN TWO POINTS AND RETURNS (SUCCESS, PATH)
         """
 
         # Validate input positions
@@ -309,7 +298,7 @@ class MinigridWrapper(MiniGridEnv):
             return True
 
         
-            # Ball is traversable (agent can walk on it to collect it)
+            # BALL OBJECTS ARE TRAVERSABLE AND COLLECTIBLE
         if isinstance(cell_obj, Ball):
             return True
 
@@ -477,10 +466,7 @@ class MinigridWrapper(MiniGridEnv):
 
     # RESET PLACEABLE GRID
     def placeablegrid_reset(self):
-        # Create a matrix (numpy) full of "1"
-        #   basically when i wanna mark a place on the grid in which you cannot
-        #   place a wall or something, the corrispective point in the grid will
-        #   be marked as "zero"
+        # INITIALIZE PLACEABLE GRID: 1=FREE SPACE, 0=RESERVED SPACE
 
         self.placeable_grid = np.ones((self.size, self.size), dtype=bool)
 

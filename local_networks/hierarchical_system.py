@@ -15,8 +15,7 @@ diag3=False
 
 class HierarchicalManager(nn.Module):
     """
-    Phase 2: Hierarchical Manager implementing Wide-then-Narrow goal selection.
-    Paper: "Manager uses two-step 'Wide-then-Narrow' goal descriptions"
+    HIERARCHICAL MANAGER: SELECTS GOALS USING WIDE-THEN-NARROW STRATEGY
     """
     
     def __init__(self, 
@@ -27,14 +26,7 @@ class HierarchicalManager(nn.Module):
                  diagnostic_interval: int = 30,  # NEW
                  diagnostic_checkstart: bool = True,  # NEW
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-        """
-        Args:
-            pivotal_states: List of discovered pivotal state coordinates
-            neighborhood_size: N×N local area around wide goal (paper uses N×N)
-            lr: Learning rate
-            horizon: Manager operates at c-step horizon
-            device: Computing device
-        """
+        # INITIALIZE MANAGER NETWORKS AND PARAMETERS
         super().__init__()
         
         self.device = device
@@ -42,7 +34,7 @@ class HierarchicalManager(nn.Module):
         self.neighborhood_size = neighborhood_size
         self.horizon = horizon
         
-        # A2C-LSTM architecture (from paper: "Manager and Worker are both A2C-LSTMs")
+    # A2C-LSTM ARCHITECTURE
         self.lstm = nn.LSTM(
             input_size=4,  # [state_x, state_y, prev_gw_x, prev_gw_y] 
             hidden_size=64,
@@ -50,41 +42,38 @@ class HierarchicalManager(nn.Module):
             batch_first=True
         ).to(device)
         
-        # Wide policy: π^ω(gw,t|st) - categorical over pivotal states
+    # WIDE POLICY OUTPUT LAYER
         self.wide_head = nn.Linear(64, len(pivotal_states)).to(device)
         
-        # Narrow policy: π^n(gn,t|st, gw,t, sw,t) - categorical over neighborhood
+    # NARROW POLICY OUTPUT LAYER
         self.narrow_head = nn.Linear(64 + 2, neighborhood_size**2).to(device)  # +2 for gw coords
         
-        # Value function V(st)
+    # VALUE FUNCTION OUTPUT LAYER
         self.critic = nn.Linear(64, 1).to(device)
         
-        # Optimizer
+    # OPTIMIZER
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
         
-        # Manager state
+    # MANAGER STATE VARIABLES
         self.hidden_state = None
         self.prev_wide_goal = (0, 0)  # Previous wide goal for LSTM input
         
-        # Hyperparameters
+    # HYPERPARAMETERS
         self.gamma = 0.99
         self.entropy_coef = 1e-5
         self.value_coef = 0.05
 
-        # Diagnostic parameters
+    # DIAGNOSTIC PARAMETERS
         self.diagnostic_interval = diagnostic_interval
         self.diagnostic_checkstart = diagnostic_checkstart
     
     def reset_manager_state(self):
-        """Reset LSTM hidden state and previous goals."""
+        # RESET MANAGER STATE
         self.hidden_state = None
         self.prev_wide_goal = (0, 0)
     
     def get_neighborhood(self, wide_goal: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """
-        Get N×N neighborhood around wide goal.
-        Paper: "zooms attention to an N × N local area sw,t around gw"
-        """
+        # GET N×N NEIGHBORHOOD AROUND WIDE GOAL
         gw_x, gw_y = wide_goal
         neighborhood = []
         
@@ -98,87 +87,71 @@ class HierarchicalManager(nn.Module):
         return neighborhood
     
     def forward(self, state: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass: Wide goal selection only.
-        
-        Args:
-            state: Current agent position (x, y)
-            
-        Returns:
-            wide_logits: Logits over pivotal states [num_pivotal_states]
-            features: LSTM features for narrow policy [64]
-            value: State value estimate [1]
-        """
-        # Prepare LSTM input: [state_x, state_y, prev_gw_x, prev_gw_y]
+        # FORWARD PASS: WIDE GOAL SELECTION
+    # PREPARE LSTM INPUT
         lstm_input = torch.tensor([
             state[0], state[1], 
             self.prev_wide_goal[0], self.prev_wide_goal[1]
         ], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)  # [1, 1, 4]
         
-        # LSTM forward pass
+    # LSTM FORWARD PASS
         lstm_out, self.hidden_state = self.lstm(lstm_input, self.hidden_state)
         features = lstm_out.squeeze(0).squeeze(0)  # [64]
         
-        # Wide policy: π^ω(gw,t|st)
+    # WIDE POLICY OUTPUT
         wide_logits = self.wide_head(features)  # [num_pivotal_states]
         
-        # Value function
+    # VALUE FUNCTION OUTPUT
         value = self.critic(features)  # [1]
         
         return wide_logits, features, value
     
     def select_wide_goal(self, state: Tuple[int, int]) -> Tuple[int, torch.Tensor, torch.Tensor]:
-        """
-        Select wide goal from pivotal states.
-        Paper: π^ω(gw,t|st) outputs a "wide" subgoal gw ∈ V where V = Vp
-        """
+        # SELECT WIDE GOAL FROM PIVOTAL STATES
         wide_logits, features, value = self.forward(state)
         
-        # Sample from categorical distribution
+    # SAMPLE FROM CATEGORICAL DISTRIBUTION
         wide_probs = F.softmax(wide_logits, dim=0)
         wide_dist = torch.distributions.Categorical(wide_probs)
         wide_idx = wide_dist.sample()
         wide_log_prob = wide_dist.log_prob(wide_idx)
         
-        # Get actual pivotal state coordinates
+    # GET PIVOTAL STATE COORDINATES
         wide_goal = self.pivotal_states[wide_idx.item()]
         
-        # Update previous wide goal for next LSTM input
+    # UPDATE PREVIOUS WIDE GOAL
         self.prev_wide_goal = wide_goal
         
         return wide_idx.item(), wide_log_prob, value.squeeze()
     
     def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int]) -> Tuple[Tuple[int, int], torch.Tensor]:
-        """
-        Select narrow goal from neighborhood around wide goal.
-        Paper: π^n(gn,t|st, gw,t, sw,t) selects final "narrow" goal gn ∈ sw,t
-        """
-        # Get LSTM features (recompute to ensure consistency)
+        # SELECT NARROW GOAL FROM NEIGHBORHOOD
+    # GET LSTM FEATURES
         _, features, _ = self.forward(state)
         
-        # Concatenate features with wide goal coordinates
+    # CONCATENATE FEATURES WITH WIDE GOAL
         wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
         narrow_input = torch.cat([features, wide_goal_tensor])  # [64 + 2]
         
-        # Narrow policy: π^n(gn,t|st, gw,t, sw,t)
+    # NARROW POLICY OUTPUT
         narrow_logits = self.narrow_head(narrow_input)  # [neighborhood_size^2]
         
-        # Sample from categorical distribution
+    # SAMPLE FROM CATEGORICAL DISTRIBUTION
         narrow_probs = F.softmax(narrow_logits, dim=0)
         narrow_dist = torch.distributions.Categorical(narrow_probs)
         narrow_idx = narrow_dist.sample()
         narrow_log_prob = narrow_dist.log_prob(narrow_idx)
         
-        # Convert index to actual coordinates
+    # CONVERT INDEX TO COORDINATES
         neighborhood = self.get_neighborhood(wide_goal)
         narrow_goal = neighborhood[narrow_idx.item()]
         
         return narrow_goal, narrow_log_prob
     
     def get_manager_action(self, state: Tuple[int, int], step_count: int = 0):
-        """Complete Wide-then-Narrow goal selection with hidden state diagnostics."""
+        # COMPLETE GOAL SELECTION WITH DIAGNOSTICS
         
-        # Configurable diagnostic printing
+    # DIAGNOSTIC PRINTING
         if self.diagnostic_checkstart and step_count < 15:
             verbose = True
         elif step_count % self.diagnostic_interval == 0:
@@ -194,11 +167,11 @@ class HierarchicalManager(nn.Module):
                 h, c = self.hidden_state
                 print(f"  Hidden state norms: h={h.norm().item():.3f}, c={c.norm().item():.3f}")
         
-        # Step 1: Wide goal selection
+    # WIDE GOAL SELECTION
         wide_idx, wide_log_prob, value = self.select_wide_goal(state)
         wide_goal = self.pivotal_states[wide_idx]
         
-        # Get distribution for diagnostics
+    # DIAGNOSTIC DISTRIBUTION
         if verbose:
             with torch.no_grad():
                 wide_logits, _, _ = self.forward(state)
@@ -219,10 +192,10 @@ class HierarchicalManager(nn.Module):
                 max_entropy = torch.log(torch.tensor(float(len(self.pivotal_states))))
                 print(f"    Entropy: {entropy.item():.3f} / {max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
         
-        # Step 2: Narrow goal selection  
+    # NARROW GOAL SELECTION
         narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal)
         
-        # Combined log probability
+    # COMBINED LOG PROBABILITY
         combined_log_prob = wide_log_prob + narrow_log_prob
         
         if verbose:
@@ -232,7 +205,7 @@ class HierarchicalManager(nn.Module):
         
         return wide_goal, narrow_goal, combined_log_prob, value
         
-    # Transfer learning initialization (broken? just copying heads i guess)
+    # TRANSFER LEARNING INITIALIZATION (COMMENTED OUT)
     # def initialize_from_goal_policy(self, goal_policy):
     #     """
     #     Transfer learning: Initialize Manager with better scaling.
@@ -263,7 +236,7 @@ class HierarchicalManager(nn.Module):
         
     #     print(f"Manager initialized with standard scaling (gain=1.0)")
 
-    # Actual initialization from goal policy (LSTM copying)
+    # INITIALIZE FROM GOAL POLICY (LSTM COPYING)
     def initialize_from_goal_policy(self, goal_policy):
         with torch.no_grad():
             # Similar LSTM copying logic as Worker
@@ -1262,6 +1235,17 @@ class HierarchicalTrainer:
             print(f"  Manager updates: {manager_updates}")
             print(f"  Worker updates: {worker_updates}")
             print(f"{'#'*70}\n")
+
+            if record_this_episode:
+                episode_record['reward'] = episode_reward
+                
+                if episode_reward < 0.5 and recording_data['bad_episode'] is None:
+                    recording_data['bad_episode'] = episode_record
+                    print(f"📹 Recorded BAD episode: reward={episode_reward:.2f}")
+                
+                if episode_reward > 3.0 and recording_data['good_episode'] is None:
+                    recording_data['good_episode'] = episode_record
+                    print(f"📹 Recorded GOOD episode: reward={episode_reward:.2f}")
         
         return {
             'episode_reward': episode_reward,

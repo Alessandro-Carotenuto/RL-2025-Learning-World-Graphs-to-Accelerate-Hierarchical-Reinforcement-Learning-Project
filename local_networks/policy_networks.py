@@ -15,8 +15,7 @@ old_diag_phase_1 = False  # Toggle detailed diagnostics in phase 1
 
 class GoalConditionedPolicy(nn.Module):
     """
-    Phase 1: Goal-conditioned policy πg for world graph discovery.
-    A2C-based policy that learns to navigate between nearby states.
+    GOAL-CONDITIONED POLICY FOR WORLD GRAPH DISCOVERY
     """
     
     def __init__(self, lr: float = 5e-3, verbose: bool =False, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
@@ -25,114 +24,102 @@ class GoalConditionedPolicy(nn.Module):
         self.verbose = verbose
         self.device = device
         
-        # Neural network components
-        # self.net = nn.Sequential(
-        #     nn.Linear(4, 64),     # [state_x, state_y, goal_x, goal_y]
-        #     nn.ReLU(),
-        #     nn.Linear(64, 64),
-        #     nn.ReLU()
-        # ).to(device)
-        
-        # LSTM instead of Sequential
+        # NETWORK COMPONENTS
+        # PREVIOUS SEQUENTIAL ARCHITECTURE (COMMENTED OUT)
+        # LSTM USED INSTEAD OF SEQUENTIAL
         self.lstm = nn.LSTM(
-            input_size=4,  # [state_x, state_y, goal_x, goal_y]
+            input_size=4,
             hidden_size=64,
             num_layers=1,
             batch_first=True
         ).to(device)
 
-         # LSTM hidden state
+         # LSTM HIDDEN STATE
         self.hidden_state = None
 
+        self.actor = nn.Linear(64, 7).to(device)
+        self.critic = nn.Linear(64, 1).to(device)
 
-        self.actor = nn.Linear(64, 7).to(device)    # 7 MiniGrid actions
-        self.critic = nn.Linear(64, 1).to(device)   # Value function
-        
-        # INCREASED LEARNING RATE for better policy updates
-        self.optimizer = optim.Adam(self.parameters(), lr=lr)  # Now 5e-3 instead of 1e-3
-        
-        # Hyperparameters
-        self.gamma = 0.99           # Discount factor
-        self.entropy_coef = 0.05    # Entropy regularization
-        self.value_coef = 0.5       # Value loss coefficient
+        # OPTIMIZER
+        self.optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        # HYPERPARAMETERS
+        self.gamma = 0.99
+        self.entropy_coef = 0.05
+        self.value_coef = 0.5
         
     def train_goal_policy_episode(self, env, start_pos: Tuple[int, int], 
                         max_episode_length: int = 50,
                         vae_system=None, 
                         curiosity_weight: float = 1.0) -> Tuple[List, List, List, bool]:
         """
-        Train the goal-conditioned policy with enhanced reward structure and diagnostics.
+        TRAIN POLICY FOR ONE EPISODE (GOAL-CONDITIONED)
         """
-        # Sample goal position
-        self.hidden_state = None  # Reset LSTM hidden state at episode start
+        # SAMPLE GOAL AND RESET STATE
+        self.hidden_state = None
         goal_pos = sample_goal_position(env, start_pos, max_distance=20)
-        
-        # Initialize episode data
+
+        # INITIALIZE EPISODE BUFFERS
         states = []
         actions = []
         rewards = []
         values = []
         log_probs = []
-        
-        # Track visited states for curiosity computation
+
+        # TRACK VISITED STATES FOR CURIOSITY
         visited_states = [start_pos]
-        
-        # Place agent at start position and ensure environment is ready
+
+        # RESET ENVIRONMENT POSITION
         obs = env.reset()
         env.agent_pos = start_pos
         env.agent_dir = 0
         current_pos = start_pos
         goal_reached = False
-        
+
         if old_diag_phase_1:
             print(f"    Goal: {goal_pos}, Distance: {manhattan_distance(start_pos, goal_pos)}")
-        
-        # DIAGNOSTICS: Track policy behavior
+
+        # DIAGNOSTICS TRACKING
         total_goal_reward = 0
         distance_changes = []
-        
+
         episode_trajectory = []  # Store (state, action) pairs
-        # Run episode
+        # RUN EPISODE
         for step in range(max_episode_length):
             # Get action from policy
             action, log_prob, value = self.get_action(current_pos, goal_pos)
             episode_trajectory.append((current_pos, action))
-            # Store state-action data
+            # STORE STATE-ACTION
             states.append((current_pos, goal_pos))
             actions.append(action)
             values.append(value)
             log_probs.append(log_prob)
-            
-            # Take environment step
+
+            # STEP ENVIRONMENT
             obs, env_reward, terminated, truncated, info = env.step(action)
-            
+
             # Get new position
             if hasattr(env, 'agent_pos') and env.agent_pos is not None:
                 next_pos = tuple(env.agent_pos)
             else:
                 next_pos = current_pos
-            
-            # Update visited states for curiosity computation
+
+            # UPDATE VISITED STATES
             if next_pos != current_pos:
                 visited_states.append(next_pos)
-            
-            # Action name for debug
+
+            # ACTION NAME FOR DEBUG
             action_names = ['turn_left', 'turn_right', 'move_forward', 'pickup', 'drop', 'toggle', 'done']
             action_name = action_names[action] if action < len(action_names) else f'action_{action}'
-            
-            # ENHANCED REWARD STRUCTURE
+
+            # REWARD BREAKDOWN
             old_distance = manhattan_distance(current_pos, goal_pos)
             new_distance = manhattan_distance(next_pos, goal_pos)
-            
-            # MAJOR INCREASE: Goal reward now 10x larger
-            goal_reward = 10.0 if next_pos == goal_pos else 0.0  # Was 1.0
-            
-            # Progress reward: reward getting closer to goal
+            goal_reward = 10.0 if next_pos == goal_pos else 0.0
             progress_reward = 0.2 if new_distance < old_distance else 0.0
-            
             step_penalty = -0.01
-            
-            # Curiosity reward computation (reduced since goal reward increased)
+
+            # CURIOSITY REWARD COMPUTATION
             curiosity_reward = 0.0
             if vae_system is not None and len(visited_states) > 1:
                 # CORRECT - uses episode_trajectory (state-action pairs) + new method
@@ -140,17 +127,17 @@ class GoalConditionedPolicy(nn.Module):
                 recent_trajectory = episode_trajectory[-window_size:]
                 base_curiosity = vae_system.compute_curiosity_reward_from_trajectory(recent_trajectory)
 
-                curiosity_reward = base_curiosity * curiosity_weight # Scale by weight
-                curiosity_reward = min(1.0, curiosity_reward)  # Cap curiosity reward to prevent spikes
-            
+                curiosity_reward = base_curiosity * curiosity_weight
+                curiosity_reward = min(1.0, curiosity_reward)
+
             total_reward = goal_reward + progress_reward + step_penalty + curiosity_reward
             rewards.append(total_reward)
-            
-            # DIAGNOSTICS: Track metrics
+
+            # DIAGNOSTICS UPDATE
             total_goal_reward += goal_reward
             distance_changes.append(new_distance - old_distance)
-            
-            # Enhanced debug output with reward breakdown
+
+            # DEBUG OUTPUT (CONDITIONAL)
             if next_pos != current_pos or step % 10 == 0:
                 reward_breakdown = f"(goal:{goal_reward:.1f}, prog:{progress_reward:.2f}, step:{step_penalty:.2f}"
                 if curiosity_reward > 0.01:
@@ -159,27 +146,27 @@ class GoalConditionedPolicy(nn.Module):
                 if self.verbose:    
                     if old_diag_phase_1:
                         print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
-            
-            # Check if goal reached or episode ended
+
+            # TERMINATION CHECKS
             if goal_reward > 0:
                 goal_reached = True
                 if old_diag_phase_1:
                     print(f"    GOAL REACHED in {step+1} steps! Total goal reward: {total_goal_reward}")
                 break
-                
+
             if terminated or truncated:
                 break
-                
+
             current_pos = next_pos
-        
-        # DIAGNOSTICS: Print episode summary
+
+        # EPISODE SUMMARY DIAGNOSTICS
         avg_distance_change = sum(distance_changes) / len(distance_changes) if distance_changes else 0
         if old_diag_phase_1:
             print(f"    Episode summary: {len(actions)} steps, goal_reward: {total_goal_reward:.1f}, avg_dist_change: {avg_distance_change:.2f}")
-        
-        # Update policy with collected data
+
+        # UPDATE POLICY
         policy_losses = self.update_policy_with_diagnostics(states, actions, rewards, values, log_probs)
-        
+
         return states, actions, rewards, goal_reached
         
     def forward(self, state: torch.Tensor, goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -246,72 +233,63 @@ class GoalConditionedPolicy(nn.Module):
     
     def update_policy(self, states: List, actions: List[int], rewards: List[float], 
                          values: List[torch.Tensor], log_probs: List[torch.Tensor]):
-            """
-            Update policy parameters using A2C algorithm.
-            
-            Args:
-                states: List of (state, goal) tuples
-                actions: List of action indices  
-                rewards: List of rewards
-                values: List of value estimates
-                log_probs: List of action log probabilities
-            """
-            if len(rewards) == 0:
-                return
-                
-            # Convert to tensors
-            returns = []
-            discounted_reward = 0
-            
-            # Compute discounted returns (backwards)
-            for reward in reversed(rewards):
-                discounted_reward = reward + self.gamma * discounted_reward
-                returns.insert(0, discounted_reward)
-                
-            returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-            values = torch.stack(values).squeeze()  # Ensure consistent shape
-            log_probs = torch.stack(log_probs)
-            actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-            
-            # Ensure all tensors have same shape
-            if values.dim() == 0:  # Single value case
-                values = values.unsqueeze(0)
-            if returns.dim() == 0:
-                returns = returns.unsqueeze(0)
-            
-            # Compute advantages
-            advantages = returns - values
-            
-            # Normalize advantages (handle single-step episodes)
-            if len(advantages) > 1:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            else:
-                advantages = advantages  # Don't normalize single values
-            
-            # Compute losses
-            policy_loss = -(log_probs * advantages.detach()).mean()
-            value_loss = F.mse_loss(values, returns)
-            
-            # Entropy for exploration (recompute from states)
-            entropy_loss = 0
-            for (state, goal) in states:
-                state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
-                goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device)
-                action_logits, _ = self.forward(state_tensor, goal_tensor)
-                action_probs = F.softmax(action_logits, dim=-1)
-                entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
-            
-            entropy_loss = entropy_loss / len(states)
-            
-            # Total loss
-            total_loss = (policy_loss + 
-                         self.value_coef * value_loss - 
-                         self.entropy_coef * entropy_loss)
-            
-            # Update parameters
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            self.optimizer.step()
+        """
+        Update policy parameters using A2C algorithm.
+        """
+        if len(rewards) == 0:
+            return
+
+        # Convert to tensors
+        returns = []
+        discounted_reward = 0
+
+        # Compute discounted returns (backwards)
+        for reward in reversed(rewards):
+            discounted_reward = reward + self.gamma * discounted_reward
+            returns.insert(0, discounted_reward)
+
+        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        values = torch.stack(values).squeeze()  # Ensure consistent shape
+        log_probs = torch.stack(log_probs)
+        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+
+        # Ensure all tensors have same shape
+        if values.dim() == 0:  # Single value case
+            values = values.unsqueeze(0)
+        if returns.dim() == 0:
+            returns = returns.unsqueeze(0)
+
+        # Compute advantages
+        advantages = returns - values
+
+        # Normalize advantages (handle single-step episodes)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Compute losses
+        policy_loss = -(log_probs * advantages.detach()).mean()
+        value_loss = F.mse_loss(values, returns)
+
+        # Entropy for exploration (recompute from states)
+        entropy_loss = 0
+        for (state, goal) in states:
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
+            goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device)
+            action_logits, _ = self.forward(state_tensor, goal_tensor)
+            action_probs = F.softmax(action_logits, dim=-1)
+            entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
+
+        entropy_loss = entropy_loss / len(states)
+
+        # Total loss
+        total_loss = (policy_loss + 
+                     self.value_coef * value_loss - 
+                     self.entropy_coef * entropy_loss)
+
+        # Update parameters
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
     
     def update_policy_with_diagnostics(self, states: List, actions: List[int], rewards: List[float], 
                      values: List[torch.Tensor], log_probs: List[torch.Tensor]):

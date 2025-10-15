@@ -1,4 +1,4 @@
-# STANDARD IMPORTS
+# EXTERNAL LIBRARY IMPORTS
 
 import pygame
 import gymnasium as gym
@@ -35,7 +35,7 @@ from torch.distributions import Uniform
 
 from typing import List, Tuple, Dict, Optional
 
-# LOCAL IMPORTS
+# PROJECT-SPECIFIC IMPORTS
 
 from local_distributions.hardkuma import HardKumaraswamy,BetaDistribution
 from wrappers.minigrid_wrapper import MinigridWrapper,EnvModes,EnvSizes
