@@ -881,20 +881,21 @@ def compare_phase1_runs(runs_dict):
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 # ACTUAL TRAINING CODE ----------------------------------------------------
+steps=2000
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 50,
         'phase2_episodes': 100,
-        'max_steps_per_episode': 2500,
-        'manager_horizon': 2500//40,
+        'max_steps_per_episode': steps,
+        'manager_horizon': steps//120,
         'neighborhood_size': math.ceil(24/4),
         'manager_lr': 1e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
-        'diagnostic_interval': 4999,  # NEW: Print diagnostics every K steps
+        'diagnostic_interval': 1000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
-        'full_breakdown_every': 50,  # NEW: Full breakdown every N episodes
+        'full_breakdown_every': 10,  # NEW: Full breakdown every N episodes
         'device': 'cuda'  # <-- ADD THIS: 'cpu' or 'cuda'
     }
 

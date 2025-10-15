@@ -69,7 +69,7 @@ class HierarchicalManager(nn.Module):
         # Hyperparameters
         self.gamma = 0.99
         self.entropy_coef = 1e-3    
-        self.value_coef = 0.5
+        self.value_coef = 0.1
 
         # Diagnostic parameters
         self.diagnostic_interval = diagnostic_interval
@@ -451,7 +451,7 @@ class HierarchicalWorker(nn.Module):
         # Hyperparameters
         self.gamma = 0.99
         self.entropy_coef = 0.01
-        self.value_coef = 0.5
+        self.value_coef = 0.1
     
     def reset_worker_state(self):
         """Reset LSTM hidden state and traversal state."""
@@ -872,7 +872,7 @@ class HierarchicalTrainer:
         }
 
         self.worker_shaping_weight=0.2
-        self.manager_shaping_weight=0.5
+        self.manager_shaping_weight=1
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -1036,11 +1036,13 @@ class HierarchicalTrainer:
                     goal_reached_this_horizon = True
                 
                 # Store Worker experience
-                worker_states.append((state, wide_goal, narrow_goal))
-                worker_actions.append(action)
-                worker_rewards.append(worker_reward)
-                worker_values.append(worker_value)
-                worker_log_probs.append(worker_log_prob)
+                # Only store if worker is NOT traversing
+                if not self.worker.current_traversal_path:
+                    worker_states.append((state, wide_goal, narrow_goal))
+                    worker_actions.append(action)
+                    worker_rewards.append(worker_reward)
+                    worker_values.append(worker_value)
+                    worker_log_probs.append(worker_log_prob)
                 
                 # # Update Worker every step
                 # if len(worker_rewards) > 0:
@@ -1090,35 +1092,38 @@ class HierarchicalTrainer:
 
             # Shaping
 
+            # ... (after the worker's for-loop for the horizon ends) ...
+            balls_collected_this_horizon = len(starting_balls_snapshot) - len(self.env.active_balls)
+            manager_reward = horizon_env_reward
+
             if self.manager_reward_shaping:
-                # AFTER - Add progress-based shaping:
-                # Calculate how much closer we got to nearest ball during this horizon
-                if len(self.env.active_balls) > 0:
-                    balls_before_start = starting_balls_snapshot  # Save at horizon start
-                    balls_after_end = list(self.env.active_balls)
-                    
-                    # Distance to nearest ball at horizon start vs end
+                # Add a large, sparse bonus for task completion
+                manager_reward += balls_collected_this_horizon * 2.0 
+                
+                # --- *** THE CRITICAL FIX IS HERE *** ---
+                if len(starting_balls_snapshot) > 0 and len(self.env.active_balls) > 0:
                     start_pos_horizon = starting_state_snapshot
                     end_pos_horizon = state
                     
-                    dist_before = min(manhattan_distance(start_pos_horizon, ball) 
-                                    for ball in balls_before_start) if balls_before_start else 0
-                    dist_after = min(manhattan_distance(end_pos_horizon, ball) 
-                                    for ball in balls_after_end) if balls_after_end else 0
+                    dist_before = min(manhattan_distance(start_pos_horizon, ball) for ball in starting_balls_snapshot)
+                    dist_after = min(manhattan_distance(end_pos_horizon, ball) for ball in self.env.active_balls)
                     
-                    progress_reward = (dist_before - dist_after) * self.manager_shaping_weight # Reward for getting closer
-                    manager_reward = horizon_env_reward + progress_reward
-                else:
-                    manager_reward = horizon_env_reward
-            else:
-                manager_reward = horizon_env_reward
+                    # Calculate progress, but only reward positive progress.
+                    # This prevents punishing the agent for exploring.
+                    progress = dist_before - dist_after
+                    if progress > 0:
+                        progress_reward = progress * self.manager_shaping_weight
+                        manager_reward += progress_reward
+            
+            # Now, manager_reward is the environment reward + ONLY POSITIVE shaping
 
             # Manager collects reward
-            manager_rewards.append(manager_reward)
+            clipped_manager_reward = np.clip(manager_reward, -1.0, 1.0) # CLIPPING
+            manager_rewards.append(clipped_manager_reward)
             horizon_counter += 1
 
 
-            MANAGER_UPDATE_FREQUENCY = 10
+            MANAGER_UPDATE_FREQUENCY = 8
 
             # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(manager_reward)
@@ -1131,7 +1136,7 @@ class HierarchicalTrainer:
                     print(f"  [REWARD DEBUG] Horizon {horizon_counter}: env_reward={horizon_env_reward:.3f}, total_so_far={sum(all_manager_rewards_this_episode):.3f}")
 
             
-            # Update Manager after EVERY horizon
+            # Update Manager 
             if horizon_counter % MANAGER_UPDATE_FREQUENCY == 0 and len(manager_rewards) > 0:
                 self.manager.update_policy(
                     manager_states, manager_wide_goals, manager_narrow_goals,
