@@ -68,7 +68,7 @@ class HierarchicalManager(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 0.01    # NEW: Increased entropy regularization
+        self.entropy_coef = 1e-3    
         self.value_coef = 0.5
 
         # Diagnostic parameters
@@ -1231,7 +1231,8 @@ class HierarchicalTrainer:
             'episode_rewards': []
         }
 
-        self.shaping_weight=0.5
+        self.worker_shaping_weight=0.2
+        self.manager_shaping_weight=1.0
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -1342,17 +1343,17 @@ class HierarchicalTrainer:
             worker_values = []
             worker_log_probs = []
             
-            horizon_env_reward = 0
+            horizon_env_reward = 0 
             goal_reached_this_horizon = False
+
+            # Save starting state for Manager reward shaping
+            starting_state_snapshot = state
+            starting_balls_snapshot = list(self.env.active_balls)
             
             for h in range(self.horizon):
                 # BEFORE taking action, record distance FOR SHAPING
                 old_dist_narrow = manhattan_distance(state, narrow_goal)
                 old_dist_wide = manhattan_distance(state, wide_goal)
-
-                # Save starting state for Manager reward shaping
-                starting_state_snapshot = state
-                starting_balls_snapshot = list(self.env.active_balls)
 
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
@@ -1392,7 +1393,7 @@ class HierarchicalTrainer:
                 # Add Manhattan Shaping
 
                 if self.manhattan_distance_rew_shaping:
-                    worker_reward += progress_bonus * self.shaping_weight
+                    worker_reward += progress_bonus * self.worker_shaping_weight
                 
                 # NEW: Track if Worker reached goal
                 if worker_reward > 0:
@@ -1456,7 +1457,7 @@ class HierarchicalTrainer:
                     dist_after = min(manhattan_distance(end_pos_horizon, ball) 
                                     for ball in balls_after_end) if balls_after_end else 0
                     
-                    progress_reward = (dist_before - dist_after) * 0.1  # Reward for getting closer
+                    progress_reward = (dist_before - dist_after) * self.manager_shaping_weight # Reward for getting closer
                     manager_reward = horizon_env_reward + progress_reward
                 else:
                     manager_reward = horizon_env_reward

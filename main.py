@@ -851,10 +851,10 @@ externalconfig = {
         'phase1_iterations': 50,
         'phase2_episodes': 100,
         'max_steps_per_episode': 2500,
-        'manager_horizon': 20,
-        'neighborhood_size': 5,
-        'manager_lr': 1e-5,
-        'worker_lr': 1e-5,
+        'manager_horizon': 2500//30,
+        'neighborhood_size': math.ceil(24/4),
+        'manager_lr': 1e-6,
+        'worker_lr': 1e-2,
         'vae_mu0': 9.0,
         'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
@@ -886,7 +886,7 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
         print(f"  {k}: {v}")
     
     # Phase 1
-    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'],phase_one_eps=config['phase1_iterations']*1000)
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'],phase_one_eps=config['phase1_iterations']*10000)
     env.phase = 1
     env.randomgen = True
     
