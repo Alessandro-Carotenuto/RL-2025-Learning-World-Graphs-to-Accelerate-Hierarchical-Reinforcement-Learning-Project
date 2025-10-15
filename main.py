@@ -78,11 +78,21 @@ def replay_and_save_video(env_config, episode_data, filename):
     env.agent_dir = episode_data['initial_agent_dir']
     env.active_balls = set(episode_data['ball_positions'])
     
+    # Restore step_count if present, else set to 0 to avoid AttributeError
+    if hasattr(env, 'step_count'):
+        if 'step_count' in episode_data:
+            env.step_count = episode_data['step_count']
+        else:
+            env.step_count = 0
+    else:
+        # If env does not have step_count, create it
+        env.step_count = episode_data.get('step_count', 0)
+
     frames = []
     for action in episode_data['actions']:
         frames.append(env.render())
         env.step(action)
-    
+
     imageio.mimsave(filename, frames, fps=10)
     print(f"Saved video: {filename}")
 
@@ -445,145 +455,73 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
     return episode_diagnostics
 
 def plot_training_diagnostics(trainer, config, save_path=None):
-    """Plot comprehensive training diagnostics with moving averages."""
+    """Plot simplified training diagnostics."""
     import matplotlib.pyplot as plt
-
     
     def moving_average(data, window=20):
-        """Compute moving average with specified window size."""
         if len(data) < window:
-            return np.array([])  # Return empty array, not original data
+            return np.array([])
         return np.convolve(data, np.ones(window)/window, mode='valid')
-        
+    
     history = trainer.diagnostic_history
     num_episodes = len(history['episode_rewards'])
     episodes = range(1, num_episodes + 1)
     
-    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle('Hierarchical RL Training Diagnostics', fontsize=16, fontweight='bold')
     
-    # 1. Episode rewards
-    axes[0, 0].plot(episodes, history['episode_rewards'], 'b-', alpha=0.7, label='Agent')
-    ma_rewards = moving_average(history['episode_rewards'])
-    if len(ma_rewards) > 0:
-        axes[0, 0].plot(range(20, 20 + len(ma_rewards)), ma_rewards, 'k-', linewidth=2, label='MA(20)')
-    axes[0, 0].set_title('Episode Rewards')
+    # 1. Worker Goal Achievement Rate
+    axes[0, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2, alpha=0.7, label='Achievement')
+    ma_achievement = moving_average([x*100 for x in history['worker_goal_achievement']])
+    if len(ma_achievement) > 0:
+        axes[0, 0].plot(range(20, 20 + len(ma_achievement)), ma_achievement, 'k-', linewidth=2, label='MA(20)')
+    axes[0, 0].set_title('Worker Goal Achievement Rate')
     axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('Reward')
+    axes[0, 0].set_ylabel('% Horizons Goal Reached')
+    axes[0, 0].set_ylim([0, 100])
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend()
     
-    # 2. Manager goal diversity
-    axes[0, 1].plot(episodes, history['manager_goal_diversity'], 'g-', linewidth=2, alpha=0.7, label='Diversity')
-    ma_diversity = moving_average(history['manager_goal_diversity'])
-    if len(ma_diversity) > 0:
-        axes[0, 1].plot(range(20, 20 + len(ma_diversity)), ma_diversity, 'k-', linewidth=2, label='MA(20)')
-    axes[0, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='Random (100%)')
-    axes[0, 1].axhline(y=1/len(trainer.manager.pivotal_states), color='orange', 
-                       linestyle='--', alpha=0.5, label='Collapsed')
-    axes[0, 1].set_title('Manager Goal Diversity')
+    # 2. Episode Rewards
+    axes[0, 1].plot(episodes, history['episode_rewards'], 'b-', alpha=0.7, label='Agent')
+    ma_rewards = moving_average(history['episode_rewards'])
+    if len(ma_rewards) > 0:
+        axes[0, 1].plot(range(20, 20 + len(ma_rewards)), ma_rewards, 'k-', linewidth=2, label='MA(20)')
+    axes[0, 1].set_title('Episode Rewards')
     axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Fraction of Unique Goals')
-    axes[0, 1].set_ylim([0, 1.1])
+    axes[0, 1].set_ylabel('Reward')
     axes[0, 1].grid(True, alpha=0.3)
     axes[0, 1].legend()
     
-    # 3. Manager e
-    axes[0, 2].plot(episodes, history['manager_entropy'], 'purple', linewidth=2, alpha=0.7, label='Entropy')
-    ma_entropy = moving_average(history['manager_entropy'])
-    if len(ma_entropy) > 0:
-        axes[0, 2].plot(range(20, 20 + len(ma_entropy)), ma_entropy, 'k-', linewidth=2, label='MA(20)')
-    max_entropy = np.log(len(trainer.manager.pivotal_states))
-    axes[0, 2].axhline(y=max_entropy, color='r', linestyle='--', alpha=0.5, label='Max entropy')
-    axes[0, 2].set_title('Manager Policy Entropy')
-    axes[0, 2].set_xlabel('Episode')
-    axes[0, 2].set_ylabel('Entropy (nats)')
-    axes[0, 2].grid(True, alpha=0.3)
-    axes[0, 2].legend()
-    
-    # 4. Worker goal achievement
-    axes[1, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2, alpha=0.7, label='Achievement')
-    ma_achievement = moving_average([x*100 for x in history['worker_goal_achievement']])
-    if len(ma_achievement) > 0:
-        axes[1, 0].plot(range(20, 20 + len(ma_achievement)), ma_achievement, 'k-', linewidth=2, label='MA(20)')
-    axes[1, 0].set_title('Worker Goal Achievement Rate')
+    # 3. Worker Value Estimates
+    axes[1, 0].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2, alpha=0.7, label='Value')
+    ma_worker_val = moving_average(history['worker_value_mean'])
+    if len(ma_worker_val) > 0:
+        axes[1, 0].plot(range(20, 20 + len(ma_worker_val)), ma_worker_val, 'k-', linewidth=2, label='MA(20)')
+    axes[1, 0].set_title('Worker Value Estimates')
     axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('% Horizons Goal Reached')
-    axes[1, 0].set_ylim([0, 100])
+    axes[1, 0].set_ylabel('Average Value')
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend()
     
-    # 5. Balls collected
-    axes[1, 1].plot(episodes, history['balls_collected_per_episode'], 'red', linewidth=2, alpha=0.7, label='Balls')
-    ma_balls = moving_average(history['balls_collected_per_episode'])
-    if len(ma_balls) > 0:
-        axes[1, 1].plot(range(20, 20 + len(ma_balls)), ma_balls, 'k-', linewidth=2, label='MA(20)')
-    axes[1, 1].axhline(y=trainer.env.total_balls, color='g', linestyle='--', 
-                       alpha=0.5, label='All balls')
-    axes[1, 1].set_title('Balls Collected per Episode')
+    # 4. Manager Value Estimates
+    axes[1, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2, alpha=0.7, label='Value')
+    ma_manager_val = moving_average(history['manager_value_mean'])
+    if len(ma_manager_val) > 0:
+        axes[1, 1].plot(range(20, 20 + len(ma_manager_val)), ma_manager_val, 'k-', linewidth=2, label='MA(20)')
+    axes[1, 1].set_title('Manager Value Estimates')
     axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Number of Balls')
+    axes[1, 1].set_ylabel('Average Value')
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
     
-    # 6. Manager rewards
-    axes[1, 2].plot(episodes, history['manager_rewards_mean'], 'b-', linewidth=2, alpha=0.7, label='Mean')
-    ma_manager_rew = moving_average(history['manager_rewards_mean'])
-    if len(ma_manager_rew) > 0:
-        axes[1, 2].plot(range(20, 20 + len(ma_manager_rew)), ma_manager_rew, 'k-', linewidth=2, label='MA(20)')
-    axes[1, 2].fill_between(episodes, 
-                            np.array(history['manager_rewards_mean']) - np.array(history['manager_rewards_std']),
-                            np.array(history['manager_rewards_mean']) + np.array(history['manager_rewards_std']),
-                            alpha=0.3)
-    axes[1, 2].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-    axes[1, 2].set_title('Manager Reward per Horizon')
-    axes[1, 2].set_xlabel('Episode')
-    axes[1, 2].set_ylabel('Reward')
-    axes[1, 2].grid(True, alpha=0.3)
-    axes[1, 2].legend()
-    
-    # 7. Distance to balls
-    if len(history['goal_distance_to_balls']) > 0:
-        axes[2, 0].plot(episodes[:len(history['goal_distance_to_balls'])], 
-                        history['goal_distance_to_balls'], 'brown', linewidth=2, alpha=0.7, label='Distance')
-        ma_distance = moving_average(history['goal_distance_to_balls'])
-        if len(ma_distance) > 0:
-            axes[2, 0].plot(range(20, 20 + len(ma_distance)), ma_distance, 'k-', linewidth=2, label='MA(20)')
-        axes[2, 0].set_title('Avg Distance: Manager Goals → Balls')
-        axes[2, 0].set_xlabel('Episode')
-        axes[2, 0].set_ylabel('Manhattan Distance')
-        axes[2, 0].grid(True, alpha=0.3)
-        axes[2, 0].legend()
-    
-    # 8. Manager values
-    axes[2, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2, alpha=0.7, label='Value')
-    ma_manager_val = moving_average(history['manager_value_mean'])
-    if len(ma_manager_val) > 0:
-        axes[2, 1].plot(range(20, 20 + len(ma_manager_val)), ma_manager_val, 'k-', linewidth=2, label='MA(20)')
-    axes[2, 1].set_title('Manager Value Estimates')
-    axes[2, 1].set_xlabel('Episode')
-    axes[2, 1].set_ylabel('Average Value')
-    axes[2, 1].grid(True, alpha=0.3)
-    axes[2, 1].legend()
-    
-    # 9. Worker values
-    axes[2, 2].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2, alpha=0.7, label='Value')
-    ma_worker_val = moving_average(history['worker_value_mean'])
-    if len(ma_worker_val) > 0:
-        axes[2, 2].plot(range(20, 20 + len(ma_worker_val)), ma_worker_val, 'k-', linewidth=2, label='MA(20)')
-    axes[2, 2].set_title('Worker Value Estimates')
-    axes[2, 2].set_xlabel('Episode')
-    axes[2, 2].set_ylabel('Average Value')
-    axes[2, 2].grid(True, alpha=0.3)
-    axes[2, 2].legend()
-    
     plt.tight_layout()
     if save_path is None:
-        # Build filename from config
         save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase2_episodes']}.png"
     plt.savefig(save_path, dpi=150)
     print(f"\nDiagnostic plots saved to {save_path}")
     plt.close()
+
 
 def save_separate_graph_visualization(world_graph, pivotal_states, config):
     """
@@ -1371,28 +1309,10 @@ def main():
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
 
-    train_full_phase1_phase2(recordflag=True)
+    train_full_phase1_phase2(recordflag=False)
     #run_phase1_comparison()
     #run_phase1_size_comparison()
 
-    # config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
-    # test_phase1_with_diagnostics(config)
-
-    # Compare maze sizes
-    # Compare different mu0 values
-    # runs = {}
-    # for currsize in [EnvSizes.MEDIUM]:
-        #   config = {'vae_mu0': 9.0, 'phase1_iterations': 25, 'maze_size': EnvSizes.MEDIUM}
-        #   runs[f'size={currsize}'] = test_phase1_with_diagnostics(config)
-    
-    # compare_phase1_runs(runs)
-
-    # runs = {}
-    # for size in [EnvSizes.SMALL, EnvSizes.MEDIUM]:
-    #     config = {'maze_size': size}
-    #     runs[f'{size.name}'] = test_phase1_with_diagnostics(config)
-
-    # compare_phase1_runs(runs)
 
 if __name__ == "__main__":
     main()
