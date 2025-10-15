@@ -880,7 +880,7 @@ class HierarchicalTrainer:
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
-    def train_episode(self, max_steps: int = 200, full_breakdown_every=1) -> Dict:
+    def train_episode(self, max_steps: int = 200, full_breakdown_every=1, recording_data=None):
         """Train one episode with comprehensive diagnostics."""
         
         # Episode tracking
@@ -889,14 +889,25 @@ class HierarchicalTrainer:
         manager_updates = 0
         worker_updates = 0
 
-        # ADD THIS:
+        # At the very beginning
+        if recording_data is not None:
+            episode_record = {
+                'actions': [],
+                'initial_agent_pos': tuple(self.env.agent_pos),
+                'initial_agent_dir': self.env.agent_dir,
+                'ball_positions': list(self.env.active_balls),
+                'grid_state': recording_data['grid_state']
+            }
+            record_this_episode = True
+        else:
+            record_this_episode = False
+
         all_manager_rewards_this_episode = []  # Track all horizon rewards for diagnostics
 
         # Reset environment and networks
         obs = self.env.reset()
         state = tuple(self.env.agent_pos)
 
-        # ADD THIS DIAGNOSTIC HERE:
         if diag2:
             print(f"\n[EPISODE {self.global_episode_counter + 1} START]")
             print(f"  Agent at: {state}")
@@ -998,7 +1009,7 @@ class HierarchicalTrainer:
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
                     state, wide_goal, narrow_goal,
-                    agent_dir=self.env.agent_dir  # ← ADD THIS
+                    agent_dir=self.env.agent_dir
                 )
                 
                 # NEW: Track Worker values
@@ -1014,6 +1025,9 @@ class HierarchicalTrainer:
                     terminated = False
                     truncated = False
                 
+                if record_this_episode:
+                    episode_record['actions'].append(action)
+
                 if diag2:
                     if env_reward != 0:
                         print(f"[REWARD] Step {episode_steps}: env_reward={env_reward:.3f}, "

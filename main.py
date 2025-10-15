@@ -50,6 +50,42 @@ from utils.misc import manhattan_distance,sample_goal_position
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 from utils.optimal_reward_computer import compute_optimal_reward_for_episode, compute_optimal_reward_bruteforce_small
 
+
+
+import pickle
+import imageio
+def replay_and_save_video(env_config, episode_data, filename):
+    """Replay episode and save as video."""
+    env = MinigridWrapper(
+        size=env_config['maze_size'],
+        mode=EnvModes.MULTIGOAL,
+        max_steps=env_config['max_steps_per_episode'],
+        render_mode='rgb_array'
+    )
+    env.phase = 2
+    
+    # Restore grid state
+    env.grid = Grid(env.size, env.size)
+    for y, row in enumerate(episode_data['grid_state']):
+        for x, cell in enumerate(row):
+            if cell == '#':
+                env.grid.set(x, y, Wall())
+            elif cell == 'B':
+                env.grid.set(x, y, Ball(COLOR_NAMES[0]))
+    
+    # Set agent
+    env.agent_pos = episode_data['initial_agent_pos']
+    env.agent_dir = episode_data['initial_agent_dir']
+    env.active_balls = set(episode_data['ball_positions'])
+    
+    frames = []
+    for action in episode_data['actions']:
+        frames.append(env.render())
+        env.step(action)
+    
+    imageio.mimsave(filename, frames, fps=10)
+    print(f"Saved video: {filename}")
+
 #---------------------------------------------------------------------------------------
 # MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
 # ---------------------------------------------------------------------------------------
@@ -145,7 +181,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
 
 
         episodes_collected = 0
-        success_count = 0  # ADD THIS LINE
+        success_count = 0
         for i, start_state in enumerate(pivotal_states[:10]):  
             print(f"  Collecting from pivotal state {i+1}: {start_state}")
             
@@ -174,7 +210,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 print(f"  Failed to collect from {start_state}: {e}")
                 continue
             
-        # ADD THIS BLOCK - Track success rate
+        # Track success rate
         if episodes_collected > 0:
             success_rate = success_count / episodes_collected
             metrics['policy_success_rates'].append(success_rate)
@@ -590,7 +626,7 @@ def save_separate_graph_visualization(world_graph, pivotal_states, config):
         # --- Step 4: Save the figure ---
         filename = f'world_graph_mu{config["vae_mu0"]:.1f}.png'
         plt.savefig(filename, dpi=200, bbox_inches='tight') # Higher DPI for better quality
-        plt.close(fig)  # Important: close the figure to free up memory
+        plt.close(fig)
         
         print(f"Successfully saved graph visualization to '{filename}'")
 
@@ -896,12 +932,12 @@ externalconfig = {
         'diagnostic_interval': 1000,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
         'full_breakdown_every': 10,  # NEW: Full breakdown every N episodes
-        'device': 'cuda'  # <-- ADD THIS: 'cpu' or 'cuda'
+        'device': 'cuda'
     }
 
 fast_training_toggle=True
 
-def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_toggle):
+def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_toggle, recordflag=False):
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
 
@@ -955,6 +991,16 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
     print_grid_image(GRIDSTATE,name=str(config['vae_mu0']))
     save_separate_graph_visualization(world_graph, pivotal_states, config)
 
+    # After phase 1, before phase 2 setup:
+    if recordflag:
+        grid_state = env.getGridState()
+        recording_data = {
+            'bad_episode': None,
+            'good_episode': None,
+            'grid_state': grid_state,
+            'config': config
+        }
+
     # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
     manager = HierarchicalManager(
         pivotal_states, 
@@ -968,7 +1014,7 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
     worker = HierarchicalWorker(
         world_graph, 
         pivotal_states,
-        lr=config['worker_lr'],  # ← ADD THIS
+        lr=config['worker_lr'],
         device=config['device']
     )
     manager.initialize_from_goal_policy(policy)
@@ -979,6 +1025,8 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
         env, manager, worker, world_graph, pivotal_states
     )
     
+    
+
     env.phase = 2
     trainer = HierarchicalTrainer(
     manager, worker, env, 
@@ -996,14 +1044,18 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
         'worker_updates': [],
         'traversals': [],
         'times': [],
-        'optimal_rewards': []  # NEW: Add this line
+        'optimal_rewards': []
     }
     
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
         if episode%10 == 0 and episode > 0:
             print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} ---")
-        stats = trainer.train_episode(max_steps=config['max_steps_per_episode'],full_breakdown_every=config['full_breakdown_every'])
+        stats = trainer.train_episode(
+        max_steps=config['max_steps_per_episode'],
+        full_breakdown_every=config['full_breakdown_every'],
+        recording_data=recording_data if recordflag else None
+    )
         
         metrics['rewards'].append(stats['episode_reward'])
         metrics['steps'].append(stats['episode_steps'])
@@ -1077,6 +1129,12 @@ def train_full_phase1_phase2(config=externalconfig,fast_training=fast_training_t
     plt.tight_layout()
     plt.savefig(simple_plot_path)
     print("\nPlots saved to training_diagnostics.png")
+
+        # After plots, before return
+    if recordflag and recording_data['bad_episode'] is not None:
+        replay_and_save_video(config, recording_data['bad_episode'], 'bad_episode.mp4')
+    if recordflag and recording_data['good_episode'] is not None:
+        replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4')
 
 
 def run_phase1_comparison():
@@ -1313,7 +1371,7 @@ def main():
     # manual_control = ManualControl(env, seed=42)
     # manual_control.start()
 
-    train_full_phase1_phase2()
+    train_full_phase1_phase2(recordflag=True)
     #run_phase1_comparison()
     #run_phase1_size_comparison()
 

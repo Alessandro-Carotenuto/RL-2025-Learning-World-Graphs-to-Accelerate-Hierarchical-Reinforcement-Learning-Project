@@ -423,7 +423,7 @@ class GoalConditionedPolicy(nn.Module):
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
                                      num_episodes: int = 6, 
-                                     max_episode_length: int = 50,  # ADD THIS
+                                     max_episode_length: int = 50,
                                      vae_system=None,
                                      curiosity_weight: float = 0.5,
                                      use_curiosity: bool = True) -> List:

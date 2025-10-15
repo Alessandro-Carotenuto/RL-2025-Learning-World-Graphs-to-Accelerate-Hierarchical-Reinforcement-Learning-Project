@@ -310,9 +310,7 @@ class MinigridWrapper(MiniGridEnv):
 
         
             # Ball is traversable (agent can walk on it to collect it)
-        
-        
-        if isinstance(cell_obj, Ball):  # ← ADD THIS
+        if isinstance(cell_obj, Ball):
             return True
 
 

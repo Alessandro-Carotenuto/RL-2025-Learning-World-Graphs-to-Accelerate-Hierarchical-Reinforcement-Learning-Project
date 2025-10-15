@@ -52,7 +52,7 @@ class PriorNetwork(nn.Module):
             nn.Softplus()
         )
     
-        # Add this initialization
+
         self._initialize_to_uniform()
     
     def _initialize_to_uniform(self):
@@ -311,7 +311,7 @@ class VAESystem(nn.Module):
         """
         super().__init__()  # Initialize nn.Module
         
-        self.current_kl_weight = 1.0  # Add this
+        self.current_kl_weight = 1.0
         
         self.device = device
         self.mu0 = mu0
@@ -362,7 +362,7 @@ class VAESystem(nn.Module):
     def encode_trajectories(self, trajectories):
         batch_states = []
         batch_actions = []
-        batch_discrete_actions = []  # ← Add this
+        batch_discrete_actions = []
         
         for trajectory in trajectories:
             states = [state for state, action in trajectory]
@@ -752,7 +752,7 @@ class VAESystem(nn.Module):
             
             # Update KL weight
             kl_weight = min(1.0, kl_weight + annealing_rate)
-            self.current_kl_weight = kl_weight  # ← ADD THIS
+            self.current_kl_weight = kl_weight
 
 
             # Print progress
