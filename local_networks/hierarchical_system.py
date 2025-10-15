@@ -68,8 +68,8 @@ class HierarchicalManager(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 1e-3    
-        self.value_coef = 0.1
+        self.entropy_coef = 1e-5
+        self.value_coef = 0.05
 
         # Diagnostic parameters
         self.diagnostic_interval = diagnostic_interval
@@ -349,6 +349,10 @@ class HierarchicalManager(nn.Module):
         # Policy and value losses
         policy_loss = -(advantages.detach() * log_probs_tensor).mean()
         value_loss = F.mse_loss(values_tensor, returns)
+
+        print(f"  Advantages (raw): {advantages[:3].tolist()}")
+        print(f"  Advantages (normalized): {advantages[:3].tolist()}")  # after normalization
+        print(f"  Policy loss: {policy_loss.item():.4f}")
         
         # Compute narrow entropy: E_gw[H(π^n|gw)]
         narrow_entropies = []
@@ -1091,35 +1095,36 @@ class HierarchicalTrainer:
             
 
             # Shaping
-
-            # ... (after the worker's for-loop for the horizon ends) ...
             balls_collected_this_horizon = len(starting_balls_snapshot) - len(self.env.active_balls)
             manager_reward = horizon_env_reward
 
             if self.manager_reward_shaping:
-                # Add a large, sparse bonus for task completion
-                manager_reward += balls_collected_this_horizon * 2.0 
+                # Bonus for ball collection
+                manager_reward += balls_collected_this_horizon * 2.0
                 
-                # --- *** THE CRITICAL FIX IS HERE *** ---
-                if len(starting_balls_snapshot) > 0 and len(self.env.active_balls) > 0:
-                    start_pos_horizon = starting_state_snapshot
-                    end_pos_horizon = state
+                # Distance-based progress shaping (fixed)
+                if len(starting_balls_snapshot) > 0:
+                    # Only compare distances to balls that STILL EXIST
+                    remaining_balls = [b for b in starting_balls_snapshot if b in self.env.active_balls]
                     
-                    dist_before = min(manhattan_distance(start_pos_horizon, ball) for ball in starting_balls_snapshot)
-                    dist_after = min(manhattan_distance(end_pos_horizon, ball) for ball in self.env.active_balls)
-                    
-                    # Calculate progress, but only reward positive progress.
-                    # This prevents punishing the agent for exploring.
-                    progress = dist_before - dist_after
-                    if progress > 0:
-                        progress_reward = progress * self.manager_shaping_weight
-                        manager_reward += progress_reward
-            
-            # Now, manager_reward is the environment reward + ONLY POSITIVE shaping
+                    if len(remaining_balls) > 0:
+                        start_pos_horizon = starting_state_snapshot
+                        end_pos_horizon = state
+                        
+                        # Distance to same set of balls before/after
+                        dist_before = min(manhattan_distance(start_pos_horizon, ball) for ball in remaining_balls)
+                        dist_after = min(manhattan_distance(end_pos_horizon, ball) for ball in remaining_balls)
+                        
+                        # Only reward positive progress
+                        progress = dist_before - dist_after
+                        if progress > 0:
+                            progress_reward = progress * self.manager_shaping_weight
+                            manager_reward += progress_reward
 
-            # Manager collects reward
-            clipped_manager_reward = np.clip(manager_reward, -1.0, 1.0) # CLIPPING
-            manager_rewards.append(clipped_manager_reward)
+            # Collect reward
+            #clipped_manager_reward = np.clip(manager_reward, -1, 1) #CLIP
+            #manager_reward = clipped_manager_reward
+            manager_rewards.append(manager_reward)
             horizon_counter += 1
 
 

@@ -110,7 +110,7 @@ class MinigridWrapper(MiniGridEnv):
 
     @staticmethod
     def _gen_mission():
-        return "grand mission"
+        return 'XL ENVIRONMENT'
 
 #----------------------------------------------------------------------------#
 #                    BFSs                                                    #
