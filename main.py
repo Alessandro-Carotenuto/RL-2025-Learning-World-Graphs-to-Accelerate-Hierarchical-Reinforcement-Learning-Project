@@ -867,9 +867,9 @@ externalconfig = {
         'manager_lr': 1e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
-        'diagnostic_interval': 1000,  # NEW: Print diagnostics every K steps
-        'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
-        'full_breakdown_every': 10,  # NEW: Full breakdown every N episodes
+        'diagnostic_interval': 1000,  
+        'diagnostic_checkstart': True,  
+        'full_breakdown_every': 10,  
         'device': 'cuda'
     }
 
