@@ -1,5 +1,5 @@
 import heapq
-from typing import List
+from typing import List, Tuple, Dict, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -12,13 +12,19 @@ import numpy as np
 class GraphManager:
     def __init__(self):
         self.nodes = set()
-        self.edges = {}
+        self.edges = {} # NEW: (start, end) -> {'weight': int, 'path': List[Tuple]} 
         
     def add_node(self, node):
         self.nodes.add(node)
     
-    def add_edge(self, node1, node2, weight):
-        self.edges[(node1, node2)] = weight
+    def add_edge(self, node1, node2, weight, path: List[Tuple[int, int]]):
+        self.edges[(node1, node2)] = {'weight': weight, 'path': path}
+    
+    # NEW: A helper to get the stored path for an edge
+    def get_edge_path(self, start_node, end_node) -> Optional[List[Tuple[int, int]]]:
+        edge_data = self.edges.get((start_node, end_node))
+        return edge_data.get('path') if edge_data else None
+
     
     def get_neighbors(self, node):
         """Get all neighbors of a node."""
@@ -28,28 +34,22 @@ class GraphManager:
                 neigh.add(n2)
         return neigh
     
+    # MODIFIED: shortest_path needs to access the weight from the dictionary
     def shortest_path(self, start, end):
         if start not in self.nodes or end not in self.nodes:
             return None, float('inf')
     
-        # Distance from start to each node
         distances = {node: float('inf') for node in self.nodes}
         distances[start] = 0
-    
-        # Priority queue (min-heap): (distance, node)
         pq = [(0, start)]
-    
-        # To reconstruct the path
         previous = {}
     
         while pq:
             current_dist, current = heapq.heappop(pq)
     
-            # Skip if we already found a shorter path
             if current_dist > distances[current]:
                 continue
     
-            # Stop early if we reached the end
             if current == end:
                 path = []
                 while current in previous:
@@ -58,11 +58,14 @@ class GraphManager:
                 path.append(start)
                 return path[::-1], distances[end]
     
-            # Explore neighbors
             for neighbor in self.get_neighbors(current):
-                weight = self.edges.get((current, neighbor))
-                if weight is None:
-                    continue  # skip if no direct edge
+                # *** MODIFICATION HERE ***
+                edge_data = self.edges.get((current, neighbor))
+                if not edge_data:
+                    continue
+                
+                weight = edge_data['weight']
+                # *** END MODIFICATION ***
     
                 alt = current_dist + weight
                 if alt < distances[neighbor]:

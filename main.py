@@ -851,12 +851,12 @@ externalconfig = {
         'phase1_iterations': 50,
         'phase2_episodes': 100,
         'max_steps_per_episode': 2500,
-        'manager_horizon': 2500//30,
+        'manager_horizon': 2500//40,
         'neighborhood_size': math.ceil(24/4),
         'manager_lr': 1e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
-        'diagnostic_interval': 50000,  # NEW: Print diagnostics every K steps
+        'diagnostic_interval': 4999,  # NEW: Print diagnostics every K steps
         'diagnostic_checkstart': True,  # NEW: Print every step for first 15 steps
         'full_breakdown_every': 50,  # NEW: Full breakdown every N episodes
         'device': 'cuda'  # <-- ADD THIS: 'cpu' or 'cuda'

@@ -627,9 +627,6 @@ class GoalConditionedPolicy(nn.Module):
                         refined_edges: Dict[Tuple, Tuple[List[Tuple], int]]) -> GraphManager:
         """
         Construct the final world graph with nodes and weighted edges.
-        
-        Args:
-            refined_edges: Dict of (start, end) -> (path, weight)
         """
         world_graph = GraphManager()
         
@@ -639,16 +636,18 @@ class GoalConditionedPolicy(nn.Module):
         for state in pivotal_states:
             world_graph.add_node(state)
         
-        # Add refined edges with weights only (no action sequences)
+        # Add refined edges with weights AND the full path
         for (start_state, end_state), (path, weight) in refined_edges.items():
-            world_graph.add_edge(start_state, end_state, weight)
+            # *** MODIFICATION HERE ***
+            world_graph.add_edge(start_state, end_state, weight, path)
+            # *** END MODIFICATION ***
             if self.verbose:
-                print(f"  Edge: {start_state} -> {end_state}, weight: {weight}")
+                print(f"  Edge: {start_state} -> {end_state}, weight: {weight}, path_len: {len(path)}")
         
         print(f"World graph constructed: {len(pivotal_states)} nodes, {len(refined_edges)} edges")
         
         return world_graph
-
+   
     def complete_world_graph_discovery(self, env, pivotal_states: List[Tuple[int, int]]) -> GraphManager:
         """
         Complete Phase 1 by discovering edges and constructing world graph.

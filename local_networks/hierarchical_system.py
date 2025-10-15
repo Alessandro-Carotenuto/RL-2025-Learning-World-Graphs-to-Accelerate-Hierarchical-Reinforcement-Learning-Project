@@ -440,6 +440,13 @@ class HierarchicalWorker(nn.Module):
         self.traversal_step = 0
         self.current_edge_actions = None
         self.current_action_idx = 0
+
+        # --- NEW WORKER STATE VARIABLES ---
+        self.current_traversal_path = []  # Path of PIVOTAL states, e.g., [(A), (B), (C)]
+        self.traversal_step = 0           # Index into self.current_traversal_path
+
+        self.current_edge_actions = []    # Action sequence for ONE edge, e.g., [1, 1, 2, 2]
+        self.current_action_idx = 0       # Index into self.current_edge_actions
         
         # Hyperparameters
         self.gamma = 0.99
@@ -526,10 +533,11 @@ class HierarchicalWorker(nn.Module):
         return action_logits, value
     
     def get_action(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int], agent_dir: int):
-        """Worker selects action with geometric path-to-action conversion."""
+        """Worker selects action by executing pre-computed paths or using policy."""
 
-        # 1. INITIATE TRAVERSAL
-        if self.should_traverse(state, wide_goal) and not self.current_traversal_path:
+        # 1. CHECK IF WE SHOULD START A NEW TRAVERSAL
+        # This happens only if we are NOT currently in a traversal.
+        if not self.current_traversal_path and self.should_traverse(state, wide_goal):
             path = self.plan_traversal(state, wide_goal)
             if path:
                 self.current_traversal_path = path
@@ -537,79 +545,60 @@ class HierarchicalWorker(nn.Module):
                 if diag:
                     print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
                     print(f"  - Target (gw): {wide_goal}")
-                    print(f"  - Planned Path: {self.current_traversal_path}")
-
-        # 2. EXECUTE TRAVERSAL
-        is_traversing = self.current_traversal_path and self.traversal_step < len(self.current_traversal_path) - 1
+                    print(f"  - Pivotal Path: {self.current_traversal_path}")
+        
+        # 2. EXECUTE THE CURRENT TRAVERSAL (if active)
+        is_traversing = bool(self.current_traversal_path)
 
         if is_traversing:
-            if diag:
-                print(f"\n[WORKER DIAGNOSTIC] Executing Traversal Step")
-                print(f"  - Agent is at: {state}, facing direction: {agent_dir}")
+            # Check if we need to load actions for a new edge segment
+            if not self.current_edge_actions:
+                if self.traversal_step < len(self.current_traversal_path) - 1:
+                    start_node = self.current_traversal_path[self.traversal_step]
+                    end_node = self.current_traversal_path[self.traversal_step + 1]
 
-            expected_node = self.current_traversal_path[self.traversal_step]
-            next_node = self.current_traversal_path[self.traversal_step + 1]
-
-            if diag:
-                print(f"  - Path State: Following path {self.current_traversal_path}")
-                print(f"  - Edge State: On edge {self.traversal_step} ({expected_node} -> {next_node})")
-
-            # CRITICAL CHECK: Position Synchronization
-            if state != expected_node:
-                if diag:
-                    print(f"  - 🔴 DESYNC DETECTED! Agent is at {state}, but expected to be at {expected_node}.")
-                    print(f"  - Aborting traversal and switching to policy.")
-                self.reset_worker_state()
-            else:
-                if diag:
-                    print(f"  - ✅ SYNC CONFIRMED. Agent is at the correct node.")
-                
-                # Generate action sequence for current edge segment if needed
-                if not hasattr(self, 'current_edge_actions') or self.current_edge_actions is None:
-                    edge_path = [expected_node, next_node]
-                    self.current_edge_actions = self.generate_actions_from_path(edge_path, agent_dir)
-                    self.current_action_idx = 0
-                    if diag:
-                        print(f"  - Action Generation: Created sequence {self.current_edge_actions} from path")
-                
-                # Execute next action in sequence
-                if self.current_action_idx < len(self.current_edge_actions):
-                    action = self.current_edge_actions[self.current_action_idx]
-                    action_names = ['turn_left', 'turn_right', 'move_forward']
-                    if diag:
-                        print(f"  - Action Execution: Returning action '{action_names[action]}' (index {self.current_action_idx})")
-                    
-                    self.current_action_idx += 1
-                    
-                    # Check if finished this edge segment
-                    if self.current_action_idx >= len(self.current_edge_actions):
+                    # CRITICAL SYNC CHECK before starting a new edge
+                    if state != start_node:
                         if diag:
-                            print(f"  - State Update: Completed edge segment, advancing to next node")
-                        self.current_edge_actions = None
-                        self.traversal_step += 1
-                        
-                        if self.traversal_step >= len(self.current_traversal_path) - 1:
+                            print(f"  - 🔴 DESYNC DETECTED! Agent at {state}, expected {start_node} to start edge.")
+                            print(f"  - Aborting traversal.")
+                        self.reset_worker_state()
+                    else:
+                        # Fetch the coordinate path and generate actions for it
+                        coord_path = self.world_graph.get_edge_path(start_node, end_node)
+                        if coord_path:
+                            self.current_edge_actions = self.generate_actions_from_path(coord_path, agent_dir)
+                            self.current_action_idx = 0
                             if diag:
-                                print("  - State Update: End of entire path reached. Clearing path.")
-                            self.current_traversal_path = []
-                    
-                    with torch.no_grad():
-                        _, value = self.forward(state, wide_goal, narrow_goal)
-                    
-                    log_prob = torch.tensor(-1.0, device=self.device)
-                    return action, log_prob, value.squeeze()
+                                print(f"  - Loading edge {start_node}->{end_node}. Generated {len(self.current_edge_actions)} actions.")
+                        else:
+                            # Path not found in graph, should not happen if plan is valid
+                            if diag: print(f"  - 🔴 ERROR: Edge path for {start_node}->{end_node} not found!")
+                            self.reset_worker_state()
                 else:
-                    if diag:
-                        print(f"  - 🔴 ERROR: No actions available but still traversing")
+                    # We have finished the last edge of the pivotal path
+                    if diag: print("  - ✅ Traversal Complete. Switching to policy.")
                     self.reset_worker_state()
 
-        # 3. FALLBACK TO POLICY ACTION
-        if not is_traversing:
-            if self.current_traversal_path and self.traversal_step > 0:
-                if diag:
-                    print("[WORKER DIAGNOSTIC] Traversal just ended. Switching to policy.")
-            self.reset_worker_state()
+            # If we have actions to execute for the current edge, execute them
+            if self.current_edge_actions and self.current_action_idx < len(self.current_edge_actions):
+                action = self.current_edge_actions[self.current_action_idx]
+                self.current_action_idx += 1
 
+                # Check if this edge segment is now complete
+                if self.current_action_idx >= len(self.current_edge_actions):
+                    self.current_edge_actions = [] # Clear actions to load next edge
+                    self.traversal_step += 1       # Move to next pivotal state in path
+                    if diag:
+                        print(f"  - Edge segment finished. Advancing to pivotal step {self.traversal_step}.")
+
+                # Return the action from the pre-computed plan
+                with torch.no_grad():
+                    _, value = self.forward(state, wide_goal, narrow_goal)
+                log_prob = torch.tensor(-1.0, device=self.device) # Dummy log_prob for planned actions
+                return action, log_prob, value.squeeze()
+
+        # 3. FALLBACK TO POLICY ACTION if not traversing
         with torch.no_grad():
             action_logits, value = self.forward(state, wide_goal, narrow_goal)
 
@@ -1053,13 +1042,13 @@ class HierarchicalTrainer:
                 worker_values.append(worker_value)
                 worker_log_probs.append(worker_log_prob)
                 
-                # Update Worker every step
-                if len(worker_rewards) > 0:
-                    self.worker.update_policy(
-                        [worker_states[-1]], [worker_actions[-1]], [worker_rewards[-1]],
-                        [worker_values[-1]], [worker_log_probs[-1]]
-                    )
-                    worker_updates += 1
+                # # Update Worker every step
+                # if len(worker_rewards) > 0:
+                #     self.worker.update_policy(
+                #         [worker_states[-1]], [worker_actions[-1]], [worker_rewards[-1]],
+                #         [worker_values[-1]], [worker_log_probs[-1]]
+                #     )
+                #     worker_updates += 1
                 
                 # Track episode stats
                 horizon_env_reward += env_reward
@@ -1073,6 +1062,19 @@ class HierarchicalTrainer:
                 if terminated or truncated:
                     break
             
+            
+            #  ADD: Update Worker AFTER horizon ends with full batch
+            if len(worker_rewards) > 0:
+                self.worker.update_policy(
+                    worker_states,   # Full horizon: 20-30 samples
+                    worker_actions,
+                    worker_rewards,
+                    worker_values,
+                    worker_log_probs
+                )
+                worker_updates += 1
+
+
             if diag2:
                 # ADD THIS DIAGNOSTIC HERE (after the for h in range loop):
                 balls_collected_this_horizon = balls_before_horizon - len(self.env.active_balls)
@@ -1115,6 +1117,9 @@ class HierarchicalTrainer:
             manager_rewards.append(manager_reward)
             horizon_counter += 1
 
+
+            MANAGER_UPDATE_FREQUENCY = 10
+
             # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(manager_reward)
                 
@@ -1127,7 +1132,7 @@ class HierarchicalTrainer:
 
             
             # Update Manager after EVERY horizon
-            if len(manager_rewards) > 0:
+            if horizon_counter % MANAGER_UPDATE_FREQUENCY == 0 and len(manager_rewards) > 0:
                 self.manager.update_policy(
                     manager_states, manager_wide_goals, manager_narrow_goals,
                     manager_rewards, manager_values, manager_log_probs,
@@ -1150,6 +1155,18 @@ class HierarchicalTrainer:
                 manager_entropies_for_update = []
             
             if terminated or truncated:
+                # ✅ ADD: Final update if any remaining experiences
+                if len(manager_rewards) > 0:
+                    self.manager.update_policy(
+                        manager_states, manager_wide_goals, manager_narrow_goals,
+                        manager_rewards, manager_values, manager_log_probs,
+                        manager_entropies_for_update,
+                        step_count=self.global_step_counter
+                    )
+                    manager_updates += 1
+                    
+                    if self.manager.hidden_state is not None:
+                        self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
                 break
         
         self.global_episode_counter += 1
