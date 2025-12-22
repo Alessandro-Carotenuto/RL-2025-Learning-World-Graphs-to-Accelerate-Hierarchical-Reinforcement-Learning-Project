@@ -11,46 +11,78 @@ import numpy as np
 
 class GraphManager:
 
-    def __init__(self):
-        self.nodes = set()
-        self.edges = {} # NEW: (start, end) -> {'weight': int, 'path': List[Tuple]} 
+    def __init__(self): 
+        self.nodes = set()        # Set of nodes represented as (x, y) tuples,  O(1) lookup time with set
+        self.edges = {}           # Dict with keys as (node1, node2) tuples and values as dicts with 'weight' and 'path'
+        self.adjacency_list = {}  # Dict with keys as nodes and values as sets of neighboring nodes
+
+        # STRUCTURE OF ADJACENCY DICTIONARY:
+        #
+        # self.adjacency = {
+        #     node1: {'outgoing': set(), 'ingoing': set()},
+        #     node2: {'outgoing': set(), 'ingoing': set()}
+        # }
         
     def add_node(self, node):
+        # Add a node represented as (x, y) tuple
         self.nodes.add(node)
     
     def add_edge(self, node1, node2, weight, path: List[Tuple[int, int]]):
-        self.edges[(node1, node2)] = {'weight': weight, 'path': path}
-    
-    # NEW: A helper to get the stored path for an edge
-    def get_edge_path(self, start_node, end_node) -> Optional[List[Tuple[int, int]]]:
-        edge_data = self.edges.get((start_node, end_node))
-        return edge_data.get('path') if edge_data else None
+        # Directed edge from node1 to node2 with associated weight and path
+        # A dictionary is used to associate node pairs with their weights and paths
+        # - A nested dictionary is used to store both weight and path for each edge, using a string as key for readability
+        self.edges[(node1, node2)] = {'weight': weight, 'path': path} 
 
+        # Update adjacency list for outgoing edges
+
+        if node1 not in self.adjacency_list:
+            self.adjacency_list[node1] = {'outgoing': set(), 'ingoing': set()}
+        
+        if node2 not in self.adjacency_list:
+            self.adjacency_list[node2] = {'outgoing': set(), 'ingoing': set()} 
+        
+        self.adjacency_list[node1]['outgoing'].add(node2)
+        self.adjacency_list[node2]['ingoing'].add(node1)
     
-    def get_neighbors(self, node):
-        """Get all neighbors of a node."""
+    
+    def get_edge_path(self, start_node, end_node) -> Optional[List[Tuple[int, int]]]:
+        # Retrieve the path associated with an edge
+        edge_data = self.edges.get((start_node, end_node))  # Get the edge data dictionary
+        return edge_data.get('path') if edge_data else None # Return the path if edge exists, else None
+    
+    def get_outgoing_neighbors(self, node):
+        # Get all neighboring nodes connected by outgoing edges from the given node
         neigh = set()
-        for (n1, n2) in self.edges.keys():
-            if n1 == node:
-                neigh.add(n2)
+        if node in self.adjacency_list:
+            neigh = self.adjacency_list[node]['outgoing']
         return neigh
     
-    # MODIFIED: shortest_path needs to access the weight from the dictionary
+    def get_all_neighbors(self, node):
+        # Get all neighboring nodes connected to and from the given node
+        neighout = set()
+        neighin = set()
+        if node in self.adjacency_list:
+            neighout = self.adjacency_list[node]['outgoing']
+            neighin = self.adjacency_list[node]['ingoing']
+        neigh = neighout | neighin # Union of outgoing and ingoing neighbors
+        return neigh
+
+
     def shortest_path(self, start, end):
         if start not in self.nodes or end not in self.nodes:
             return None, float('inf')
-    
+
         distances = {node: float('inf') for node in self.nodes}
         distances[start] = 0
         pq = [(0, start)]
         previous = {}
-    
+
         while pq:
             current_dist, current = heapq.heappop(pq)
-    
+
             if current_dist > distances[current]:
                 continue
-    
+
             if current == end:
                 path = []
                 while current in previous:
@@ -58,22 +90,20 @@ class GraphManager:
                     current = previous[current]
                 path.append(start)
                 return path[::-1], distances[end]
-    
-            for neighbor in self.get_neighbors(current):
-                # *** MODIFICATION HERE ***
+
+            # *** CHANGE THIS LINE ***
+            for neighbor in self.get_outgoing_neighbors(current):  # Now O(1) instead of O(E)
                 edge_data = self.edges.get((current, neighbor))
                 if not edge_data:
                     continue
                 
                 weight = edge_data['weight']
-                # *** END MODIFICATION ***
-    
                 alt = current_dist + weight
                 if alt < distances[neighbor]:
                     distances[neighbor] = alt
                     previous[neighbor] = current
                     heapq.heappush(pq, (alt, neighbor))
-    
+
         return None, float('inf')
     
 
