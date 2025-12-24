@@ -67,42 +67,52 @@ class GraphManager:
         neigh = neighout | neighin # Union of outgoing and ingoing neighbors
         return neigh
 
-
     def shortest_path(self, start, end):
-        if start not in self.nodes or end not in self.nodes:
+        if start not in self.nodes or end not in self.nodes:    #if start or end node not in graph
             return None, float('inf')
 
-        distances = {node: float('inf') for node in self.nodes}
-        distances[start] = 0
-        pq = [(0, start)]
-        previous = {}
+        distances = {node: float('inf') for node in self.nodes} # Initialize distances to infinity, from start to all nodes
+        distances[start] = 0                                    # Distance to start node is 0   
+        pq = [(0, start)]                                       # Priority queue for Dijkstra's algorithm
+                                                                # - Priority queue is a min-heap based on distance, i initialize as a 
+                                                                # - list with a tuple (distance, node), but i treat it as a heap using heapq functions
+                                                                # - cause works on lists directly but provides heap functionalities
+                                                                
+        previous = {}                                           # To reconstruct the shortest path
 
-        while pq:
-            current_dist, current = heapq.heappop(pq)
+        while pq:                                               # While there are nodes to process
+            current_dist, current = heapq.heappop(pq)           # Get the node with the smallest distance
+            #i can pop beacuse pq is a min-heap based on distance, from heapq documentation
+            #heapq.heappop pops and returns the smallest item from the heap, maintaining the heap invariant
+            #in this case the smallest item is the tuple with the smallest distance
+            #
+            #-- In the first iteration, it will pop (0, start) since start has distance 0 and it's the only item in the heap
 
-            if current_dist > distances[current]:
+
+            if current_dist > distances[current]:                # If a shorter path to current has been found,  skip processing
                 continue
 
-            if current == end:
-                path = []
-                while current in previous:
+            if current == end:                                    # If we reached the end node, reconstruct the path
+                path = []                             
+                while current in previous:                        
                     path.append(current)
                     current = previous[current]
                 path.append(start)
                 return path[::-1], distances[end]
 
-            # *** CHANGE THIS LINE ***
-            for neighbor in self.get_outgoing_neighbors(current):  # Now O(1) instead of O(E)
-                edge_data = self.edges.get((current, neighbor))
+           
+            for neighbor in self.get_outgoing_neighbors(current):  # Lookup outgoing neighbors O(1) with adjacency list
+                edge_data = self.edges.get((current, neighbor))    # Get edge data for current to neighbor
+
                 if not edge_data:
                     continue
                 
                 weight = edge_data['weight']
-                alt = current_dist + weight
-                if alt < distances[neighbor]:
-                    distances[neighbor] = alt
+                neighbor_to_curr = current_dist + weight                         #neighbor_to_curr is the distance to neighbor through current
+                if neighbor_to_curr < distances[neighbor]:                       
+                    distances[neighbor] = neighbor_to_curr
                     previous[neighbor] = current
-                    heapq.heappush(pq, (alt, neighbor))
+                    heapq.heappush(pq, (neighbor_to_curr, neighbor))             # Push the updated distance and neighbor into the priority queue
 
         return None, float('inf')
     
