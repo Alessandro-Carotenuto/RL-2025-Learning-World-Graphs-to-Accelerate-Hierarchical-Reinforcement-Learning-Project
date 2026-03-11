@@ -669,5 +669,3 @@ class GoalConditionedPolicy(nn.Module):
         print("="*60)
         
         return world_graph
-    
-#c
