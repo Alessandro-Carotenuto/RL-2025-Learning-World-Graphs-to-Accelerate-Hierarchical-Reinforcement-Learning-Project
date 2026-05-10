@@ -848,8 +848,8 @@ class HierarchicalTrainer:
             'episode_rewards': []
         }
 
-        self.worker_shaping_weight=0.2
-        self.manager_shaping_weight=1
+        self.worker_shaping_weight=0.2   # max ~0.15/horizon << success reward 1.0
+        self.manager_shaping_weight=0.1  # max ~1.5/horizon < success reward 2.0 (1 ball)
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -927,7 +927,12 @@ class HierarchicalTrainer:
             wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
                 state, step_count=self.global_step_counter
             )
-            
+
+            # Truncated BPTT: detach hidden state so the computation graph doesn't
+            # grow across horizons. Values and log_probs still have local gradients.
+            if self.manager.hidden_state is not None:
+                self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
+
             manager_selection_counts[wide_goal] += 1
 
             # ADD THIS DIAGNOSTIC HERE:
@@ -956,8 +961,8 @@ class HierarchicalTrainer:
             manager_states.append(state)
             manager_wide_goals.append(wide_goal)
             manager_narrow_goals.append(narrow_goal)
-            manager_log_probs.append(manager_log_prob)  # ← REMOVE .detach()
-            manager_values.append(manager_value)        # ← REMOVE .detach()
+            manager_log_probs.append(manager_log_prob)
+            manager_values.append(manager_value)
             manager_entropies_for_update.append(entropy.detach())  # Keep this
             
             # Worker executes for horizon steps

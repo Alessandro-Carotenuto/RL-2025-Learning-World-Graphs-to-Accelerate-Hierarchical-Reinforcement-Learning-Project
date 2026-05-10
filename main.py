@@ -523,7 +523,7 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     plt.close()
 
 
-def save_separate_graph_visualization(world_graph, pivotal_states, config):
+def save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=None):
     """
     Save a standalone visualization of the world graph, rendering the
     actual feasible paths for each edge.
@@ -558,7 +558,8 @@ def save_separate_graph_visualization(world_graph, pivotal_states, config):
             show_labels=True,
             node_size=250,
             edge_width=1.5,
-            title=f'World Graph (mu0={config["vae_mu0"]}) - Feasible Paths'
+            title=f'World Graph (mu0={config["vae_mu0"]}) - Feasible Paths',
+            grid_state=grid_state
         )
         
         # --- Step 4: Save the figure ---
@@ -579,7 +580,7 @@ def test_phase1_with_diagnostics(config=None):
     Test Phase 1 using alternating_training_loop with diagnostic tracking. 
     """
     default_config = {
-        'maze_size': EnvSizes.SMALL,
+        'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 15,
         'vae_mu0': 10.0,
         'goal_policy_lr': 5e-3,
@@ -655,7 +656,6 @@ def test_phase1_with_diagnostics(config=None):
 
 
     GRIDSTATE=env.getGridState()
-    print_grid_image(GRIDSTATE,name=str(config['vae_mu0']))
 
     # Generate plots (around line 800)
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))  # Changed from (2, 2)
@@ -713,8 +713,8 @@ def test_phase1_with_diagnostics(config=None):
     plt.savefig(f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png', dpi=150)
     print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
     plt.close()
-    
-    save_separate_graph_visualization(world_graph, pivotal_states, config)
+
+    save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
     
     # Summary
     print(f"\n{'='*70}")
@@ -926,8 +926,7 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     )
 
     GRIDSTATE=env.getGridState()
-    print_grid_image(GRIDSTATE,name=str(config['vae_mu0']))
-    save_separate_graph_visualization(world_graph, pivotal_states, config)
+    save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
 
     # After phase 1, before phase 2 setup:
     if recordflag:
@@ -1300,18 +1299,10 @@ def run_phase1_size_comparison():
 
 
 def main():
-    # pygame.init()
-    # env = MinigridWrapper(render_mode="human",size=EnvSizes.EXTRALARGE, mode=EnvModes.MULTIGOAL, phase_one_eps=10)
-    # # #env = FastWrapper("MiniGrid-KeyCorridorS3R2-v0",1000,"human")
-    # # print(os.path.dirname(minigrid.__file__))
-
-    # # enable manual control for testing
-    # manual_control = ManualControl(env, seed=42)
-    # manual_control.start()
-
-    train_full_phase1_phase2(recordflag=False)
-    #run_phase1_comparison()
-    #run_phase1_size_comparison()
+    test_phase1_with_diagnostics()
+    # train_full_phase1_phase2(recordflag=False)  # Phase 1 + Phase 2 together
+    # run_phase1_comparison()
+    # run_phase1_size_comparison()
 
 
 if __name__ == "__main__":

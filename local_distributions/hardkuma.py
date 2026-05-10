@@ -62,39 +62,17 @@ class HardKumaraswamy:
         return log_prob
         
     def kl_divergence(self, other_dist):
-        # KL DIVERGENCE BETWEEN KUMARASWAMY AND BETA DISTRIBUTIONS
-    # BETA DISTRIBUTION PARAMETERS
-        alpha_beta = other_dist.alpha
-        beta_beta = other_dist.beta
-        
-    # KUMARASWAMY DISTRIBUTION PARAMETER
-        alpha_kuma = self.alpha
-        
-    # DIGAMMA TERMS FOR NORMALIZATION
-        psi_alpha = digamma(alpha_beta)
-        psi_beta = digamma(beta_beta)
-        psi_alpha_plus_beta = digamma(alpha_beta + beta_beta)
-        
-    # LOG-GAMMA TERMS FOR NORMALIZATION
-        log_beta_normalizer = lgamma(alpha_beta) + lgamma(beta_beta) - lgamma(alpha_beta + beta_beta)
-
-    # COMBINE ALL TERMS FOR KL
+        # KL DIVERGENCE: Bernoulli surrogate for HardKuma vs Beta prior.
+        # The continuous Kumaraswamy-Beta KL approximation produces systematically
+        # negative values (clipped to 0 by relu), giving zero gradient signal.
+        # Instead we compute KL(Bernoulli(q) || Bernoulli(p)) where:
+        #   q = P(z=1) from HardKuma expected value
+        #   p = alpha/(alpha+beta) = mean of the Beta prior
+        # This is always >= 0 and provides correct gradient to the inference network.
         eps = 1e-8
-        
-        term1 = (1 - 1 / (alpha_kuma + eps)) * (psi_alpha - psi_alpha_plus_beta)
-        term2 = torch.log(alpha_kuma + eps) - psi_beta + psi_alpha_plus_beta
-        term3 = (beta_beta - 1) * torch.log(alpha_kuma + eps) # Simplified term for Kuma beta=1
-        
-    # SIMPLIFIED KL APPROXIMATION
-        kl = (
-            (alpha_beta - 1) * (-1 / (alpha_kuma + eps)) +
-            (beta_beta - 1) * (torch.log(alpha_kuma + eps) - np.euler_gamma) -
-            log_beta_normalizer -
-            torch.log(alpha_kuma + eps)
-        )
-        
-    # KL SHOULD BE NON-NEGATIVE
-        return F.relu(kl)
+        q = self._expected_value().clamp(eps, 1.0 - eps)
+        p = (other_dist.alpha / (other_dist.alpha + other_dist.beta)).clamp(eps, 1.0 - eps)
+        return q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
         
     def expected_l0_norm(self):
         # EXPECTED L0 NORM FOR SPARSITY

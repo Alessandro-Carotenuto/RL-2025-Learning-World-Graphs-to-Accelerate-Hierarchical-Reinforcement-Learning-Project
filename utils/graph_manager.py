@@ -123,27 +123,47 @@ class GraphVisualizer:
     Visualizes GraphManager objects with straight-line edges between nodes.
     """
 
+    # Color map for ASCII grid cells — MiniGrid-style palette
+    _CELL_COLORS = {
+        '#': [40,  40,  40],   # wall  - near black
+        '-': [190, 190, 190],  # empty - light gray
+        'G': [0,   180, 0],    # goal  - green
+        'K': [255, 215, 0],    # key   - gold
+        'D': [140, 70,  20],   # door  - brown
+        'B': [30,  120, 255],  # ball  - blue
+    }
+
     def __init__(self, graph_manager: 'GraphManager', figsize=(12, 10)):
-        """
-        Args:
-            graph_manager: An instance of the GraphManager class.
-            figsize: A tuple specifying the figure size for the plot.
-        """
         self.graph = graph_manager
         self.figsize = figsize
+
+    def _grid_to_image(self, grid_state) -> np.ndarray:
+        """Convert ASCII grid (grid_state[y][x]) to an RGB uint8 image."""
+        h = len(grid_state)
+        w = len(grid_state[0]) if h > 0 else 0
+        img = np.full((h, w, 3), 200, dtype=np.uint8)
+        for y in range(h):
+            for x in range(w):
+                char = grid_state[y][x] if x < len(grid_state[y]) else '-'
+                img[y, x] = self._CELL_COLORS.get(char, [200, 200, 200])
+        return img
 
     def visualize(self,
                   show_weights=True,
                   show_labels=True,
                   node_size=300,
-                  node_color='lightblue',
-                  edge_color='gray',
+                  node_color='#C8A830',
+                  edge_color='#555555',
                   edge_width=1.5,
                   highlight_nodes=None,
                   highlight_color='red',
-                  title="World Graph Visualization"):
+                  title="World Graph Visualization",
+                  grid_state=None):
         """
         Creates a graph visualization with straight-line edges.
+        If grid_state is provided, the MiniGrid map is rendered as background
+        and the graph is overlaid using the same (x, y) coordinate system,
+        with y=0 at the top (MiniGrid convention).
         """
         fig, ax = plt.subplots(figsize=self.figsize)
 
@@ -154,32 +174,39 @@ class GraphVisualizer:
 
         pos = {node: node for node in nodes}
 
-        # --- MODIFIED SECTION for straight-line edges ---
-        for (start, end), edge_data in self.graph.edges.items():
-            # Get the start and end coordinates for a straight line
-            x_coords = [pos[start][0], pos[end][0]]
-            y_coords = [pos[start][1], pos[end][1]]
+        # Background grid (optional)
+        if grid_state is not None:
+            img = self._grid_to_image(grid_state)
+            h, w = img.shape[:2]
+            # extent=[left, right, bottom, top]; bottom > top inverts y so row 0 is at top
+            ax.imshow(img, extent=[-0.5, w - 0.5, h - 0.5, -0.5], zorder=0)
+            ax.set_xlim(-0.5, w - 0.5)
+            ax.set_ylim(h - 0.5, -0.5)  # y=0 at top, y=h at bottom
+        else:
+            x_vals = [n[0] for n in nodes]
+            y_vals = [n[1] for n in nodes]
+            x_min, x_max = min(x_vals), max(x_vals)
+            y_min, y_max = min(y_vals), max(y_vals)
+            x_pad = (x_max - x_min) * 0.1 or 1
+            y_pad = (y_max - y_min) * 0.1 or 1
+            ax.set_xlim(x_min - x_pad, x_max + x_pad)
+            ax.set_ylim(y_max + y_pad, y_min - y_pad)  # y=0 at top
 
-            # Draw the straight line
-            ax.plot(x_coords, y_coords,
-                    color=edge_color,
-                    linewidth=edge_width,
-                    alpha=0.7,
-                    zorder=1)
-            
-            # Place weight labels at the midpoint of the straight line
+        # Draw edges
+        for (start, end), edge_data in self.graph.edges.items():
+            ax.plot([pos[start][0], pos[end][0]],
+                    [pos[start][1], pos[end][1]],
+                    color=edge_color, linewidth=edge_width, alpha=0.7, zorder=1)
+
             if show_weights:
                 weight = edge_data.get('weight', '')
-                mid_point_x = (pos[start][0] + pos[end][0]) / 2
-                mid_point_y = (pos[start][1] + pos[end][1]) / 2
-                ax.text(mid_point_x, mid_point_y, str(weight),
-                        fontsize=8,
-                        ha='center',
-                        va='center',
+                mid_x = (pos[start][0] + pos[end][0]) / 2
+                mid_y = (pos[start][1] + pos[end][1]) / 2
+                ax.text(mid_x, mid_y, str(weight), fontsize=8, ha='center', va='center',
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8),
                         zorder=3)
 
-        # --- UNCHANGED SECTION: Draw Nodes and Labels ---
+        # Draw nodes
         for node in nodes:
             x, y = pos[node]
             color = highlight_color if (highlight_nodes and node in highlight_nodes) else node_color
@@ -188,23 +215,10 @@ class GraphVisualizer:
                 ax.annotate(f'{node}', (x, y), xytext=(5, 5), textcoords='offset points',
                             fontsize=9, ha='left', zorder=4)
 
-        # Formatting (unchanged)
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.set_xlabel('X Coordinate', fontsize=12)
         ax.set_ylabel('Y Coordinate', fontsize=12)
         ax.grid(True, alpha=0.3)
-        ax.invert_yaxis()
-
-        if nodes:
-            x_coords = [node[0] for node in nodes]
-            y_coords = [node[1] for node in nodes]
-            x_min, x_max = min(x_coords), max(x_coords)
-            y_min, y_max = min(y_coords), max(y_coords)
-            x_pad = (x_max - x_min) * 0.1 or 1
-            y_pad = (y_max - y_min) * 0.1 or 1
-            ax.set_xlim(x_min - x_pad, x_max + x_pad)
-            ax.set_ylim(y_max + y_pad, y_min - y_pad)
-
         plt.tight_layout()
         return fig, ax
 

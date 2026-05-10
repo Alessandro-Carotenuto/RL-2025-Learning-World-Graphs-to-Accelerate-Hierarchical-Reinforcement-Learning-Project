@@ -553,15 +553,16 @@ class GoalConditionedPolicy(nn.Module):
         
         for (start_state, end_state), raw_path in raw_edges.items():
             print(f"  Refining {start_state} -> {end_state}")
-            
+
             try:
+                self.hidden_state = None
                 env.reset()
                 env.agent_pos = start_state
                 env.agent_dir = 0
                 current_pos = start_state
                 
                 refined_path = [start_state]
-                max_refinement_steps = len(raw_path) + 5
+                max_refinement_steps = len(raw_path) * 5 + 20
                 
                 for step in range(max_refinement_steps):
                     action, log_prob, value = self.get_action(current_pos, end_state)

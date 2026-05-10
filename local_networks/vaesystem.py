@@ -253,9 +253,8 @@ class VAESystem(nn.Module):
         
         # Lagrangian multipliers (learnable parameters for automatic weight tuning)
         self.lambda_kl = nn.Parameter(torch.tensor(1.0))      # KL divergence weight
-        self.lambda_l0 = nn.Parameter(torch.tensor(2.0))      # L0 sparsity weight  
-        self.lambda_lt = nn.Parameter(torch.tensor(0.5))      # Transition weight
-        
+        self.lambda_l0 = nn.Parameter(torch.tensor(2.0))      # L0 sparsity weight
+
         # Optimizers
         self.vae_optimizer = optim.Adam(
             list(self.state_encoder.parameters()) +
@@ -265,10 +264,10 @@ class VAESystem(nn.Module):
             list(self.generation_net.parameters()),
             lr=1e-5
         )
-        
+
         self.lambda_optimizer = optim.Adam(
-            [self.lambda_kl, self.lambda_l0, self.lambda_lt],
-            lr=1e-5
+            [self.lambda_kl, self.lambda_l0],
+            lr=1e-3
         )
         
         # Training state
@@ -399,25 +398,19 @@ class VAESystem(nn.Module):
         raw_kl = masked_kl.sum() / mask.sum().clamp(min=1)
 
         # Free bits for λ_KL term
-        free_bits_threshold = 0.01  # Minimum KL per timestep
+        free_bits_threshold = 0.1  # λ_KL stops growing when KL drops below this
         kl_loss_contribution = torch.maximum(
-            raw_kl - free_bits_threshold, 
+            raw_kl - free_bits_threshold,
             torch.tensor(0.0, device=self.device)
         )
 
-        # NEW: KL floor penalty (uses raw KL, not free-bits version)
-        kl_floor = 0.2 # Target minimum KL per timestep
-        kl_penalty = F.relu(kl_floor - raw_kl) * 25.0  # Penalty if KL drops too low
+        # Mild floor to prevent KL collapse (kl_floor << original 0.2 to avoid fighting λ_KL)
+        kl_floor = 0.05
+        kl_penalty = F.relu(kl_floor - raw_kl) * 5.0
 
         expected_l0 = hardkuma_dist.expected_l0_norm() / batch_size
-        target_l0 = self.mu0 
+        target_l0 = self.mu0
         l0_loss = torch.pow(expected_l0 - target_l0, 2)
-        
-        z_diff = torch.abs(z_samples[:, 1:] - z_samples[:, :-1])
-        seq_mask = torch.arange(seq_len-1, device=self.device).unsqueeze(0) < (seq_lengths-1).unsqueeze(1).to(self.device)
-        masked_transitions = torch.where(seq_mask, z_diff, torch.zeros_like(z_diff))
-        expected_transitions = masked_transitions.sum() / (seq_mask.sum().clamp(min=1) * batch_size)
-        lt_loss = torch.pow(expected_transitions - 2 * self.mu0, 2)
 
         # Optional diagnostics
         if torch.rand(1) < 0.01 and diagvae==True:
@@ -434,23 +427,20 @@ class VAESystem(nn.Module):
 
         # --- Step 9: Final Loss (includes penalty) ---
         total_loss = (
-            reconstruction_loss + 
+            reconstruction_loss +
             kl_weight * torch.abs(self.lambda_kl) * kl_loss_contribution +
-            torch.abs(self.lambda_l0) * l0_loss + 
-            torch.abs(self.lambda_lt) * lt_loss +
-            kl_penalty  # NEW: Prevents KL collapse
+            torch.abs(self.lambda_l0) * l0_loss +
+            kl_penalty
         )
         
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
-            'kl_divergence': raw_kl,  # Return raw KL for monitoring
+            'kl_divergence': raw_kl,
             'kl_contribution': kl_loss_contribution,
-            'kl_penalty': kl_penalty,  # NEW: Track penalty
+            'kl_penalty': kl_penalty,
             'l0_loss': l0_loss,
-            'lt_loss': lt_loss,
             'expected_l0': expected_l0,
-            'expected_transitions': expected_transitions,
             'z_samples': z_samples.detach(),
         }
     
@@ -536,15 +526,13 @@ class VAESystem(nn.Module):
         with torch.no_grad():
             self.lambda_kl.grad = -self.lambda_kl.grad
             self.lambda_l0.grad = -self.lambda_l0.grad
-            self.lambda_lt.grad = -self.lambda_lt.grad
-        
+
         self.lambda_optimizer.step()  # Now it maximizes!
-        
+
         # Clamp lambdas
         with torch.no_grad():
-            self.lambda_kl.data.clamp_(0.1, 500.0)
+            self.lambda_kl.data.clamp_(0.1, 15.0)
             self.lambda_l0.data.clamp_(0.01, 10.0)
-            self.lambda_lt.data.clamp_(0.01, 10.0)
         
         # Log losses
         logged_losses = {
@@ -673,17 +661,16 @@ class VAESystem(nn.Module):
 
             # Print progress
             if epoch % 1 == 0:
-                print(f"Epoch {epoch:3d}: Loss={avg_losses['total_loss']:.4f}, "
+                n_eps = len(all_trajectories)
+                avg_loss_per_ep = avg_losses['total_loss'] / max(n_eps, 1)
+                print(f"Epoch {epoch:3d}: Loss={avg_losses['total_loss']:.1f} ({avg_loss_per_ep:.3f}/ep), "
                       f"Recon={avg_losses['reconstruction_loss']:.4f}, "
-                      f"KL Contribution={avg_losses['kl_contribution']:.4f}, "
-                      f"L0={avg_losses['expected_l0']:.2f}, "
-                      f"KL_Weight={kl_weight:.2f}") # <-- MODIFIED: Log the weight
-                print(f"λ_KL: {self.lambda_kl.item():.3f}, "
-                    f"λ_L0: {self.lambda_l0.item():.3f}, "
-                    f"KL divergence: {avg_losses['kl_divergence']:.4f}")
+                      f"KL={avg_losses['kl_divergence']:.4f}, KLc={avg_losses['kl_contribution']:.4f}, "
+                      f"L0={avg_losses['expected_l0']:.2f}")
+                print(f"  λ_KL={self.lambda_kl.item():.3f}, λ_L0={self.lambda_l0.item():.3f}")
             
-            # Check for convergence
-            current_loss = avg_losses['total_loss']
+            # Check for convergence on reconstruction (total_loss grows with buffer size and λ)
+            current_loss = avg_losses['reconstruction_loss']
             if current_loss < best_loss - convergence_threshold:
                 best_loss = current_loss
                 patience_counter = 0

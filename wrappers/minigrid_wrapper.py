@@ -651,7 +651,8 @@ class MinigridWrapper(MiniGridEnv):
                     print(EL, end='')
                 row.append(EL)
             ASCIIGRID.append(row)
-            print()
+            if view:
+                print()
         return ASCIIGRID
     
     # STARTS GRID GENERATION
