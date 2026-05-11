@@ -149,7 +149,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 obs = env.reset()
                 start_pos = tuple(env.agent_pos)
                 episodes = policy.collect_episodes_from_position(
-                    env, start_pos, num_episodes=6, vae_system=vae_system
+                    env, start_pos, num_episodes=6, max_episode_length=100, vae_system=vae_system
                 )
                 if episodes:
                     buffer.add_episodes(episodes)
@@ -184,12 +184,19 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
         # Phase 2: Collect trajectories from pivotal states
-        print(f"Second Half: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
-        
+        COVERAGE_THRESHOLD = 50
+        if len(pivotal_states) < COVERAGE_THRESHOLD:
+            states_to_explore = pivotal_states
+            print(f"Second Half: Collecting from ALL {len(pivotal_states)} pivotal states (coverage phase, target={COVERAGE_THRESHOLD})...")
+        else:
+            top_n = max(1, len(pivotal_states) // 5)  # top 20%
+            states_to_explore = pivotal_states[:top_n]
+            print(f"Second Half: Collecting from top 20% ({top_n}/{len(pivotal_states)}) pivotal states...")
+
         episodes_collected = 0
         success_count = 0
-        for i, start_state in enumerate(pivotal_states[:10]):
-            print(f"  Collecting from pivotal state {i+1}: {start_state}")
+        for i, start_state in enumerate(states_to_explore):
+            print(f"  Collecting from pivotal state {i+1}/{len(states_to_explore)}: {start_state}")
             
             # Start curiosity only after first iteration
             if iteration == 0:
@@ -203,7 +210,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 episodes = policy.collect_episodes_from_position(
                     env, start_state,
                     num_episodes=10,
-                    max_episode_length=50,  # Increased from 25
+                    max_episode_length=100,
                     vae_system=vae_system,
                     curiosity_weight=curiosity_weight
                 )
@@ -227,16 +234,16 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"  Collected {episodes_collected} new episodes")
         print(f"  Total episodes in buffer: {buffer.episodes_in_buffer}")
         
-        # Check for convergence
-        if len(reconstruction_losses) >= 3:
+        # Check for convergence (not before min_iterations to ensure coverage)
+        MIN_ITERATIONS = 5
+        if len(reconstruction_losses) >= 3 and iteration + 1 >= MIN_ITERATIONS:
             recent_losses = reconstruction_losses[-3:]
             loss_changes = [abs(recent_losses[i] - recent_losses[i-1]) for i in range(1, len(recent_losses))]
             avg_change = sum(loss_changes) / len(loss_changes)
-            
+
             print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
-            
+
             if fast_training:
-                #threshold_reconstruction_loss=0.05
                 threshold_reconstruction_loss=0.01
             else:
                 threshold_reconstruction_loss=0.005
@@ -252,7 +259,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             random_start = tuple(env.agent_pos)
             try:
                 random_episodes = policy.collect_episodes_from_position(
-                    env, random_start, num_episodes=6, vae_system=vae_system
+                    env, random_start, num_episodes=6, max_episode_length=100, vae_system=vae_system
                 )
                 if random_episodes:
                     buffer.add_episodes(random_episodes)
@@ -269,8 +276,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     print(f"Final episodes in buffer: {buffer.episodes_in_buffer}")
     print(f"Final pivotal states ({len(pivotal_states)}): {pivotal_states}")
     
-    # CHANGE RETURN - Add metrics
-    return pivotal_states, world_graph, metrics
+    return pivotal_states, world_graph, metrics, all_pivotal_states
 
 # PLOT AND DIAGNOSTICS -------------------------------------------------------
 
@@ -595,6 +601,141 @@ def save_separate_graph_visualization(world_graph, pivotal_states, config, grid_
         if 'fig' in locals():
             plt.close(fig)
 
+def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_evolution.gif', fps=2):
+    """One frame per Phase 1 iteration — same style as the final graph visualization."""
+    if not all_pivotal_states_history:
+        print("No Phase 1 history to animate.")
+        return
+
+    frames = []
+    total = len(all_pivotal_states_history)
+
+    for iteration, pivotal_states in enumerate(all_pivotal_states_history):
+        temp_graph = GraphManager()
+        for ps in pivotal_states:
+            temp_graph.add_node(ps)
+
+        viz = GraphVisualizer(temp_graph, figsize=(10, 10))
+        fig, ax = viz.visualize(
+            show_weights=False,
+            show_labels=True,
+            node_size=250,
+            edge_width=1.5,
+            title=f'Phase 1 — Iteration {iteration + 1}/{total}  |  {len(pivotal_states)} pivotal states',
+            grid_state=grid_state,
+        )
+
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape((height, width, 3))
+        frames.append(frame)
+        plt.close(fig)
+
+    imageio.mimsave(filename, frames, fps=fps)
+    print(f"Phase 1 evolution GIF saved to '{filename}' ({len(frames)} frames)")
+
+
+def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp4', fps=15, max_steps=500):
+    """
+    Standalone: load checkpoint + session file, run one greedy episode, save as MP4.
+    Call this after training from anywhere — no training objects needed.
+    Requires: checkpoint .pt  +  checkpoint _session.pt (saved automatically at end of Phase 2).
+    """
+    pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
+
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    session = torch.load(session_path, map_location='cpu', weights_only=False)
+    agent_start = session['agent_start']
+    ball_positions = session['ball_positions']
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        device='cpu',
+    )
+    manager.load_state_dict(session['manager_state_dict'])
+    manager.eval()
+
+    worker = HierarchicalWorker(
+        world_graph,
+        pivotal_states,
+        lr=config['worker_lr'],
+        device='cpu',
+    )
+    worker.load_state_dict(session['worker_state_dict'])
+    worker.eval()
+
+    _run_and_save_episode(manager, worker, config, grid_state, agent_start, ball_positions, filename, fps, max_steps)
+
+
+def render_phase2_episode_gif_from_objects(manager, worker, config, grid_state, agent_start_pos,
+                                           ball_positions=None, filename='phase2_final_episode.mp4',
+                                           fps=15, max_steps=500):
+    """
+    Run one greedy episode with trained manager/worker and save as MP4.
+    Called at end of training when all objects are in memory.
+    """
+    _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos, ball_positions, filename, fps, max_steps)
+
+
+def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
+                          ball_positions, filename, fps, max_steps):
+    env = MinigridWrapper(
+        size=config['maze_size'],
+        mode=EnvModes.MULTIGOAL,
+        max_steps=config['max_steps_per_episode'],
+        render_mode='rgb_array',
+    )
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.agent_start_pos = agent_start_pos
+    env.agent_pos = agent_start_pos
+    env.placeable_grid[agent_start_pos[0]][agent_start_pos[1]] = False
+    env.firstgen = False
+    env.phase = 2
+    if ball_positions is not None:
+        env.fixed_ball_positions = ball_positions
+
+    env.reset()
+    state = tuple(env.agent_pos)
+    manager.reset_manager_state()
+    worker.reset_worker_state()
+
+    frames = [env.render()]
+    done = False
+    step = 0
+    horizon_step = 0
+    wide_goal = manager.pivotal_states[0]
+    narrow_goal = manager.pivotal_states[0]
+
+    with torch.no_grad():
+        while not done and step < max_steps:
+            if horizon_step == 0:
+                wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999)
+                if manager.hidden_state is not None:
+                    manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
+            action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
+            try:
+                obs, _, terminated, truncated, _ = env.step(action)
+            except (AssertionError, IndexError):
+                terminated, truncated = False, False
+            state = tuple(env.agent_pos)
+            frames.append(env.render())
+            done = terminated or truncated
+            step += 1
+            horizon_step = (horizon_step + 1) % config['manager_horizon']
+
+    writer = imageio.get_writer(filename, fps=fps, format='ffmpeg')
+    for frame in frames:
+        writer.append_data(np.array(frame, dtype=np.uint8))
+    writer.close()
+    print(f"Phase 2 video saved to '{filename}' ({len(frames)} frames, {len(frames)/fps:.1f}s)")
+
+
 def test_phase1_with_diagnostics(config=None):
     """
     Test Phase 1 using alternating_training_loop with diagnostic tracking. 
@@ -632,8 +773,8 @@ def test_phase1_with_diagnostics(config=None):
     buffer = StatBuffer()
     
     # Run alternating training (now with persistent KL)
-    pivotal_states, world_graph, loop_metrics = alternating_training_loop(
-        env, policy, vae_system, buffer, 
+    pivotal_states, world_graph, loop_metrics, _ = alternating_training_loop(
+        env, policy, vae_system, buffer,
         max_iterations=config['phase1_iterations']
     )
     
@@ -950,7 +1091,8 @@ def restore_maze_from_grid_state(env, grid_state):
     env.placeable_grid[env.agent_start_pos[0]][env.agent_start_pos[1]] = False
 
 
-def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrides=None, fixed_balls=True):
+def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrides=None, fixed_balls=True,
+                          phase2_animation=False):
     """Run Phase 2 training using a saved Phase 1 checkpoint.
     fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
     fixed_balls=False: random ball positions every episode
@@ -1000,7 +1142,12 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         env.fixed_ball_positions = first_balls
         print(f"Fixed ball positions: {first_balls}")
     else:
+        first_balls = None
         print("Ball positions: random each episode")
+
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    torch.save({'agent_start': agent_start, 'ball_positions': first_balls}, session_path)
+    print(f"Session saved to '{session_path}'")
 
     manager = HierarchicalManager(
         pivotal_states,
@@ -1033,13 +1180,12 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
     print("\nPHASE 2: Hierarchical Training (standalone)")
     metrics = {'rewards': [], 'steps': [], 'manager_updates': [], 'worker_updates': [], 'times': [], 'optimal_rewards': []}
 
+    debug_interval = max(1, config['phase2_episodes'] // 20)
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
-        if episode % 10 == 0 and episode > 0:
-            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} ---")
         stats = trainer.train_episode(
             max_steps=config['max_steps_per_episode'],
-            full_breakdown_every=config['full_breakdown_every'],
+            full_breakdown_every=debug_interval,
         )
         metrics['rewards'].append(stats['episode_reward'])
         metrics['steps'].append(stats['episode_steps'])
@@ -1047,11 +1193,31 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
         metrics['optimal_rewards'].append(stats['optimal_reward'])
+        if episode % debug_interval == 0 and episode > 0:
+            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
 
     print("\n" + "="*70)
     print("PHASE 2 COMPLETE")
     print("="*70)
     plot_training_diagnostics(trainer, config)
+
+    # Update session with trained weights
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    torch.save({
+        'agent_start': agent_start,
+        'ball_positions': first_balls,
+        'manager_state_dict': manager.state_dict(),
+        'worker_state_dict': worker.state_dict(),
+    }, session_path)
+    print(f"Session updated with trained weights: '{session_path}'")
+
+    if phase2_animation:
+        render_phase2_episode_gif_from_objects(
+            manager, worker, config, grid_state,
+            agent_start_pos=agent_start,
+            ball_positions=first_balls,
+        )
+
     print(f"Best reward: {max(metrics['rewards']):.2f}")
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:]) / 10:.2f}")
     return metrics
@@ -1063,7 +1229,7 @@ steps=2000
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 50,
-        'phase2_episodes': 500,
+        'phase2_episodes': 200,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//120,
         'neighborhood_size': math.ceil(24/4),
@@ -1071,14 +1237,15 @@ externalconfig = {
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
         'diagnostic_interval': 10000,
-        'diagnostic_checkstart': True,
-        'full_breakdown_every': 10,  
+        'diagnostic_checkstart': False,
+        'full_breakdown_every': 10,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
 fast_training_toggle=True
 
-def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_toggle, recordflag=False):
+def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_toggle, recordflag=False,
+                             phase1_animation=True, phase2_animation=True):
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
 
@@ -1111,7 +1278,7 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     print("\nPHASE 1: World Graph Discovery")
     start_time = time.time()
     
-    pivotal_states, world_graph, stat_buffer = alternating_training_loop(
+    pivotal_states, world_graph, stat_buffer, all_pivotal_states = alternating_training_loop(
         env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
         fast_training=fast_training
     )
@@ -1130,6 +1297,9 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
 
     GRIDSTATE=env.getGridState()
     save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
+
+    if phase1_animation:
+        create_phase1_gif(all_pivotal_states, GRIDSTATE)
 
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
@@ -1190,30 +1360,23 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         'optimal_rewards': []
     }
     
+    debug_interval = max(1, config['phase2_episodes'] // 20)
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
-        if episode%10 == 0 and episode > 0:
-            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} ---")
         stats = trainer.train_episode(
-        max_steps=config['max_steps_per_episode'],
-        full_breakdown_every=config['full_breakdown_every'],
-        recording_data=recording_data if recordflag else None
-    )
-        
+            max_steps=config['max_steps_per_episode'],
+            full_breakdown_every=debug_interval,
+            recording_data=recording_data if recordflag else None
+        )
+
         metrics['rewards'].append(stats['episode_reward'])
         metrics['steps'].append(stats['episode_steps'])
         metrics['manager_updates'].append(stats['manager_updates'])
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
         metrics['optimal_rewards'].append(stats['optimal_reward'])
-        
-        
-        #OLD METRICS, NOW IN HIERARCHICAL SISTEM
-        # if (episode + 1) % 10 == 0:
-        #     recent = metrics['rewards'][-10:]
-        #     print(f"Ep {episode+1}: avg_reward={sum(recent)/10:.2f}, "
-        #           f"last={stats['episode_reward']:.2f}, "
-        #           f"time={metrics['times'][-1]:.1f}s")
+        if episode % debug_interval == 0 and episode > 0:
+            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
     
     # AFTER all episodes complete - NOW plot the diagnostics
     print("\n" + "="*70)
@@ -1279,6 +1442,23 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     if recordflag and recording_data['good_episode'] is not None:
         replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4')
 
+    # Save trained weights to session
+    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    torch.save({
+        'agent_start': env.agent_start_pos,
+        'ball_positions': None,
+        'manager_state_dict': manager.state_dict(),
+        'worker_state_dict': worker.state_dict(),
+    }, session_path)
+    print(f"Session updated with trained weights: '{session_path}'")
+
+    if phase2_animation:
+        render_phase2_episode_gif_from_objects(
+            manager, worker, config, GRIDSTATE,
+            agent_start_pos=env.agent_start_pos,
+        )
+
 
 def run_phase1_comparison():
     """
@@ -1333,7 +1513,7 @@ def run_phase1_comparison():
         base_env.phase = 1
         
         # Run training
-        pivotal_states, world_graph, metrics = alternating_training_loop(
+        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
             base_env, policy, vae_system, buffer,
             max_iterations=iterations,
             fast_training=True
@@ -1441,7 +1621,7 @@ def run_phase1_size_comparison():
         buffer = StatBuffer()
         
         # Train
-        pivotal_states, world_graph, metrics = alternating_training_loop(
+        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
             env, policy, vae_system, buffer,
             max_iterations=iterations,
             fast_training=True
@@ -1506,8 +1686,8 @@ def run_phase1_size_comparison():
 
 def main():
     #test_phase1_with_diagnostics()
-    # train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
-    run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True)  # fixed_balls=False for random
+    train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    # run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True)  # fixed_balls=False for random
     # run_phase1_comparison()
     # run_phase1_size_comparison()
 

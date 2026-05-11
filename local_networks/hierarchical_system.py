@@ -1243,5 +1243,6 @@ class HierarchicalTrainer:
             'unique_manager_goals': len(unique_manager_goals),
             'goal_diversity_history': None,
             'optimal_reward': optimal_reward,
-            'optimal_steps': optimal_steps
+            'optimal_steps': optimal_steps,
+            'balls_collected': balls_collected,
         }
