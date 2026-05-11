@@ -78,6 +78,7 @@ class MinigridWrapper(MiniGridEnv):
         self.active_balls = set()  # Track ball positions
         self.total_balls = 0
         self.balls_collected = 0
+        self.fixed_ball_positions = None  # If set, use fixed positions every episode
 
         # ------------------------------------------------------
 
@@ -594,27 +595,30 @@ class MinigridWrapper(MiniGridEnv):
     
     def ResetMultiGoals(self, playerpos, goals=5):
         self.removeitems()
-        reachables = self.BFS_all_reachable(playerpos)
-        
-        ballpos = []
-        for i in range(goals):
-            px = playerpos[0]
-            py = playerpos[1]
-            while (px == playerpos[0] and py == playerpos[1]):
-                point = random.randint(0, len(reachables)-1)
-                px = reachables[point][0]
-                py = reachables[point][1]
-                
-            self.grid.set(px, py, Ball(COLOR_NAMES[i]))
-            #print("BALL PLACED", px, py)
-            self.placeable_grid[px][py] = False
-            ballpos.append((px, py))
-        
-        # Track active balls
+
+        if self.fixed_ball_positions is not None:
+            ballpos = list(self.fixed_ball_positions)
+            for i, (px, py) in enumerate(ballpos):
+                self.grid.set(px, py, Ball(COLOR_NAMES[i % len(COLOR_NAMES)]))
+                self.placeable_grid[px][py] = False
+        else:
+            reachables = self.BFS_all_reachable(playerpos)
+            ballpos = []
+            for i in range(goals):
+                px = playerpos[0]
+                py = playerpos[1]
+                while (px == playerpos[0] and py == playerpos[1]):
+                    point = random.randint(0, len(reachables)-1)
+                    px = reachables[point][0]
+                    py = reachables[point][1]
+                self.grid.set(px, py, Ball(COLOR_NAMES[i]))
+                self.placeable_grid[px][py] = False
+                ballpos.append((px, py))
+
         self.active_balls = set(ballpos)
         self.total_balls = len(ballpos)
         self.balls_collected = 0
-        
+
         return ballpos
 
     def EasyGeneralPurposeMap(self):

@@ -149,61 +149,46 @@ class HierarchicalManager(nn.Module):
         return narrow_goal, narrow_log_prob
     
     def get_manager_action(self, state: Tuple[int, int], step_count: int = 0):
-        # COMPLETE GOAL SELECTION WITH DIAGNOSTICS
-        
-    # DIAGNOSTIC PRINTING
-        if self.diagnostic_checkstart and step_count < 15:
-            verbose = True
-        elif step_count % self.diagnostic_interval == 0:
-            verbose = True
-        else:
-            verbose = False
-        
+        verbose = (self.diagnostic_checkstart and step_count < 15) or (step_count % self.diagnostic_interval == 0)
+
         if verbose:
             print(f"\n[Manager Action] Step {step_count}")
             print(f"  Current state: {state}")
-            print(f"  Hidden state exists: {self.hidden_state is not None}")
             if self.hidden_state is not None:
                 h, c = self.hidden_state
                 print(f"  Hidden state norms: h={h.norm().item():.3f}, c={c.norm().item():.3f}")
-        
-    # WIDE GOAL SELECTION
-        wide_idx, wide_log_prob, value = self.select_wide_goal(state)
-        wide_goal = self.pivotal_states[wide_idx]
-        
-    # DIAGNOSTIC DISTRIBUTION
+
+        # Pass 1: wide goal — also captures logits/entropy without an extra forward
+        wide_logits, _, value = self.forward(state)
+        wide_probs = F.softmax(wide_logits, dim=0)
+        entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
+
+        wide_dist = torch.distributions.Categorical(wide_probs)
+        wide_idx = wide_dist.sample()
+        wide_log_prob = wide_dist.log_prob(wide_idx)
+        wide_goal = self.pivotal_states[wide_idx.item()]
+        self.prev_wide_goal = wide_goal  # updated before pass 2
+
         if verbose:
-            with torch.no_grad():
-                wide_logits, _, _ = self.forward(state)
-                wide_probs = F.softmax(wide_logits, dim=0)
-                
-                # Top 5 logits and probs
-                top_k = min(5, len(wide_logits))
-                top_logits, top_indices = wide_logits.topk(top_k)
-                top_probs = wide_probs[top_indices]
-                
-                print(f"  Wide goal selection:")
-                print(f"    Top {top_k} logits: {top_logits.tolist()}")
-                print(f"    Top {top_k} probs: {top_probs.tolist()}")
-                print(f"    Selected idx: {wide_idx}, goal: {wide_goal}")
-                
-                # Entropy
-                entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
-                max_entropy = torch.log(torch.tensor(float(len(self.pivotal_states))))
-                print(f"    Entropy: {entropy.item():.3f} / {max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
-        
-    # NARROW GOAL SELECTION
+            top_k = min(5, len(wide_logits))
+            top_logits, top_indices = wide_logits.topk(top_k)
+            max_entropy = torch.log(torch.tensor(float(len(self.pivotal_states))))
+            print(f"  Wide goal selection:")
+            print(f"    Top {top_k} logits: {top_logits.tolist()}")
+            print(f"    Top {top_k} probs: {wide_probs[top_indices].tolist()}")
+            print(f"    Selected idx: {wide_idx.item()}, goal: {wide_goal}")
+            print(f"    Entropy: {entropy.item():.3f}/{max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
+
+        # Pass 2: narrow goal — LSTM now sees updated prev_wide_goal as context
         narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal)
-        
-    # COMBINED LOG PROBABILITY
         combined_log_prob = wide_log_prob + narrow_log_prob
-        
+
         if verbose:
             print(f"  Narrow goal: {narrow_goal}")
             print(f"  Combined log prob: {combined_log_prob.item():.3f}")
-            print(f"  Value estimate: {value.item():.3f}")
-        
-        return wide_goal, narrow_goal, combined_log_prob, value
+            print(f"  Value: {value.squeeze().item():.3f}")
+
+        return wide_goal, narrow_goal, combined_log_prob, value.squeeze(), entropy
         
     # TRANSFER LEARNING INITIALIZATION (COMMENTED OUT)
     # def initialize_from_goal_policy(self, goal_policy):
@@ -266,6 +251,10 @@ class HierarchicalManager(nn.Module):
         if len(rewards) == 0:
             return
         
+        # Skip single-sample batches (can't normalize advantages)
+        if len(rewards) <= 1:
+            return
+
         # Diagnostic printing
         if self.diagnostic_checkstart and step_count < 15:
             verbose = True
@@ -273,28 +262,28 @@ class HierarchicalManager(nn.Module):
             verbose = True
         else:
             verbose = False
-        
+
         if verbose:
             print(f"\n{'='*70}")
             print(f"[Manager Update Debug] Step {step_count}")
             print(f"{'='*70}")
-        
+
         # Convert to tensors
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         values_tensor = torch.stack(values).squeeze()
         log_probs_tensor = torch.stack(log_probs)
         wide_entropies_tensor = torch.stack(entropies)  # These are wide entropies from get_manager_action
-        
+
         # Fix dimensions
         if values_tensor.dim() == 0:
             values_tensor = values_tensor.unsqueeze(0)
         if rewards_tensor.dim() == 0:
             rewards_tensor = rewards_tensor.unsqueeze(0)
-        
+
         if verbose:
             print(f"Batch size: {len(rewards)}")
             print(f"Rewards: {rewards_tensor.tolist()}")
-        
+
         # Compute returns
         returns = []
         R = 0
@@ -302,7 +291,7 @@ class HierarchicalManager(nn.Module):
             R = r + self.gamma * R
             returns.insert(0, R)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        
+
         # GAE
         gae_lambda = 0.95
         advantages = torch.zeros_like(rewards_tensor)
@@ -314,35 +303,34 @@ class HierarchicalManager(nn.Module):
                 delta = rewards_tensor[t] + self.gamma * values_tensor[t + 1] - values_tensor[t]
             gae = delta + self.gamma * gae_lambda * gae
             advantages[t] = gae
-        
+
         # Normalize advantages
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+        raw_advantages = advantages.clone()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = advantages.clamp(-3.0, 3.0)
+
         # Policy and value losses
         policy_loss = -(advantages.detach() * log_probs_tensor).mean()
         value_loss = F.mse_loss(values_tensor, returns)
 
-        print(f"  Advantages (raw): {advantages[:3].tolist()}")
-        print(f"  Advantages (normalized): {advantages[:3].tolist()}")  # after normalization
-        print(f"  Policy loss: {policy_loss.item():.4f}")
+        if verbose:
+            print(f"  Advantages (raw): {raw_advantages[:3].tolist()}")
+            print(f"  Advantages (normalized): {advantages[:3].tolist()}")
+            print(f"  Policy loss: {policy_loss.item():.4f}")
         
-        # Compute narrow entropy: E_gw[H(π^n|gw)]
+        # Compute narrow entropy — save/restore hidden state so the loop
+        # does not corrupt the recurrent state used outside this update
+        saved_hidden = tuple(h.detach().clone() for h in self.hidden_state) if self.hidden_state else None
         narrow_entropies = []
-        for i, (state, wide_goal) in enumerate(zip(states, wide_goals)):
-            # Recompute narrow distribution for this state and wide goal
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
-            wide_logits, features, _ = self.forward(state)
-            
-            # Get narrow logits
-            wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
-            narrow_input = torch.cat([features, wide_goal_tensor])
+        for state_i, wide_goal_i in zip(states, wide_goals):
+            _, features_i, _ = self.forward(state_i)
+            wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
+            narrow_input = torch.cat([features_i, wide_goal_tensor])
             narrow_logits = self.narrow_head(narrow_input)
-            
-            # Compute entropy
             narrow_probs = F.softmax(narrow_logits, dim=0)
             narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
             narrow_entropies.append(narrow_entropy)
+        self.hidden_state = saved_hidden
         
         narrow_entropy_mean = torch.stack(narrow_entropies).mean()
         wide_entropy_mean = wide_entropies_tensor.mean()
@@ -428,7 +416,7 @@ class HierarchicalWorker(nn.Module):
         # Hyperparameters
         self.gamma = 0.99
         self.entropy_coef = 0.01
-        self.value_coef = 0.1
+        self.value_coef = 0.5
     
     def reset_worker_state(self):
         """Reset LSTM hidden state and traversal state."""
@@ -444,39 +432,44 @@ class HierarchicalWorker(nn.Module):
     
     def plan_traversal(self, current_state: Tuple[int, int], target_state: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
         """
-        Plan graph traversal from current pivotal state to target pivotal state.
-        Paper: "estimate optimal traversal route based on edge weights using dynamic programming"
+        Plan graph traversal from current pivotal state toward target pivotal state.
+        First tries a direct Dijkstra path; if unreachable, falls back to the closest
+        reachable pivotal node to target (best-effort traversal).
         """
         if not self.is_at_pivotal_state(current_state):
             return None
-        
         if not self.is_at_pivotal_state(target_state):
             return None
-        
-        # Use GraphManager's shortest path (Dijkstra)
-        path, distance = self.world_graph.shortest_path(current_state, target_state)
-        
+
+        # Primary: exact path to target
+        path, _ = self.world_graph.shortest_path(current_state, target_state)
         if path and len(path) > 1:
             return path
-        
+
+        # Best-effort: route to closest reachable pivotal state to target
+        reachable = self.world_graph.get_reachable_nodes(current_state)
+        reachable.discard(current_state)
+        if not reachable:
+            return None
+
+        best_node = min(reachable,
+                        key=lambda n: abs(n[0] - target_state[0]) + abs(n[1] - target_state[1]))
+        path, _ = self.world_graph.shortest_path(current_state, best_node)
+        if path and len(path) > 1:
+            return path
+
         return None
-    
+
     def should_traverse(self, current_state: Tuple[int, int], wide_goal: Tuple[int, int]) -> bool:
         """
         Determine if Worker should initiate graph traversal.
         Paper: "Worker can traverse via world graph if it encounters pivotal state g'w with feasible connection to gw"
         """
-        # Check if at pivotal state
         if not self.is_at_pivotal_state(current_state):
             return False
-        
-        # Check if not already at target
         if current_state == wide_goal:
             return False
-        
-        # Check if path exists in graph
         path = self.plan_traversal(current_state, wide_goal)
-        
         return path is not None
     
     def forward(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -519,6 +512,7 @@ class HierarchicalWorker(nn.Module):
             if path:
                 self.current_traversal_path = path
                 self.traversal_step = 0
+                self._traversal_starts_this_episode = getattr(self, '_traversal_starts_this_episode', 0) + 1
                 if diag:
                     print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
                     print(f"  - Target (gw): {wide_goal}")
@@ -638,14 +632,6 @@ class HierarchicalWorker(nn.Module):
         else:  # diff == 3
             # Target is 1 turn left away (or 3 turns right)
             return 0  # turn_left
-
-    def reset_worker_state(self):
-        """Reset LSTM hidden state and traversal state."""
-        self.hidden_state = None
-        self.current_traversal_path = []
-        self.traversal_step = 0
-        self.current_edge_step = 0
-        self.orientation_complete = False  # NEW: Reset orientation flag
 
     def compute_reward(self, current_state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> float:
         """
@@ -777,6 +763,7 @@ class HierarchicalWorker(nn.Module):
         # Update
         self.optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
         self.optimizer.step()
 
     def generate_actions_from_path(self, path, current_agent_dir):
@@ -849,7 +836,7 @@ class HierarchicalTrainer:
         }
 
         self.worker_shaping_weight=0.2   # max ~0.15/horizon << success reward 1.0
-        self.manager_shaping_weight=0.1  # max ~1.5/horizon < success reward 2.0 (1 ball)
+        self.manager_shaping_weight=0.5
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -891,6 +878,7 @@ class HierarchicalTrainer:
         
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
+        self.worker._traversal_starts_this_episode = 0
         
         # Episode tracking
         episode_reward = 0
@@ -898,6 +886,7 @@ class HierarchicalTrainer:
         manager_updates = 0
         worker_updates = 0
         manager_selection_counts = Counter()
+        traversal_starts = 0  # how many times graph traversal is initiated
 
 
         # NEW: Diagnostic tracking for this episode
@@ -924,7 +913,7 @@ class HierarchicalTrainer:
         while episode_steps < max_steps:
             # Manager selects goals
 
-            wide_goal, narrow_goal, manager_log_prob, manager_value = self.manager.get_manager_action(
+            wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
                 state, step_count=self.global_step_counter
             )
 
@@ -934,24 +923,17 @@ class HierarchicalTrainer:
                 self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
 
             manager_selection_counts[wide_goal] += 1
+            manager_entropies.append(entropy.item())
 
-            # ADD THIS DIAGNOSTIC HERE:
             if diag2:
                 balls_before_horizon = len(self.env.active_balls)
                 if len(self.env.active_balls) > 0:
-                    nearest_ball = min(self.env.active_balls, 
+                    nearest_ball = min(self.env.active_balls,
                                     key=lambda b: abs(wide_goal[0]-b[0]) + abs(wide_goal[1]-b[1]))
                     dist_to_nearest = abs(wide_goal[0]-nearest_ball[0]) + abs(wide_goal[1]-nearest_ball[1])
                     print(f"[MANAGER SELECT] wide={wide_goal}, narrow={narrow_goal}, "
                         f"nearest_ball={nearest_ball}, dist={dist_to_nearest}")
 
-            # NEW: Track Manager diagnostics
-            with torch.no_grad():
-                wide_logits, _, _ = self.manager.forward(state)
-                wide_probs = F.softmax(wide_logits, dim=0)
-                entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
-                manager_entropies.append(entropy.item())
-            
             unique_manager_goals.add(wide_goal)
             manager_wide_goals_list.append(wide_goal)
             manager_narrow_goals_list.append(narrow_goal)
@@ -1107,11 +1089,9 @@ class HierarchicalTrainer:
                         dist_before = min(manhattan_distance(start_pos_horizon, ball) for ball in remaining_balls)
                         dist_after = min(manhattan_distance(end_pos_horizon, ball) for ball in remaining_balls)
                         
-                        # Only reward positive progress
                         progress = dist_before - dist_after
-                        if progress > 0:
-                            progress_reward = progress * self.manager_shaping_weight
-                            manager_reward += progress_reward
+                        progress_reward = progress * self.manager_shaping_weight
+                        manager_reward += progress_reward
 
             # Collect reward
             #clipped_manager_reward = np.clip(manager_reward, -1, 1) #CLIP
@@ -1236,6 +1216,7 @@ class HierarchicalTrainer:
             print(f"\nWorker Diagnostics:")
             print(f"  Goal achievement rate: {worker_success_rate*100:.1f}%")
             print(f"  Avg value estimate: {np.mean(worker_values_list):.3f}")
+            print(f"  Graph traversals initiated: {self.worker._traversal_starts_this_episode}")
             print(f"\nTraining Stats:")
             print(f"  Manager updates: {manager_updates}")
             print(f"  Worker updates: {worker_updates}")

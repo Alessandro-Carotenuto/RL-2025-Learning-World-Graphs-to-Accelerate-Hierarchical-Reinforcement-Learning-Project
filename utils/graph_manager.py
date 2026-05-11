@@ -1,4 +1,5 @@
 import heapq
+from collections import deque
 from typing import List, Tuple, Dict, Optional
 import matplotlib.pyplot as plt
 import numpy as np
@@ -115,7 +116,22 @@ class GraphManager:
                     heapq.heappush(pq, (neighbor_to_curr, neighbor))             # Push the updated distance and neighbor into the priority queue
 
         return None, float('inf')
-    
+
+    def get_reachable_nodes(self, start):
+        """Return set of nodes reachable from start via directed edges (BFS)."""
+        if start not in self.nodes:
+            return set()
+        visited = {start}
+        queue = deque([start])
+        while queue:
+            current = queue.popleft()
+            for neighbor in self.get_outgoing_neighbors(current):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        return visited
+
+
 
 
 class GraphVisualizer:
@@ -145,6 +161,8 @@ class GraphVisualizer:
         for y in range(h):
             for x in range(w):
                 char = grid_state[y][x] if x < len(grid_state[y]) else '-'
+                if char == 'B':
+                    char = '-'  # balls are randomized per episode, show as empty
                 img[y, x] = self._CELL_COLORS.get(char, [200, 200, 200])
         return img
 

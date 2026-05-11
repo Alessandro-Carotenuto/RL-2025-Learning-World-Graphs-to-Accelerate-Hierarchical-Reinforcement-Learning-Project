@@ -186,13 +186,9 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         # Phase 2: Collect trajectories from pivotal states
         print(f"Second Half: Collecting trajectories from top {min(10, len(pivotal_states))} pivotal states...")
         
-        # Use fewer pivotal states early, more as training progresses
-        num_pivotal_to_use = min(5 + iteration, len(pivotal_states))
-
-
         episodes_collected = 0
         success_count = 0
-        for i, start_state in enumerate(pivotal_states[:10]):  
+        for i, start_state in enumerate(pivotal_states[:10]):
             print(f"  Collecting from pivotal state {i+1}: {start_state}")
             
             # Start curiosity only after first iteration
@@ -379,7 +375,7 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
         print(f"Start position: {current_pos}")
         
         # Manager selects goals
-        wide_goal, narrow_goal, log_prob, value = manager.get_manager_action(current_pos)
+        wide_goal, narrow_goal, log_prob, value, entropy = manager.get_manager_action(current_pos)
         print(f"Manager goals: wide={wide_goal}, narrow={narrow_goal}")
         
         # Check if wide goal is reachable
@@ -854,6 +850,174 @@ def compare_phase1_runs(runs_dict):
         succ = m['policy_success_rate'][-1]*100 if m['policy_success_rate'] else 0
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
+#----------------------------------------------------------------------------#
+#                        PHASE 1 CHECKPOINT SAVE / LOAD                      #
+#----------------------------------------------------------------------------#
+
+def save_phase1_checkpoint(path, pivotal_states, world_graph, policy, vae_system, config, grid_state):
+    """Save all Phase 1 outputs to a single file."""
+    checkpoint = {
+        'pivotal_states': pivotal_states,
+        'world_graph': world_graph,
+        'policy_state_dict': policy.state_dict(),
+        'vae_state_dict': vae_system.state_dict(),
+        'vae_kwargs': {
+            'state_dim': 16,
+            'action_vocab_size': 7,
+            'mu0': config['vae_mu0'],
+            'grid_size': int(config['maze_size'].value) + 4,
+        },
+        'config': config,
+        'grid_state': grid_state,
+    }
+    torch.save(checkpoint, path)
+    print(f"Phase 1 checkpoint saved to '{path}'")
+
+
+def load_phase1_checkpoint(path, device=None):
+    """Load Phase 1 checkpoint. Returns (pivotal_states, world_graph, policy, vae_system, config, grid_state)."""
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+
+    config = checkpoint['config']
+    if device is not None:
+        config['device'] = device
+
+    vae_kw = checkpoint['vae_kwargs']
+    vae_system = VAESystem(
+        state_dim=vae_kw['state_dim'],
+        action_vocab_size=vae_kw['action_vocab_size'],
+        mu0=vae_kw['mu0'],
+        grid_size=vae_kw['grid_size'],
+    )
+    vae_system.load_state_dict(checkpoint['vae_state_dict'])
+    vae_system.to(config['device'])
+
+    policy = GoalConditionedPolicy(lr=5e-3, device=config['device'])
+    policy.load_state_dict(checkpoint['policy_state_dict'])
+
+    print(f"Phase 1 checkpoint loaded from '{path}'")
+    print(f"  Pivotal states: {len(checkpoint['pivotal_states'])}")
+    print(f"  Graph edges:    {len(checkpoint['world_graph'].edges)}")
+
+    return (
+        checkpoint['pivotal_states'],
+        checkpoint['world_graph'],
+        policy,
+        vae_system,
+        config,
+        checkpoint['grid_state'],
+    )
+
+
+def restore_maze_from_grid_state(env, grid_state):
+    """Overwrite env.grid with the Phase 1 maze walls from the ASCII grid_state."""
+    h = len(grid_state)
+    w = len(grid_state[0]) if h > 0 else 0
+    for y in range(h):
+        for x in range(w):
+            char = grid_state[y][x]
+            if char == '#':
+                env.grid.set(x, y, Wall())
+                env.placeable_grid[x][y] = False
+            else:
+                env.grid.set(x, y, None)
+                env.placeable_grid[x][y] = True
+    # Agent start position is never placeable
+    env.placeable_grid[env.agent_start_pos[0]][env.agent_start_pos[1]] = False
+
+
+def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrides=None, fixed_balls=True):
+    """Run Phase 2 training using a saved Phase 1 checkpoint.
+    fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
+    fixed_balls=False: random ball positions every episode
+    """
+    pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
+
+    if config_overrides:
+        config.update(config_overrides)
+
+    env = MinigridWrapper(
+        size=config['maze_size'],
+        mode=EnvModes.MULTIGOAL,
+        max_steps=config['max_steps_per_episode'],
+    )
+    env.reset()  # triggers _gen_grid → initializes grid + placeable_grid
+    # Restore exact Phase 1 maze structure so pivotal states stay valid
+    restore_maze_from_grid_state(env, grid_state)
+    env.firstgen = False  # prevent re-generation on next reset
+    env.phase = 2         # next reset → ResetMultiGoals → balls placed
+
+    # Graph reachability diagnostic
+    agent_start = tuple(env.agent_start_pos)
+    reachable = world_graph.get_reachable_nodes(agent_start)
+    print(f"Graph reachability from {agent_start}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
+    unreachable = [n for n in pivotal_states if n not in reachable]
+    print(f"  Unreachable from start: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
+
+    if fixed_balls:
+        # Generate ball positions once from the Phase 1 maze and fix them
+        agent_pos = (env.agent_start_pos[0], env.agent_start_pos[1])
+        first_balls = env.ResetMultiGoals(agent_pos, goals=5)
+        env.fixed_ball_positions = first_balls
+        print(f"Fixed ball positions: {first_balls}")
+    else:
+        print("Ball positions: random each episode")
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        device=config['device'],
+    )
+    worker = HierarchicalWorker(
+        world_graph,
+        pivotal_states,
+        lr=config['worker_lr'],
+        device=config['device'],
+    )
+    manager.initialize_from_goal_policy(policy)
+    worker.initialize_from_goal_policy(policy)
+
+    print("\nDiagnosing Worker behavior BEFORE training:")
+    diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states)
+
+    trainer = HierarchicalTrainer(
+        manager, worker, env,
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+    )
+
+    print("\nPHASE 2: Hierarchical Training (standalone)")
+    metrics = {'rewards': [], 'steps': [], 'manager_updates': [], 'worker_updates': [], 'times': [], 'optimal_rewards': []}
+
+    for episode in range(config['phase2_episodes']):
+        ep_start = time.time()
+        if episode % 10 == 0 and episode > 0:
+            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} ---")
+        stats = trainer.train_episode(
+            max_steps=config['max_steps_per_episode'],
+            full_breakdown_every=config['full_breakdown_every'],
+        )
+        metrics['rewards'].append(stats['episode_reward'])
+        metrics['steps'].append(stats['episode_steps'])
+        metrics['manager_updates'].append(stats['manager_updates'])
+        metrics['worker_updates'].append(stats['worker_updates'])
+        metrics['times'].append(time.time() - ep_start)
+        metrics['optimal_rewards'].append(stats['optimal_reward'])
+
+    print("\n" + "="*70)
+    print("PHASE 2 COMPLETE")
+    print("="*70)
+    plot_training_diagnostics(trainer, config)
+    print(f"Best reward: {max(metrics['rewards']):.2f}")
+    print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:]) / 10:.2f}")
+    return metrics
+
+
 # ACTUAL TRAINING CODE ----------------------------------------------------
 steps=2000
 
@@ -864,7 +1028,7 @@ externalconfig = {
         'max_steps_per_episode': steps,
         'manager_horizon': steps//120,
         'neighborhood_size': math.ceil(24/4),
-        'manager_lr': 1e-4,
+        'manager_lr': 3e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
         'diagnostic_interval': 1000,  
@@ -927,6 +1091,9 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
 
     GRIDSTATE=env.getGridState()
     save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
+
+    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
+    save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
 
     # After phase 1, before phase 2 setup:
     if recordflag:
@@ -1299,8 +1466,9 @@ def run_phase1_size_comparison():
 
 
 def main():
-    test_phase1_with_diagnostics()
-    # train_full_phase1_phase2(recordflag=False)  # Phase 1 + Phase 2 together
+    #test_phase1_with_diagnostics()
+    # train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', fixed_balls=True)  # fixed_balls=False for random
     # run_phase1_comparison()
     # run_phase1_size_comparison()
 
