@@ -370,7 +370,8 @@ class HierarchicalWorker(nn.Module):
                  world_graph,
                  pivotal_states: List[Tuple[int, int]],
                  lr: float = 5e-3,
-                 verbose: bool =False,
+                 verbose: bool = False,
+                 goal_policy=None,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -385,7 +386,13 @@ class HierarchicalWorker(nn.Module):
         self.device = device
         self.world_graph = world_graph
         self.pivotal_states = set(pivotal_states)
-        
+
+        # Phase 1 navigator — fine-tuned during Phase 2.
+        # Stored via object.__setattr__ to prevent PyTorch from registering it as a
+        # submodule: otherwise self.parameters() would include GCP params, causing
+        # double-counting in the optimizer and polluting worker.state_dict().
+        object.__setattr__(self, 'goal_policy', goal_policy)
+
         # A2C-LSTM architecture
         self.lstm = nn.LSTM(
             input_size=6,  # [state_x, state_y, gw_x, gw_y, gn_x, gn_y]
@@ -397,8 +404,15 @@ class HierarchicalWorker(nn.Module):
         self.actor = nn.Linear(64, 3).to(device)
         self.critic = nn.Linear(64, 1).to(device)
         
-        self.optimizer = optim.Adam(self.parameters(), lr=lr)
-        
+        if self.goal_policy is not None:
+            # Fine-tune GCP at 1/10 the worker LR to preserve Phase 1 knowledge
+            self.optimizer = optim.Adam([
+                {'params': self.parameters(), 'lr': lr},
+                {'params': self.goal_policy.parameters(), 'lr': lr * 0.1},
+            ])
+        else:
+            self.optimizer = optim.Adam(self.parameters(), lr=lr)
+
         # Worker state
         self.hidden_state = None
         self.current_traversal_path = []
@@ -425,6 +439,8 @@ class HierarchicalWorker(nn.Module):
         self.traversal_step = 0
         self.current_edge_actions = None
         self.current_action_idx = 0
+        if self.goal_policy is not None:
+            self.goal_policy.hidden_state = None
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -569,16 +585,33 @@ class HierarchicalWorker(nn.Module):
                 log_prob = torch.tensor(-1.0, device=self.device) # Dummy log_prob for planned actions
                 return action, log_prob, value.squeeze()
 
-        # 3. FALLBACK TO POLICY ACTION if not traversing
-        with torch.no_grad():
+        # 3. FALLBACK: fine-tune Phase 1 GCP if available, else use worker A2C.
+        if self.goal_policy is not None:
+            # Worker value: uses wide+narrow goal context
+            _, value = self.forward(state, wide_goal, narrow_goal)
+
+            # GCP selects action toward narrow_goal — gradients flow for fine-tuning
+            state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
+            gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=self.device)
+            gp_logits, _ = self.goal_policy.forward(state_t, gn_t)
+            if gp_logits.dim() > 1:
+                gp_logits = gp_logits.squeeze(0)
+            masked = torch.full_like(gp_logits, float('-inf'))
+            masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]  # navigation actions only
+            probs = F.softmax(masked, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            idx = dist.sample()
+            log_prob = dist.log_prob(idx)
+            action = idx.item()
+        else:
             action_logits, value = self.forward(state, wide_goal, narrow_goal)
+            probs = F.softmax(action_logits, dim=0)
+            dist = torch.distributions.Categorical(probs)
+            idx = dist.sample()
+            log_prob = dist.log_prob(idx)
+            action = idx.item()
 
-        action_probs = F.softmax(action_logits, dim=0)
-        action_dist = torch.distributions.Categorical(action_probs)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
-
-        return action.item(), log_prob, value.squeeze()
+        return action, log_prob, value.squeeze()
 
     def _compute_required_direction(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> int:
         """
@@ -763,8 +796,18 @@ class HierarchicalWorker(nn.Module):
         # Update
         self.optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+        if self.goal_policy is not None:
+            all_params = list(self.parameters()) + list(self.goal_policy.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.5)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
         self.optimizer.step()
+
+        # Truncated BPTT: detach hidden states so graphs don't grow across horizons
+        if self.hidden_state is not None:
+            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+        if self.goal_policy is not None and self.goal_policy.hidden_state is not None:
+            self.goal_policy.hidden_state = tuple(h.detach() for h in self.goal_policy.hidden_state)
 
     def generate_actions_from_path(self, path, current_agent_dir):
         """Convert position path to action sequence based on current orientation."""

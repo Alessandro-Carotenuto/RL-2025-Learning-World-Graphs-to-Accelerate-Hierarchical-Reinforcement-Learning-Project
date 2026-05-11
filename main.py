@@ -648,6 +648,10 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
     agent_start = session['agent_start']
     ball_positions = session['ball_positions']
 
+    # Apply Phase 2 fine-tuned GCP weights if saved in session
+    if 'goal_policy_state_dict' in session:
+        policy.load_state_dict(session['goal_policy_state_dict'])
+
     manager = HierarchicalManager(
         pivotal_states,
         neighborhood_size=config['neighborhood_size'],
@@ -664,6 +668,7 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
         world_graph,
         pivotal_states,
         lr=config['worker_lr'],
+        goal_policy=policy,
         device='cpu',
     )
     worker.load_state_dict(session['worker_state_dict'])
@@ -1162,6 +1167,7 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         world_graph,
         pivotal_states,
         lr=config['worker_lr'],
+        goal_policy=policy,
         device=config['device'],
     )
     manager.initialize_from_goal_policy(policy)
@@ -1201,13 +1207,14 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
     print("="*70)
     plot_training_diagnostics(trainer, config)
 
-    # Update session with trained weights
+    # Update session with trained weights (GCP fine-tuned in Phase 2)
     session_path = checkpoint_path.replace('.pt', '_session.pt')
     torch.save({
         'agent_start': agent_start,
         'ball_positions': first_balls,
         'manager_state_dict': manager.state_dict(),
         'worker_state_dict': worker.state_dict(),
+        'goal_policy_state_dict': policy.state_dict(),
     }, session_path)
     print(f"Session updated with trained weights: '{session_path}'")
 
@@ -1325,9 +1332,10 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         device=config['device']
     )
     worker = HierarchicalWorker(
-        world_graph, 
+        world_graph,
         pivotal_states,
         lr=config['worker_lr'],
+        goal_policy=policy,
         device=config['device']
     )
     manager.initialize_from_goal_policy(policy)
@@ -1442,7 +1450,7 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     if recordflag and recording_data['good_episode'] is not None:
         replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4')
 
-    # Save trained weights to session
+    # Save trained weights to session (GCP fine-tuned in Phase 2)
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     session_path = checkpoint_path.replace('.pt', '_session.pt')
     torch.save({
@@ -1450,6 +1458,7 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         'ball_positions': None,
         'manager_state_dict': manager.state_dict(),
         'worker_state_dict': worker.state_dict(),
+        'goal_policy_state_dict': policy.state_dict(),
     }, session_path)
     print(f"Session updated with trained weights: '{session_path}'")
 
