@@ -451,66 +451,90 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
     return episode_diagnostics
 
 def plot_training_diagnostics(trainer, config, save_path=None):
-    """Plot simplified training diagnostics."""
-    import matplotlib.pyplot as plt
-    
+    """Plot training diagnostics: 6 panels covering task, manager, and worker signals."""
+
     def moving_average(data, window=20):
         if len(data) < window:
             return np.array([])
         return np.convolve(data, np.ones(window)/window, mode='valid')
-    
+
     history = trainer.diagnostic_history
     num_episodes = len(history['episode_rewards'])
-    episodes = range(1, num_episodes + 1)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    episodes = list(range(1, num_episodes + 1))
+    ma_start = 20  # moving average window
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle('Hierarchical RL Training Diagnostics', fontsize=16, fontweight='bold')
-    
-    # 1. Worker Goal Achievement Rate
-    axes[0, 0].plot(episodes, [x*100 for x in history['worker_goal_achievement']], 'orange', linewidth=2, alpha=0.7, label='Achievement')
-    ma_achievement = moving_average([x*100 for x in history['worker_goal_achievement']])
-    if len(ma_achievement) > 0:
-        axes[0, 0].plot(range(20, 20 + len(ma_achievement)), ma_achievement, 'k-', linewidth=2, label='MA(20)')
-    axes[0, 0].set_title('Worker Goal Achievement Rate')
-    axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('% Horizons Goal Reached')
-    axes[0, 0].set_ylim([0, 100])
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].legend()
-    
-    # 2. Episode Rewards
-    axes[0, 1].plot(episodes, history['episode_rewards'], 'b-', alpha=0.7, label='Agent')
-    ma_rewards = moving_average(history['episode_rewards'])
-    if len(ma_rewards) > 0:
-        axes[0, 1].plot(range(20, 20 + len(ma_rewards)), ma_rewards, 'k-', linewidth=2, label='MA(20)')
-    axes[0, 1].set_title('Episode Rewards')
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Reward')
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].legend()
-    
-    # 3. Worker Value Estimates
-    axes[1, 0].plot(episodes, history['worker_value_mean'], 'magenta', linewidth=2, alpha=0.7, label='Value')
-    ma_worker_val = moving_average(history['worker_value_mean'])
-    if len(ma_worker_val) > 0:
-        axes[1, 0].plot(range(20, 20 + len(ma_worker_val)), ma_worker_val, 'k-', linewidth=2, label='MA(20)')
-    axes[1, 0].set_title('Worker Value Estimates')
-    axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('Average Value')
-    axes[1, 0].grid(True, alpha=0.3)
-    axes[1, 0].legend()
-    
-    # 4. Manager Value Estimates
-    axes[1, 1].plot(episodes, history['manager_value_mean'], 'cyan', linewidth=2, alpha=0.7, label='Value')
-    ma_manager_val = moving_average(history['manager_value_mean'])
-    if len(ma_manager_val) > 0:
-        axes[1, 1].plot(range(20, 20 + len(ma_manager_val)), ma_manager_val, 'k-', linewidth=2, label='MA(20)')
-    axes[1, 1].set_title('Manager Value Estimates')
-    axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Average Value')
-    axes[1, 1].grid(True, alpha=0.3)
-    axes[1, 1].legend()
-    
+
+    def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
+        ax.plot(episodes, data, color=color, linewidth=1.5, alpha=0.5, label=label)
+        ma = moving_average(data)
+        if len(ma) > 0:
+            ax.plot(range(ma_start, ma_start + len(ma)), ma, 'k-', linewidth=2, label=f'MA({ma_start})')
+        ax.set_title(title)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # 1. Episode Rewards vs Optimal
+    ax = axes[0, 0]
+    ax.plot(episodes, history['episode_rewards'], 'b-', linewidth=1.5, alpha=0.5, label='Agent')
+    ma_r = moving_average(history['episode_rewards'])
+    if len(ma_r) > 0:
+        ax.plot(range(ma_start, ma_start + len(ma_r)), ma_r, 'b-', linewidth=2, label=f'MA({ma_start})')
+    ax.set_title('Episode Rewards')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Reward')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # 2. Balls Collected per Episode
+    plot_with_ma(axes[0, 1],
+                 history['balls_collected_per_episode'],
+                 'green', 'Balls', 'Balls Collected',
+                 'Balls Collected per Episode',
+                 ylim=[0, 6])
+
+    # 3. Manager Goal Diversity  (unique goals / total horizons — drops as manager converges)
+    plot_with_ma(axes[0, 2],
+                 history['manager_goal_diversity'],
+                 'orange', 'Diversity', 'Unique Goals / Horizons',
+                 'Manager Goal Diversity\n(↓ = converging on fewer goals)',
+                 ylim=[0, 1])
+
+    # 4. Manager Entropy  (absolute nats — drops as policy peaks)
+    max_entropy = np.log(len(trainer.manager.pivotal_states))
+    entropy_pct = [e / max_entropy * 100 for e in history['manager_entropy']]
+    plot_with_ma(axes[1, 0],
+                 entropy_pct,
+                 'red', 'Entropy %', '% of Max Entropy',
+                 'Manager Policy Entropy\n(↓ = more decisive)',
+                 ylim=[80, 101])
+
+    # 5. Avg Distance: Manager Goals → Nearest Ball  (drops as manager learns ball locations)
+    dist_data = history['goal_distance_to_balls']
+    if dist_data:
+        dist_episodes = list(range(1, len(dist_data) + 1))
+        ax5 = axes[1, 1]
+        ax5.plot(dist_episodes, dist_data, 'purple', linewidth=1.5, alpha=0.5, label='Dist')
+        ma_d = moving_average(dist_data)
+        if len(ma_d) > 0:
+            ax5.plot(range(ma_start, ma_start + len(ma_d)), ma_d, 'k-', linewidth=2, label=f'MA({ma_start})')
+        ax5.set_title('Avg Distance: Manager Goals → Balls\n(↓ = manager targeting balls)')
+        ax5.set_xlabel('Episode')
+        ax5.set_ylabel('Manhattan Distance')
+        ax5.grid(True, alpha=0.3)
+        ax5.legend(fontsize=8)
+
+    # 6. Manager Value Estimate  (rises and stabilises as critic converges)
+    plot_with_ma(axes[1, 2],
+                 history['manager_value_mean'],
+                 'cyan', 'Value', 'Average Value',
+                 'Manager Value Estimate\n(stabilises when critic converges)')
+
     plt.tight_layout()
     if save_path is None:
         save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase2_episodes']}.png"
@@ -942,22 +966,37 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         max_steps=config['max_steps_per_episode'],
     )
     env.reset()  # triggers _gen_grid → initializes grid + placeable_grid
-    # Restore exact Phase 1 maze structure so pivotal states stay valid
     restore_maze_from_grid_state(env, grid_state)
+
+    # Find a valid start position in the Phase 1 maze: not a wall, ≥6 reachable cells
+    attempt = 0
+    while True:
+        attempt += 1
+        x = random.randint(1, env.size - 2)
+        y = random.randint(1, env.size - 2)
+        if isinstance(env.grid.get(x, y), Wall):
+            continue
+        reachables = env.BFS_all_reachable((x, y))
+        if len(reachables) >= 6:
+            env.agent_start_pos = (x, y)
+            env.agent_pos = (x, y)
+            env.placeable_grid[x][y] = False
+            break
+
+    agent_start = (x, y)
+    print(f"Valid start found after {attempt} attempt(s): {agent_start} ({len(reachables)} reachable cells)")
+
     env.firstgen = False  # prevent re-generation on next reset
     env.phase = 2         # next reset → ResetMultiGoals → balls placed
 
     # Graph reachability diagnostic
-    agent_start = tuple(env.agent_start_pos)
     reachable = world_graph.get_reachable_nodes(agent_start)
     print(f"Graph reachability from {agent_start}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
     unreachable = [n for n in pivotal_states if n not in reachable]
     print(f"  Unreachable from start: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
 
     if fixed_balls:
-        # Generate ball positions once from the Phase 1 maze and fix them
-        agent_pos = (env.agent_start_pos[0], env.agent_start_pos[1])
-        first_balls = env.ResetMultiGoals(agent_pos, goals=5)
+        first_balls = env.ResetMultiGoals(agent_start, goals=5)
         env.fixed_ball_positions = first_balls
         print(f"Fixed ball positions: {first_balls}")
     else:
@@ -1024,17 +1063,17 @@ steps=2000
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 50,
-        'phase2_episodes': 100,
+        'phase2_episodes': 500,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//120,
         'neighborhood_size': math.ceil(24/4),
-        'manager_lr': 3e-4,
+        'manager_lr': 5e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
-        'diagnostic_interval': 1000,  
-        'diagnostic_checkstart': True,  
+        'diagnostic_interval': 10000,
+        'diagnostic_checkstart': True,
         'full_breakdown_every': 10,  
-        'device': 'cuda'
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
 fast_training_toggle=True
@@ -1468,7 +1507,7 @@ def run_phase1_size_comparison():
 def main():
     #test_phase1_with_diagnostics()
     # train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
-    run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', fixed_balls=True)  # fixed_balls=False for random
+    run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True)  # fixed_balls=False for random
     # run_phase1_comparison()
     # run_phase1_size_comparison()
 

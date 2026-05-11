@@ -1100,7 +1100,7 @@ class HierarchicalTrainer:
             horizon_counter += 1
 
 
-            MANAGER_UPDATE_FREQUENCY = 8
+            MANAGER_UPDATE_FREQUENCY = 20
 
             # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(manager_reward)
