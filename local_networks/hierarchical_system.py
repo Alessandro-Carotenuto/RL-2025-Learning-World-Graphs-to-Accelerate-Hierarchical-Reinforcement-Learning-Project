@@ -854,7 +854,8 @@ class HierarchicalTrainer:
                  diagnostic_interval: int = 30,
                  diagnostic_checkstart: bool = True,
                  workershaping=True,
-                 managershaping=True):
+                 managershaping=True,
+                 narrow_shaping_weight: float = 1.0):
         self.manager = manager
         self.worker = worker
         self.env = env
@@ -879,7 +880,8 @@ class HierarchicalTrainer:
         }
 
         self.worker_shaping_weight=0.2   # max ~0.15/horizon << success reward 1.0
-        self.manager_shaping_weight=0.5
+        self.manager_shaping_weight=1
+        self.narrow_shaping_weight=narrow_shaping_weight
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -1117,8 +1119,17 @@ class HierarchicalTrainer:
 
             if self.manager_reward_shaping:
                 # Bonus for ball collection
-                manager_reward += balls_collected_this_horizon * 2.0
+                manager_reward += balls_collected_this_horizon * 5
                 
+                # Narrow-goal closeness shaping: prefer narrow goals nearer to balls
+                if len(starting_balls_snapshot) > 0:
+                    narrow_dist_to_ball = min(
+                        manhattan_distance(narrow_goal, ball)
+                        for ball in starting_balls_snapshot
+                    )
+                    narrow_bonus = self.narrow_shaping_weight / (1.0 + narrow_dist_to_ball)
+                    manager_reward += narrow_bonus
+
                 # Distance-based progress shaping (fixed)
                 if len(starting_balls_snapshot) > 0:
                     # Only compare distances to balls that STILL EXIST

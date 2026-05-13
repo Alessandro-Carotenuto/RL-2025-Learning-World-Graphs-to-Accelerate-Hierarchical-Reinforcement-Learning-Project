@@ -275,10 +275,13 @@ class VAESystem(nn.Module):
         self.current_pivotal_states = set()
         
     def encode_trajectories(self, trajectories):
+        trajectories = [t for t in trajectories if len(t) > 0]
+        if not trajectories:
+            raise ValueError("encode_trajectories received no non-empty trajectories")
         batch_states = []
         batch_actions = []
         batch_discrete_actions = []
-        
+
         for trajectory in trajectories:
             states = [state for state, action in trajectory]
             actions = [action for state, action in trajectory]

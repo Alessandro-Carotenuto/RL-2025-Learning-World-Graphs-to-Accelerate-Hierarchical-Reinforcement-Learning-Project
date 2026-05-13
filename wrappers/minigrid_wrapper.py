@@ -465,6 +465,51 @@ class MinigridWrapper(MiniGridEnv):
                         self.grid.set(x, y, Wall())
                         self.placeable_grid[x][y] = False
 
+    def _carve_l_shaped_corridor(self, start_pos, end_pos):
+        """Carve a simple L-shaped corridor between two interior positions."""
+        x0, y0 = start_pos
+        x1, y1 = end_pos
+
+        if random.random() < 0.5:
+            for x in range(min(x0, x1), max(x0, x1) + 1):
+                self.grid.set(x, y0, None)
+                self.placeable_grid[x][y0] = True
+            for y in range(min(y0, y1), max(y0, y1) + 1):
+                self.grid.set(x1, y, None)
+                self.placeable_grid[x1][y] = True
+        else:
+            for y in range(min(y0, y1), max(y0, y1) + 1):
+                self.grid.set(x0, y, None)
+                self.placeable_grid[x0][y] = True
+            for x in range(min(x0, x1), max(x0, x1) + 1):
+                self.grid.set(x, y1, None)
+                self.placeable_grid[x][y1] = True
+
+    def repair_connectivity(self):
+        """Ensure that all traversable interior free cells are reachable from the agent."""
+        if self.agent_start_pos is None:
+            return
+
+        # Repeatedly connect unreachable traversable tiles until none remain.
+        while True:
+            reachable = set(self.BFS_all_reachable(self.agent_start_pos))
+            unreachable = []
+
+            for x in range(1, self.size - 1):
+                for y in range(1, self.size - 1):
+                    if (x, y) in reachable:
+                        continue
+                    cell_obj = self.grid.get(x, y)
+                    if self._is_traversable(cell_obj):
+                        unreachable.append((x, y))
+
+            if not unreachable:
+                break
+
+            target = random.choice(unreachable)
+            nearest = min(reachable, key=lambda p: abs(p[0] - target[0]) + abs(p[1] - target[1]))
+            self._carve_l_shaped_corridor(target, nearest)
+
     # RESET PLACEABLE GRID
     def placeablegrid_reset(self):
         # INITIALIZE PLACEABLE GRID: 1=FREE SPACE, 0=RESERVED SPACE
@@ -622,12 +667,12 @@ class MinigridWrapper(MiniGridEnv):
         return ballpos
 
     def EasyGeneralPurposeMap(self):
-        
-       self.resetgrid()
-       playerpos = (self.agent_start_pos[0], self.agent_start_pos[1])
-       self.placeable_grid[playerpos[0]][playerpos[1]]=False
-       self.NoiseFiller(0.65)  # noise and reserves
-       return
+        self.resetgrid()
+        playerpos = (self.agent_start_pos[0], self.agent_start_pos[1])
+        self.placeable_grid[playerpos[0]][playerpos[1]] = False
+        self.NoiseFiller(0.65)  # noise and reserves
+        self.repair_connectivity()
+        return
 
     def ascii_encode_gridelement(self,obj):
         if obj is None:

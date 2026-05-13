@@ -115,13 +115,44 @@ def print_grid_image(GRIDTEXT,name=' '):
     plt.tight_layout()
     plt.savefig('grid'+name+'.png', dpi=150, bbox_inches='tight')
 
-def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, fast_training=True):
+def _walk_away_from_spawn(env, spawn: tuple, walk_length: int = 400, bias: float = 0.7) -> tuple:
+    """
+    Random walk biased toward moving away from spawn.
+    At each step: if move_forward increases manhattan distance from spawn,
+    take it with probability `bias`; otherwise pick a random action.
+    Returns the position reached. No map knowledge required — only env.step().
+    """
+    obs = env.reset()
+    current_pos = tuple(env.agent_pos)
+    dir_delta = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
+    for _ in range(walk_length):
+        dx, dy = dir_delta[env.agent_dir]
+        fwd = (current_pos[0] + dx, current_pos[1] + dy)
+        if (manhattan_distance(fwd, spawn) > manhattan_distance(current_pos, spawn)
+                and random.random() < bias):
+            action = 2  # move_forward (away from spawn)
+        else:
+            action = random.choice([0, 1, 2])
+        try:
+            obs, _, term, trunc, _ = env.step(action)
+            current_pos = tuple(env.agent_pos)
+            if term or trunc:
+                break
+        except Exception:
+            break
+    return current_pos
+
+
+def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, fast_training=True,
+                              explore_top_fraction: float = 0.20):
     """
     Main alternating training loop with persistent KL annealing.
+    explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
+                          used for trajectory collection once COVERAGE_THRESHOLD is reached.
     """
     print("Starting Alternating Training Loop:")
     print("=" * 50)
-    
+
     reconstruction_losses = []
     all_pivotal_states = []
     pivotal_states = []
@@ -130,14 +161,19 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     'policy_success_rates': []
     }
 
-    
+
     # NEW: Persistent KL weight across iterations
     persistent_kl_weight = 1.0
 
     # Ramping parameters (not used now)
     # total_epochs = max_iterations * 25  # Assuming 25 epochs per iteration
     # kl_ramp_rate = -0.5 / (total_epochs * 0.5) # Ramp from 0.5 to 1.0 over half the total epochs
-    
+
+    # Compute spawn position once (it's fixed throughout Phase 1)
+    _obs = env.reset()
+    spawn_pos = tuple(env.agent_pos)
+    print(f"Spawn position: {spawn_pos}")
+
     for iteration in range(max_iterations):
         print(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
         print(f"Current KL weight: {persistent_kl_weight:.3f}")
@@ -184,14 +220,18 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
         # Phase 2: Collect trajectories from pivotal states
+        # Sort by distance from spawn descending — farthest states first — to break the
+        # self-reinforcing clustering loop that keeps all pivotal states near spawn.
         COVERAGE_THRESHOLD = 50
+        sorted_by_dist = sorted(pivotal_states, key=lambda s: manhattan_distance(s, spawn_pos), reverse=True)
         if len(pivotal_states) < COVERAGE_THRESHOLD:
-            states_to_explore = pivotal_states
-            print(f"Second Half: Collecting from ALL {len(pivotal_states)} pivotal states (coverage phase, target={COVERAGE_THRESHOLD})...")
+            states_to_explore = sorted_by_dist
+            print(f"Second Half: Collecting from ALL {len(pivotal_states)} pivotal states sorted farthest-first from spawn {spawn_pos}...")
         else:
-            top_n = max(1, len(pivotal_states) // 5)  # top 20%
-            states_to_explore = pivotal_states[:top_n]
-            print(f"Second Half: Collecting from top 20% ({top_n}/{len(pivotal_states)}) pivotal states...")
+            top_n = max(1, int(len(pivotal_states) * explore_top_fraction))
+            states_to_explore = sorted_by_dist[:top_n]
+            pct = int(explore_top_fraction * 100)
+            print(f"Second Half: top {pct}% farthest from spawn ({top_n}/{len(pivotal_states)}) pivotal states...")
 
         episodes_collected = 0
         success_count = 0
@@ -234,6 +274,25 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"  Collected {episodes_collected} new episodes")
         print(f"  Total episodes in buffer: {buffer.episodes_in_buffer}")
         
+        # Diversity collection: biased random walks away from spawn to break clustering.
+        # Each walk physically navigates to a distant region (no map knowledge used).
+        _cw = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
+        print(f"Spatial diversity: 4 biased walks from spawn {spawn_pos}...")
+        diversity_walk_number=10
+        for _wi in range(diversity_walk_number):
+            _dst = _walk_away_from_spawn(env, spawn_pos, walk_length=250, bias=0.65)
+            dist_from_spawn = manhattan_distance(_dst, spawn_pos)
+            print(f"  Walk {_wi+1}: reached {_dst} (dist={dist_from_spawn})")
+            try:
+                _eps = policy.collect_episodes_from_position(
+                    env, _dst, num_episodes=4, max_episode_length=100,
+                    vae_system=vae_system, curiosity_weight=_cw
+                )
+                if _eps:
+                    buffer.add_episodes(_eps)
+            except Exception as e:
+                print(f"  Walk {_wi+1} collection failed: {e}")
+
         # Check for convergence (not before min_iterations to ensure coverage)
         MIN_ITERATIONS = 5
         if len(reconstruction_losses) >= 3 and iteration + 1 >= MIN_ITERATIONS:
@@ -251,20 +310,6 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
             if avg_change < threshold_reconstruction_loss:
                 print("Reconstruction loss has plateaued - training converged!")
                 break
-        
-        # Optional diversity collection
-        if iteration % 2 == 0:
-            print("Phase 4: Adding diversity with random exploration...")
-            obs = env.reset()
-            random_start = tuple(env.agent_pos)
-            try:
-                random_episodes = policy.collect_episodes_from_position(
-                    env, random_start, num_episodes=6, max_episode_length=100, vae_system=vae_system
-                )
-                if random_episodes:
-                    buffer.add_episodes(random_episodes)
-            except Exception as e:
-                print(f"Random exploration failed: {e}")
     
 
     # Construct world graph
@@ -643,6 +688,15 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
     """
     pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
 
+    # Fall back to sensible defaults for older Phase 1 checkpoints
+    config.setdefault('max_steps_per_episode', 2000)
+    config.setdefault('neighborhood_size', math.ceil(config['maze_size'].value / 4))
+    config.setdefault('manager_horizon', config['max_steps_per_episode'] // 120)
+    config.setdefault('manager_lr', 5e-4)
+    config.setdefault('worker_lr', 1e-4)
+    config.setdefault('diagnostic_interval', 10000)
+    config.setdefault('diagnostic_checkstart', False)
+
     session_path = checkpoint_path.replace('.pt', '_session.pt')
     session = torch.load(session_path, map_location='cpu', weights_only=False)
     agent_start = session['agent_start']
@@ -778,9 +832,10 @@ def test_phase1_with_diagnostics(config=None):
     buffer = StatBuffer()
     
     # Run alternating training (now with persistent KL)
-    pivotal_states, world_graph, loop_metrics, _ = alternating_training_loop(
+    pivotal_states, world_graph, loop_metrics, all_pivotal_states_history = alternating_training_loop(
         env, policy, vae_system, buffer,
-        max_iterations=config['phase1_iterations']
+        max_iterations=config['phase1_iterations'],
+        explore_top_fraction=config.get('explore_top_fraction', 0.20)
     )
     
     # Extract metrics from VAE training history
@@ -881,7 +936,11 @@ def test_phase1_with_diagnostics(config=None):
     plt.close()
 
     save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
-    
+    create_phase1_gif(all_pivotal_states_history, GRIDSTATE)
+
+    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
+    save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
+
     # Summary
     print(f"\n{'='*70}")
     print("PHASE 1 TEST COMPLETE")
@@ -1049,6 +1108,13 @@ def load_phase1_checkpoint(path, device=None):
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
     config = checkpoint['config']
+    config.setdefault('max_steps_per_episode', 2000)
+    config.setdefault('neighborhood_size', math.ceil(config['maze_size'].value / 4))
+    config.setdefault('manager_horizon', config['max_steps_per_episode'] // 120)
+    config.setdefault('manager_lr', 5e-4)
+    config.setdefault('worker_lr', 1e-4)
+    config.setdefault('diagnostic_interval', 10000)
+    config.setdefault('diagnostic_checkstart', False)
     if device is not None:
         config['device'] = device
 
@@ -1097,7 +1163,7 @@ def restore_maze_from_grid_state(env, grid_state):
 
 
 def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrides=None, fixed_balls=True,
-                          phase2_animation=False):
+                          phase2_animation=True):
     """Run Phase 2 training using a saved Phase 1 checkpoint.
     fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
     fixed_balls=False: random ball positions every episode
@@ -1106,6 +1172,14 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
 
     if config_overrides:
         config.update(config_overrides)
+
+        # If device is overridden, move loaded models to the new device too.
+        if config['device'] == 'cuda' and not torch.cuda.is_available():
+            print("WARNING: CUDA requested in config_overrides but not available. Falling back to CPU.")
+            config['device'] = 'cpu'
+
+        vae_system.to(config['device'])
+        policy.to(config['device'])
 
     env = MinigridWrapper(
         size=config['maze_size'],
@@ -1235,10 +1309,10 @@ steps=2000
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 50,
-        'phase2_episodes': 200,
+        'phase1_iterations': 2,
+        'phase2_episodes': 10,
         'max_steps_per_episode': steps,
-        'manager_horizon': steps//120,
+        'manager_horizon': steps//250,
         'neighborhood_size': math.ceil(24/4),
         'manager_lr': 5e-4,
         'worker_lr': 1e-4,
@@ -1246,6 +1320,7 @@ externalconfig = {
         'diagnostic_interval': 10000,
         'diagnostic_checkstart': False,
         'full_breakdown_every': 10,
+        'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
@@ -1287,7 +1362,8 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     
     pivotal_states, world_graph, stat_buffer, all_pivotal_states = alternating_training_loop(
         env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
-        fast_training=fast_training
+        fast_training=fast_training,
+        explore_top_fraction=config.get('explore_top_fraction', 0.20)
     )
     
     phase1_time = time.time() - start_time
@@ -1694,9 +1770,17 @@ def run_phase1_size_comparison():
 
 
 def main():
-    #test_phase1_with_diagnostics()
+    """
+    test_phase1_with_diagnostics(config={
+        'maze_size': externalconfig['maze_size'],
+        'phase1_iterations': externalconfig['phase1_iterations'],
+        'vae_mu0': externalconfig['vae_mu0'],
+        'device': externalconfig['device'],
+    })
+    """
     train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
-    # run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True)  # fixed_balls=False for random
+    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)  # fixed_balls=False for random
+    #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
     # run_phase1_comparison()
     # run_phase1_size_comparison()
 

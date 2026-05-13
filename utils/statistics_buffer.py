@@ -22,6 +22,7 @@ class StatBuffer:
         self.placeholder_previous_episode = 0
         self.episodes_in_buffer = 0
         self.total_steps_in_buffer = 0
+        self._total_popped = 0  # cumulative steps evicted from the front
 
         # THIS IS FOR MULTIPLE EPISODES
         self.finalrewards = []
@@ -53,6 +54,7 @@ class StatBuffer:
             self.rewards.pop(0)
             self.next_states.pop(0)
             self.dones.pop(0)
+            self._total_popped += 1
 
     def end_episode(self):
         # computes the total reward for one episode
@@ -101,18 +103,23 @@ class StatBuffer:
     def get_ACTtraj_stream(self):
         return self.actions
     
-    def get_STATE_ACT_traj_from_ep(self,epnumber=0):
-        states=self.states[self.episodes_extremes[epnumber]
-                                           [0]:self.episodes_extremes[epnumber][1]]
-        actions=self.actions[self.episodes_extremes[epnumber]
-                                           [0]:self.episodes_extremes[epnumber][1]]
+    def get_STATE_ACT_traj_from_ep(self, epnumber=0):
+        start, end, _ = self.episodes_extremes[epnumber]
+        # Adjust absolute indices for any steps evicted from the front
+        adj_start = max(0, start - self._total_popped)
+        adj_end = end - self._total_popped
+        if adj_end <= 0 or adj_start >= len(self.states):
+            return []
+        states = self.states[adj_start:adj_end]
+        actions = self.actions[adj_start:adj_end]
         return list(zip(states, actions))
     
     def get_STATE_ACT_traj_stream(self):
         return list(zip(self.states,self.actions))
     
     def get_STATE_ACT_traj_stream_byep(self):
-        return [self.get_STATE_ACT_traj_from_ep(i) for i in range(self.episodes_in_buffer)]
+        trajs = [self.get_STATE_ACT_traj_from_ep(i) for i in range(self.episodes_in_buffer)]
+        return [t for t in trajs if len(t) > 0]
         
 
 
