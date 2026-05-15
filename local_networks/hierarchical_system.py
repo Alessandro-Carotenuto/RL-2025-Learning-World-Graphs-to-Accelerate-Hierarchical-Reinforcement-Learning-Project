@@ -1190,32 +1190,11 @@ class HierarchicalTrainer:
             goal_reached_prev = goal_reached_this_horizon
             ball_collected_prev = balls_collected_this_horizon > 0
 
-            MANAGER_UPDATE_FREQUENCY = 20
-
             all_manager_rewards_this_episode.append(manager_reward)
 
             if diag3:
                 if horizon_counter % 10 == 0:
                     print(f"  [REWARD DEBUG] Horizon {horizon_counter}: env_reward={horizon_env_reward:.3f}, total_so_far={sum(all_manager_rewards_this_episode):.3f}")
-
-            # Update Manager on completed-goal experiences accumulated so far
-            if horizon_counter % MANAGER_UPDATE_FREQUENCY == 0 and len(manager_rewards) > 0:
-                self.manager.update_policy(
-                    manager_states, manager_wide_goals, manager_narrow_goals,
-                    manager_rewards, manager_values, manager_log_probs,
-                    manager_entropies_for_update,
-                    step_count=self.global_step_counter
-                )
-                manager_updates += 1
-                if self.manager.hidden_state is not None:
-                    self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
-                manager_states = []
-                manager_wide_goals = []
-                manager_narrow_goals = []
-                manager_rewards = []
-                manager_values = []
-                manager_log_probs = []
-                manager_entropies_for_update = []
 
             if terminated or truncated:
                 break

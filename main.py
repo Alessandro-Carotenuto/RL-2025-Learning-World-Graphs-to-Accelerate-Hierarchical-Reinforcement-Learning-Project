@@ -1327,8 +1327,8 @@ steps=2000
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 50,
-        'phase2_episodes': 500,
+        'phase1_iterations': 2,
+        'phase2_episodes': 10,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,
         'neighborhood_size': math.ceil(24/4),
@@ -1417,6 +1417,11 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
 
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
+
+    if len(pivotal_states) < 2:
+        print(f"\nERROR: Phase 1 produced only {len(pivotal_states)} pivotal state(s). "
+              f"Phase 2 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
+        return
 
     # After phase 1, before phase 2 setup:
     if recordflag:
