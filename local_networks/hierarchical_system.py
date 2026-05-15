@@ -849,19 +849,21 @@ class HierarchicalWorker(nn.Module):
         return actions
 
 class HierarchicalTrainer:
-    def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker, 
+    def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker,
                  env, horizon: int = 15,
                  diagnostic_interval: int = 30,
                  diagnostic_checkstart: bool = True,
                  workershaping=True,
                  managershaping=True,
-                 narrow_shaping_weight: float = 1.0):
+                 narrow_shaping_weight: float = 1.0,
+                 goal_timeout: int = 3):
         self.manager = manager
         self.worker = worker
         self.env = env
         self.horizon = horizon
         self.diagnostic_interval = diagnostic_interval
         self.diagnostic_checkstart = diagnostic_checkstart
+        self.goal_timeout = goal_timeout  # max horizons before forcing a new goal
         self.global_step_counter = 0
         self.global_episode_counter = 0
         
@@ -924,7 +926,19 @@ class HierarchicalTrainer:
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
         self.worker._traversal_starts_this_episode = 0
-        
+
+        # Goal persistence state
+        active_wide_goal = None
+        active_narrow_goal = None
+        active_log_prob = None
+        active_value = None
+        active_entropy = None
+        active_goal_state = None
+        horizons_on_goal = 0
+        cumulative_goal_reward = 0.0
+        goal_reached_prev = False   # did the worker reach the goal last horizon?
+        ball_collected_prev = False  # was a ball collected last horizon?
+
         # Episode tracking
         episode_reward = 0
         episode_steps = 0
@@ -956,19 +970,50 @@ class HierarchicalTrainer:
         horizon_counter = 0
         
         while episode_steps < max_steps:
-            # Manager selects goals
-
-            wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
-                state, step_count=self.global_step_counter
+            # ── GOAL SELECTION (persistence) ──────────────────────────────────
+            need_new_goal = (
+                active_wide_goal is None
+                or goal_reached_prev
+                or ball_collected_prev
+                or horizons_on_goal >= self.goal_timeout
             )
 
-            # Truncated BPTT: detach hidden state so the computation graph doesn't
-            # grow across horizons. Values and log_probs still have local gradients.
-            if self.manager.hidden_state is not None:
-                self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
+            if need_new_goal:
+                # Push completed goal experience to buffer before selecting new one
+                if active_wide_goal is not None:
+                    manager_states.append(active_goal_state)
+                    manager_wide_goals.append(active_wide_goal)
+                    manager_narrow_goals.append(active_narrow_goal)
+                    manager_rewards.append(cumulative_goal_reward)
+                    manager_values.append(active_value)
+                    manager_log_probs.append(active_log_prob)
+                    manager_entropies_for_update.append(active_entropy)
+                    # flush only traversal state — LSTM context stays valid across goals
+                    self.worker.current_traversal_path = []
+                    self.worker.traversal_step = 0
+                    self.worker.current_edge_actions = None
+                    self.worker.current_action_idx = 0
+
+                wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
+                    state, step_count=self.global_step_counter
+                )
+                if self.manager.hidden_state is not None:
+                    self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
+
+                active_wide_goal = wide_goal
+                active_narrow_goal = narrow_goal
+                active_log_prob = manager_log_prob
+                active_value = manager_value
+                active_entropy = entropy.detach()
+                active_goal_state = state
+                horizons_on_goal = 0
+                cumulative_goal_reward = 0.0
+            else:
+                wide_goal = active_wide_goal
+                narrow_goal = active_narrow_goal
 
             manager_selection_counts[wide_goal] += 1
-            manager_entropies.append(entropy.item())
+            manager_entropies.append(active_entropy.item())
 
             if diag2:
                 balls_before_horizon = len(self.env.active_balls)
@@ -982,15 +1027,7 @@ class HierarchicalTrainer:
             unique_manager_goals.add(wide_goal)
             manager_wide_goals_list.append(wide_goal)
             manager_narrow_goals_list.append(narrow_goal)
-            manager_values_list.append(manager_value.item())
-            
-            # ACCUMULATE Manager experience
-            manager_states.append(state)
-            manager_wide_goals.append(wide_goal)
-            manager_narrow_goals.append(narrow_goal)
-            manager_log_probs.append(manager_log_prob)
-            manager_values.append(manager_value)
-            manager_entropies_for_update.append(entropy.detach())  # Keep this
+            manager_values_list.append(active_value.item())
             
             # Worker executes for horizon steps
             worker_states = []
@@ -1054,8 +1091,7 @@ class HierarchicalTrainer:
                 if self.manhattan_distance_rew_shaping:
                     worker_reward += progress_bonus * self.worker_shaping_weight
                 
-                # NEW: Track if Worker reached goal
-                if worker_reward > 0:
+                if next_state == narrow_goal:
                     goal_reached_this_horizon = True
                 
                 # Store Worker experience
@@ -1147,27 +1183,22 @@ class HierarchicalTrainer:
                         progress_reward = progress * self.manager_shaping_weight
                         manager_reward += progress_reward
 
-            # Collect reward
-            #clipped_manager_reward = np.clip(manager_reward, -1, 1) #CLIP
-            #manager_reward = clipped_manager_reward
-            manager_rewards.append(manager_reward)
+            # Accumulate reward for the current goal (pushed to buffer on next selection)
+            cumulative_goal_reward += manager_reward
+            horizons_on_goal += 1
             horizon_counter += 1
-
+            goal_reached_prev = goal_reached_this_horizon
+            ball_collected_prev = balls_collected_this_horizon > 0
 
             MANAGER_UPDATE_FREQUENCY = 20
 
-            # ADD THIS - save for diagnostics before resetting
             all_manager_rewards_this_episode.append(manager_reward)
-                
 
-
-            # Add after this line:
             if diag3:
-                if horizon_counter % 10 == 0:  # Print every 10 horizons
+                if horizon_counter % 10 == 0:
                     print(f"  [REWARD DEBUG] Horizon {horizon_counter}: env_reward={horizon_env_reward:.3f}, total_so_far={sum(all_manager_rewards_this_episode):.3f}")
 
-            
-            # Update Manager 
+            # Update Manager on completed-goal experiences accumulated so far
             if horizon_counter % MANAGER_UPDATE_FREQUENCY == 0 and len(manager_rewards) > 0:
                 self.manager.update_policy(
                     manager_states, manager_wide_goals, manager_narrow_goals,
@@ -1176,12 +1207,8 @@ class HierarchicalTrainer:
                     step_count=self.global_step_counter
                 )
                 manager_updates += 1
-                
-                # ADD THIS: Detach AFTER update
                 if self.manager.hidden_state is not None:
                     self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
-
-                # Reset Manager experience
                 manager_states = []
                 manager_wide_goals = []
                 manager_narrow_goals = []
@@ -1189,21 +1216,30 @@ class HierarchicalTrainer:
                 manager_values = []
                 manager_log_probs = []
                 manager_entropies_for_update = []
-            
+
             if terminated or truncated:
-                # ✅ ADD: Final update if any remaining experiences
-                if len(manager_rewards) > 0:
-                    self.manager.update_policy(
-                        manager_states, manager_wide_goals, manager_narrow_goals,
-                        manager_rewards, manager_values, manager_log_probs,
-                        manager_entropies_for_update,
-                        step_count=self.global_step_counter
-                    )
-                    manager_updates += 1
-                    
-                    if self.manager.hidden_state is not None:
-                        self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
                 break
+
+        # ── FINALIZE LAST GOAL EXPERIENCE + FINAL UPDATE ──────────────────────
+        if active_wide_goal is not None:
+            manager_states.append(active_goal_state)
+            manager_wide_goals.append(active_wide_goal)
+            manager_narrow_goals.append(active_narrow_goal)
+            manager_rewards.append(cumulative_goal_reward)
+            manager_values.append(active_value)
+            manager_log_probs.append(active_log_prob)
+            manager_entropies_for_update.append(active_entropy)
+
+        if len(manager_rewards) > 0:
+            self.manager.update_policy(
+                manager_states, manager_wide_goals, manager_narrow_goals,
+                manager_rewards, manager_values, manager_log_probs,
+                manager_entropies_for_update,
+                step_count=self.global_step_counter
+            )
+            manager_updates += 1
+            if self.manager.hidden_state is not None:
+                self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
         
         self.global_episode_counter += 1
         

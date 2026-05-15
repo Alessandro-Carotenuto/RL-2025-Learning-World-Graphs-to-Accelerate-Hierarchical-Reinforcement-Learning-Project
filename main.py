@@ -144,11 +144,21 @@ def _walk_away_from_spawn(env, spawn: tuple, walk_length: int = 400, bias: float
 
 
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, fast_training=True,
-                              explore_top_fraction: float = 0.20):
+                              explore_top_fraction: float = 0.20,
+                              diversity_walk_number: int = 10,
+                              walk_length: int = 250,
+                              walk_bias: float = 0.65,
+                              walk_episodes: int = 4,
+                              graph_walk_length: int = 20,
+                              graph_num_attempts: int = 70):
     """
     Main alternating training loop with persistent KL annealing.
     explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
                           used for trajectory collection once COVERAGE_THRESHOLD is reached.
+    diversity_walk_number: number of biased random walks per iteration for geographic diversity.
+    walk_length: steps per diversity walk.
+    walk_bias: probability of moving away from spawn at each walk step.
+    walk_episodes: episodes collected from each walk destination.
     """
     print("Starting Alternating Training Loop:")
     print("=" * 50)
@@ -277,15 +287,14 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         # Diversity collection: biased random walks away from spawn to break clustering.
         # Each walk physically navigates to a distant region (no map knowledge used).
         _cw = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
-        print(f"Spatial diversity: 4 biased walks from spawn {spawn_pos}...")
-        diversity_walk_number=10
+        print(f"Spatial diversity: {diversity_walk_number} biased walks from spawn {spawn_pos}...")
         for _wi in range(diversity_walk_number):
-            _dst = _walk_away_from_spawn(env, spawn_pos, walk_length=250, bias=0.65)
+            _dst = _walk_away_from_spawn(env, spawn_pos, walk_length=walk_length, bias=walk_bias)
             dist_from_spawn = manhattan_distance(_dst, spawn_pos)
             print(f"  Walk {_wi+1}: reached {_dst} (dist={dist_from_spawn})")
             try:
                 _eps = policy.collect_episodes_from_position(
-                    env, _dst, num_episodes=4, max_episode_length=100,
+                    env, _dst, num_episodes=walk_episodes, max_episode_length=100,
                     vae_system=vae_system, curiosity_weight=_cw
                 )
                 if _eps:
@@ -313,7 +322,9 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     
 
     # Construct world graph
-    world_graph = policy.complete_world_graph_discovery(env, pivotal_states)
+    world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
+                                                         graph_walk_length=graph_walk_length,
+                                                         graph_num_attempts=graph_num_attempts)
     
     # Final summary
     print(f"\nAlternating Training Complete!")
@@ -835,7 +846,13 @@ def test_phase1_with_diagnostics(config=None):
     pivotal_states, world_graph, loop_metrics, all_pivotal_states_history = alternating_training_loop(
         env, policy, vae_system, buffer,
         max_iterations=config['phase1_iterations'],
-        explore_top_fraction=config.get('explore_top_fraction', 0.20)
+        explore_top_fraction=config.get('explore_top_fraction', 0.20),
+        diversity_walk_number=config.get('diversity_walk_number', 10),
+        walk_length=config.get('walk_length', 250),
+        walk_bias=config.get('walk_bias', 0.65),
+        walk_episodes=config.get('walk_episodes', 4),
+        graph_walk_length=config.get('graph_walk_length', 20),
+        graph_num_attempts=config.get('graph_num_attempts', 70)
     )
     
     # Extract metrics from VAE training history
@@ -1255,6 +1272,7 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         horizon=config['manager_horizon'],
         diagnostic_interval=config['diagnostic_interval'],
         diagnostic_checkstart=config['diagnostic_checkstart'],
+        goal_timeout=config.get('goal_timeout', 3),
     )
 
     print("\nPHASE 2: Hierarchical Training (standalone)")
@@ -1309,8 +1327,8 @@ steps=2000
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 2,
-        'phase2_episodes': 10,
+        'phase1_iterations': 50,
+        'phase2_episodes': 500,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,
         'neighborhood_size': math.ceil(24/4),
@@ -1320,7 +1338,14 @@ externalconfig = {
         'diagnostic_interval': 10000,
         'diagnostic_checkstart': False,
         'full_breakdown_every': 10,
+        'goal_timeout': 3,              # max horizons before forcing a new Manager goal
         'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
+        'diversity_walk_number': 30,    # Phase 1: biased random walks per iteration
+        'walk_length': 400,             # Phase 1: steps per diversity walk
+        'walk_bias': 0.70,              # Phase 1: probability of stepping away from spawn
+        'walk_episodes': 10,             # Phase 1: episodes collected per walk destination
+        'graph_walk_length': 50,         # Phase 1: max steps per random walk for edge discovery
+        'graph_num_attempts': 150,       # Phase 1: random walk attempts per pivotal state
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
@@ -1363,7 +1388,13 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     pivotal_states, world_graph, stat_buffer, all_pivotal_states = alternating_training_loop(
         env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
         fast_training=fast_training,
-        explore_top_fraction=config.get('explore_top_fraction', 0.20)
+        explore_top_fraction=config.get('explore_top_fraction', 0.20),
+        diversity_walk_number=config.get('diversity_walk_number', 10),
+        walk_length=config.get('walk_length', 250),
+        walk_bias=config.get('walk_bias', 0.65),
+        walk_episodes=config.get('walk_episodes', 4),
+        graph_walk_length=config.get('graph_walk_length', 20),
+        graph_num_attempts=config.get('graph_num_attempts', 70)
     )
     
     phase1_time = time.time() - start_time
@@ -1426,10 +1457,11 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
 
     env.phase = 2
     trainer = HierarchicalTrainer(
-    manager, worker, env, 
+    manager, worker, env,
     horizon=config['manager_horizon'],
-    diagnostic_interval=config['diagnostic_interval'],  # NEW
-    diagnostic_checkstart=config['diagnostic_checkstart'])
+    diagnostic_interval=config['diagnostic_interval'],
+    diagnostic_checkstart=config['diagnostic_checkstart'],
+    goal_timeout=config.get('goal_timeout', 3))
     
     print("\nPHASE 2: Hierarchical Training")
     

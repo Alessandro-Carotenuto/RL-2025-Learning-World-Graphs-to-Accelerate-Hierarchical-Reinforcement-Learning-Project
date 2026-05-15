@@ -627,7 +627,9 @@ class GoalConditionedPolicy(nn.Module):
         
         return world_graph
    
-    def complete_world_graph_discovery(self, env, pivotal_states: List[Tuple[int, int]]) -> GraphManager:
+    def complete_world_graph_discovery(self, env, pivotal_states: List[Tuple[int, int]],
+                                       graph_walk_length: int = 20,
+                                       graph_num_attempts: int = 70) -> GraphManager:
         """
         Complete Phase 1 by discovering edges and constructing world graph.
         
@@ -643,7 +645,9 @@ class GoalConditionedPolicy(nn.Module):
         print("="*60)
         
         # Step 1: Discover edges through random walks
-        raw_edges = self.discover_edges_between_pivotal_states(env, pivotal_states)
+        raw_edges = self.discover_edges_between_pivotal_states(env, pivotal_states,
+                                                                max_walk_length=graph_walk_length,
+                                                                num_attempts=graph_num_attempts)
         
         # Step 2: Refine paths using goal-conditioned policy
         refined_edges = self.refine_paths_with_goal_policy(env, raw_edges)
