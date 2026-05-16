@@ -1,10 +1,5 @@
 import torch
 from torch.distributions import Uniform
-from torch import digamma, lgamma
-import torch.nn.functional as F
-
-import numpy as np
-
 
 # HARD KUMARASWAMY DISTRIBUTION:
 # DIFFERENTIABLE BINARY SAMPLING WITH STRETCH-AND-RECTIFY FOR VAE STATE SELECTION

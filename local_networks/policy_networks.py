@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-
 import random
+from typing import List, Tuple, Dict
 
-from typing import List, Tuple, Dict, Optional
+# PROJECT-SPECIFIC IMPORTS
 
 from utils.misc import manhattan_distance,sample_goal_position
 from utils.graph_manager import GraphManager

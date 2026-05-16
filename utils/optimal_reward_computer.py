@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Tuple
 from itertools import permutations
 
 def compute_optimal_reward_for_episode(env, debug=False) -> Tuple[float, int]:

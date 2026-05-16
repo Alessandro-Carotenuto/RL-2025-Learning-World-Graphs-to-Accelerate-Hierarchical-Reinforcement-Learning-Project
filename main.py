@@ -1,59 +1,30 @@
 # EXTERNAL LIBRARY IMPORTS
 
-import pygame
-import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import os
 import math
+import time
+import torch
+import imageio
 
-from enum import Enum
-
-import minigrid
+# MINIGRID IMPORTS
 from minigrid.core.constants import COLOR_NAMES
 from minigrid.core.grid import Grid
-from minigrid.core.mission import MissionSpace
 from minigrid.core.world_object import Door, Goal, Key, Wall, Ball
-from minigrid.manual_control import ManualControl
-from minigrid.minigrid_env import MiniGridEnv
 
-from collections import deque
 
-from typing import Any, Iterable, SupportsFloat, TypeVar
-from gymnasium.core import ActType, ObsType
-
-import time
-
-import heapq
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions import Uniform
-
-from typing import List, Tuple, Dict, Optional
 
 # PROJECT-SPECIFIC IMPORTS
 
-from local_distributions.hardkuma import HardKumaraswamy,BetaDistribution
-from wrappers.minigrid_wrapper import MinigridWrapper,EnvModes,EnvSizes
-from wrappers.fast_wrapper import FastWrapper
+from wrappers.minigrid_wrapper import MinigridWrapper, EnvModes, EnvSizes
 from utils.graph_manager import GraphManager, GraphVisualizer
-from utils.statistics_buffer import StatBuffer,TestBuffer
-from utils.statistics_visualizer import Visualizer
-from local_networks.vaesystem import PriorNetwork,InferenceNetwork,GenerationNetwork
-from local_networks.vaesystem import StateEncoder, ActionEncoder, VAESystem
+from utils.statistics_buffer import StatBuffer
+from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
-from utils.misc import manhattan_distance,sample_goal_position
+from utils.misc import manhattan_distance, sample_goal_position
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
-from utils.optimal_reward_computer import compute_optimal_reward_for_episode, compute_optimal_reward_bruteforce_small
 
-
-
-import pickle
-import imageio
 def replay_and_save_video(env_config, episode_data, filename, world_graph=None, pivotal_states=None):
     """Replay episode and save as video."""
     from PIL import Image, ImageDraw

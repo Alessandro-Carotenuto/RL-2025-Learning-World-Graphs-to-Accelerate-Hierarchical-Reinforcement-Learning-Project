@@ -1,23 +1,18 @@
-from enum import Enum
-
-import minigrid
+# MINIGRID IMPORTS
 from minigrid.core.constants import COLOR_NAMES
 from minigrid.core.grid import Grid
 from minigrid.core.mission import MissionSpace
 from minigrid.core.world_object import Door, Goal, Key, Wall, Ball
-from minigrid.manual_control import ManualControl
 from minigrid.minigrid_env import MiniGridEnv
 
-import random
 
-import math
 
-import torch
-import torch.nn as nn
-
+# OTHER IMPORTS
 from collections import deque
-
+import random
+import math
 import numpy as np
+from enum import Enum
 
 #----------------------------------------------------------------------------#
 #                          ENVIRONMENT MODES                                #

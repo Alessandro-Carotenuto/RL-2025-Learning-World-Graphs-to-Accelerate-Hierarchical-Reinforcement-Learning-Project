@@ -4,10 +4,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
-from typing import List, Tuple, Dict, Optional
-
+# IMPORTS FOR DISTRIBUTIONS
+from typing import List, Tuple
 import numpy as np
 
+# PROJECT-SPECIFIC IMPORTS
 from local_distributions.hardkuma import HardKumaraswamy, BetaDistribution
 
 diagvae=False
