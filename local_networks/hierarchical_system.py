@@ -884,28 +884,14 @@ class HierarchicalTrainer:
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
-    def train_episode(self, max_steps: int = 200, full_breakdown_every=1, recording_data=None):
+    def train_episode(self, max_steps: int = 200, full_breakdown_every=1):
         """Train one episode with comprehensive diagnostics."""
-        
+
         # Episode tracking
         episode_reward = 0
         episode_steps = 0
         manager_updates = 0
         worker_updates = 0
-
-        # At the very beginning
-        if recording_data is not None:
-            episode_record = {
-                'actions': [],
-                'goals': [],
-                'initial_agent_pos': tuple(self.env.agent_pos),
-                'initial_agent_dir': self.env.agent_dir,
-                'ball_positions': list(self.env.active_balls),
-                'grid_state': recording_data['grid_state']
-            }
-            record_this_episode = True
-        else:
-            record_this_episode = False
 
         all_manager_rewards_this_episode = []  # Track all horizon rewards for diagnostics
 
@@ -1065,10 +1051,6 @@ class HierarchicalTrainer:
                     terminated = False
                     truncated = False
                 
-                if record_this_episode:
-                    episode_record['actions'].append(action)
-                    episode_record['goals'].append((wide_goal, narrow_goal))
-
                 if diag2:
                     if env_reward != 0:
                         print(f"[REWARD] Step {episode_steps}: env_reward={env_reward:.3f}, "
@@ -1290,17 +1272,6 @@ class HierarchicalTrainer:
             print(f"  Worker updates: {worker_updates}")
             print(f"{'#'*70}\n")
 
-            if record_this_episode:
-                episode_record['reward'] = episode_reward
-                
-                if episode_reward < 0.5 and recording_data['bad_episode'] is None:
-                    recording_data['bad_episode'] = episode_record
-                    print(f"📹 Recorded BAD episode: reward={episode_reward:.2f}")
-                
-                if episode_reward > 3.0 and recording_data['good_episode'] is None:
-                    recording_data['good_episode'] = episode_record
-                    print(f"📹 Recorded GOOD episode: reward={episode_reward:.2f}")
-        
         return {
             'episode_reward': episode_reward,
             'episode_steps': episode_steps,

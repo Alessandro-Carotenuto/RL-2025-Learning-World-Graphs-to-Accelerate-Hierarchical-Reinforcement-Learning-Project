@@ -1,6 +1,17 @@
 import random
+import torch
 
-from typing import List, Tuple, Dict, Optional
+#-----------------------------------------------------------------------------
+
+def resolve_device(config):
+    if config['device'] == 'cuda':
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA requested but not available. Falling back to CPU.")
+            config['device'] = 'cpu'
+        else:
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU")
 
 #-----------------------------------------------------------------------------
 def manhattan_distance(pos1, pos2):

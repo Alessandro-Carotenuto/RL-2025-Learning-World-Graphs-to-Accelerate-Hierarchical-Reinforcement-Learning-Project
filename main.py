@@ -1,5 +1,4 @@
 # EXTERNAL LIBRARY IMPORTS
-
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -16,101 +15,14 @@ from minigrid.core.world_object import Door, Goal, Key, Wall, Ball
 
 
 # PROJECT-SPECIFIC IMPORTS
-
 from wrappers.minigrid_wrapper import MinigridWrapper, EnvModes, EnvSizes
 from utils.graph_manager import GraphManager, GraphVisualizer
 from utils.statistics_buffer import StatBuffer
 from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
-from utils.misc import manhattan_distance, sample_goal_position
+from utils.misc import manhattan_distance, sample_goal_position, resolve_device
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 
-def replay_and_save_video(env_config, episode_data, filename, world_graph=None, pivotal_states=None):
-    """Replay episode and save as video."""
-    from PIL import Image, ImageDraw
-
-    env = MinigridWrapper(
-        size=env_config['maze_size'],
-        mode=EnvModes.MULTIGOAL,
-        max_steps=env_config['max_steps_per_episode'],
-        render_mode='rgb_array'
-    )
-    env.phase = 2
-
-    # Restore grid state
-    env.grid = Grid(env.size, env.size)
-    for y, row in enumerate(episode_data['grid_state']):
-        for x, cell in enumerate(row):
-            if cell == '#':
-                env.grid.set(x, y, Wall())
-            elif cell == 'B':
-                env.grid.set(x, y, Ball(COLOR_NAMES[0]))
-
-    # Set agent
-    env.agent_pos = episode_data['initial_agent_pos']
-    env.agent_dir = episode_data['initial_agent_dir']
-    env.active_balls = set(episode_data['ball_positions'])
-
-    # Restore step_count if present, else set to 0 to avoid AttributeError
-    if hasattr(env, 'step_count'):
-        if 'step_count' in episode_data:
-            env.step_count = episode_data['step_count']
-        else:
-            env.step_count = 0
-    else:
-        env.step_count = episode_data.get('step_count', 0)
-
-    goals = episode_data.get('goals', [])
-    overlay_enabled = world_graph is not None and pivotal_states is not None
-
-    def draw_graph_overlay(frame, step_idx):
-        tile_size = frame.shape[1] // env.width
-
-        def px(coord):
-            return (coord[0] * tile_size + tile_size // 2,
-                    coord[1] * tile_size + tile_size // 2)
-
-        frame_pil = Image.fromarray(frame).convert('RGBA')
-        overlay = Image.new('RGBA', frame_pil.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-
-        # Edges: yellow, 25% opacity
-        for (start, end) in world_graph.edges:
-            draw.line([px(start), px(end)], fill=(255, 220, 0, 64), width=2)
-
-        # Nodes: yellow circles, 25% opacity
-        r = max(2, tile_size // 5)
-        for ps in pivotal_states:
-            cx, cy = px(ps)
-            draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(255, 220, 0, 64))
-
-        # Current goal overlay
-        if step_idx < len(goals):
-            wide_goal, narrow_goal = goals[step_idx]
-            # Wide goal: bright orange, 100% opacity
-            cx, cy = px(wide_goal)
-            draw.ellipse([(cx - r * 2, cy - r * 2), (cx + r * 2, cy + r * 2)],
-                         fill=(255, 160, 0, 255))
-            # Narrow goal cell: cyan, 20% opacity
-            nx, ny = narrow_goal
-            draw.rectangle(
-                [(nx * tile_size, ny * tile_size),
-                 ((nx + 1) * tile_size - 1, (ny + 1) * tile_size - 1)],
-                fill=(0, 200, 255, 51)
-            )
-
-        return np.array(Image.alpha_composite(frame_pil, overlay).convert('RGB'))
-
-    frames = []
-    for i, action in enumerate(episode_data['actions']):
-        frame = env.render()
-        if overlay_enabled:
-            frame = draw_graph_overlay(frame, i)
-        frames.append(frame)
-        env.step(action)
-
-    imageio.mimsave(filename, frames, fps=10)
-    print(f"Saved video: {filename}")
 
 #---------------------------------------------------------------------------------------
 # MAIN ALTERNATING TRAINING LOOP - UPDATED TO INCLUDE WORLD GRAPH CONSTRUCTION
@@ -1271,7 +1183,7 @@ def load_phase1_checkpoint(path, device=None):
     vae_system.load_state_dict(checkpoint['vae_state_dict'])
     vae_system.to(config['device'])
 
-    policy = GoalConditionedPolicy(lr=5e-3, device=config['device'])
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
     policy.load_state_dict(checkpoint['policy_state_dict'])
 
     print(f"Phase 1 checkpoint loaded from '{path}'")
@@ -1317,9 +1229,7 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         config.update(config_overrides)
 
         # If device is overridden, move loaded models to the new device too.
-        if config['device'] == 'cuda' and not torch.cuda.is_available():
-            print("WARNING: CUDA requested in config_overrides but not available. Falling back to CPU.")
-            config['device'] = 'cpu'
+        resolve_device(config)
 
         vae_system.to(config['device'])
         policy.to(config['device'])
@@ -1462,6 +1372,7 @@ externalconfig = {
         'neighborhood_size': math.ceil(24/8),
         'manager_lr': 5e-4,
         'worker_lr': 1e-4,
+        'goal_policy_lr': 5e-3,
         'vae_mu0': 9.0,
         'diagnostic_interval': 10000,
         'diagnostic_checkstart': False,
@@ -1480,20 +1391,16 @@ externalconfig = {
 
 fast_training_toggle=True
 
-def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_toggle, recordflag=False,
-                             phase1_animation=True, phase2_animation=True):
+def train_full_phase1_phase2(
+        config=externalconfig,
+        fast_training=fast_training_toggle,
+        phase1_animation=True,
+        phase2_animation=True):
+    
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
 
-    # Validate device availability
-    if config['device'] == 'cuda':
-        if not torch.cuda.is_available():
-            print("WARNING: CUDA requested but not available. Falling back to CPU.")
-            config['device'] = 'cpu'
-        else:
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Using CPU")
+    resolve_device(config)
     
     print("="*70)
     print("FULL TRAINING with Diagnostics")
@@ -1507,7 +1414,7 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     env.phase = 1
     env.randomgen = True
     
-    policy = GoalConditionedPolicy(lr=5e-3,device=config['device']) # Hardcoded learning rate for goal policy
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
     buffer = StatBuffer()
     
@@ -1552,16 +1459,6 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         print(f"\nERROR: Phase 1 produced only {len(pivotal_states)} pivotal state(s). "
               f"Phase 2 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
         return
-
-    # After phase 1, before phase 2 setup:
-    if recordflag:
-        grid_state = env.getGridState()
-        recording_data = {
-            'bad_episode': None,
-            'good_episode': None,
-            'grid_state': grid_state,
-            'config': config
-        }
 
     # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
     manager = HierarchicalManager(
@@ -1617,7 +1514,6 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         stats = trainer.train_episode(
             max_steps=config['max_steps_per_episode'],
             full_breakdown_every=debug_interval,
-            recording_data=recording_data if recordflag else None
         )
 
         metrics['rewards'].append(stats['episode_reward'])
@@ -1687,14 +1583,6 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
     plt.savefig(simple_plot_path)
     print("\nPlots saved to training_diagnostics.png")
 
-        # After plots, before return
-    if recordflag and recording_data['bad_episode'] is not None:
-        replay_and_save_video(config, recording_data['bad_episode'], 'bad_episode.mp4',
-                              world_graph=world_graph, pivotal_states=pivotal_states)
-    if recordflag and recording_data['good_episode'] is not None:
-        replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4',
-                              world_graph=world_graph, pivotal_states=pivotal_states)
-
     # Save trained weights to session (GCP fine-tuned in Phase 2)
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     session_path = checkpoint_path.replace('.pt', '_session.pt')
@@ -1714,7 +1602,6 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
             world_graph=world_graph,
             pivotal_states=pivotal_states,
         )
-
 
 def run_phase1_comparison():
     """
@@ -1755,7 +1642,7 @@ def run_phase1_comparison():
         print(f"{'='*70}")
         
         # Create fresh networks
-        policy = GoalConditionedPolicy(lr=5e-3, device=device)
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
         vae_system = VAESystem(
             state_dim=16,
             action_vocab_size=7,
@@ -1866,7 +1753,7 @@ def run_phase1_size_comparison():
         print_grid_image(grid_state, name=f'map_{size.name}')
         
         # Create networks
-        policy = GoalConditionedPolicy(lr=5e-3, device=device)
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
         vae_system = VAESystem(
             state_dim=16,
             action_vocab_size=7,
@@ -1949,7 +1836,7 @@ def main():
         'device': externalconfig['device'],
     })
     """
-    train_full_phase1_phase2(recordflag=False)       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)  # fixed_balls=False for random
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
     # run_phase1_comparison()
