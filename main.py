@@ -1174,74 +1174,14 @@ def restore_maze_from_grid_state(env, grid_state):
             else:
                 env.grid.set(x, y, None)
                 env.placeable_grid[x][y] = True
+                
     # Agent start position is never placeable
     env.placeable_grid[env.agent_start_pos[0]][env.agent_start_pos[1]] = False
 
 
-def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrides=None, fixed_balls=True,
-                          phase2_animation=True):
-    """Run Phase 2 training using a saved Phase 1 checkpoint.
-    fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
-    fixed_balls=False: random ball positions every episode
-    """
-    pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
-
-    if config_overrides:
-        config.update(config_overrides)
-
-        # If device is overridden, move loaded models to the new device too.
-        resolve_device(config)
-
-        vae_system.to(config['device'])
-        policy.to(config['device'])
-
-    env = MinigridWrapper(
-        size=config['maze_size'],
-        mode=EnvModes.MULTIGOAL,
-        max_steps=config['max_steps_per_episode'],
-    )
-    env.reset()  # triggers _gen_grid → initializes grid + placeable_grid
-    restore_maze_from_grid_state(env, grid_state)
-
-    # Find a valid start position in the Phase 1 maze: not a wall, ≥6 reachable cells
-    attempt = 0
-    while True:
-        attempt += 1
-        x = random.randint(1, env.size - 2)
-        y = random.randint(1, env.size - 2)
-        if isinstance(env.grid.get(x, y), Wall):
-            continue
-        reachables = env.BFS_all_reachable((x, y))
-        if len(reachables) >= 6:
-            env.agent_start_pos = (x, y)
-            env.agent_pos = (x, y)
-            env.placeable_grid[x][y] = False
-            break
-
-    agent_start = (x, y)
-    print(f"Valid start found after {attempt} attempt(s): {agent_start} ({len(reachables)} reachable cells)")
-
-    env.firstgen = False  # prevent re-generation on next reset
-    env.phase = 2         # next reset → ResetMultiGoals → balls placed
-
-    # Graph reachability diagnostic
-    reachable = world_graph.get_reachable_nodes(agent_start)
-    print(f"Graph reachability from {agent_start}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
-    unreachable = [n for n in pivotal_states if n not in reachable]
-    print(f"  Unreachable from start: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
-
-    if fixed_balls:
-        first_balls = env.ResetMultiGoals(agent_start, goals=5)
-        env.fixed_ball_positions = first_balls
-        print(f"Fixed ball positions: {first_balls}")
-    else:
-        first_balls = None
-        print("Ball positions: random each episode")
-
-    session_path = checkpoint_path.replace('.pt', '_session.pt')
-    torch.save({'agent_start': agent_start, 'ball_positions': first_balls}, session_path)
-    print(f"Session saved to '{session_path}'")
-
+def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
+                         agent_start, first_balls, session_path, grid_state,
+                         phase2_animation=True):
     manager = HierarchicalManager(
         pivotal_states,
         neighborhood_size=config['neighborhood_size'],
@@ -1264,6 +1204,7 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
     print("\nDiagnosing Worker behavior BEFORE training:")
     diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states)
 
+    env.phase = 2
     trainer = HierarchicalTrainer(
         manager, worker, env,
         horizon=config['manager_horizon'],
@@ -1272,8 +1213,11 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
         goal_timeout=config.get('goal_timeout', 3),
     )
 
-    print("\nPHASE 2: Hierarchical Training (standalone)")
-    metrics = {'rewards': [], 'steps': [], 'manager_updates': [], 'worker_updates': [], 'times': [], 'optimal_rewards': []}
+    print("\nPHASE 2: Hierarchical Training")
+    metrics = {
+        'rewards': [], 'steps': [], 'manager_updates': [],
+        'worker_updates': [], 'times': [], 'optimal_rewards': [],
+    }
 
     debug_interval = max(1, config['phase2_episodes'] // 20)
     for episode in range(config['phase2_episodes']):
@@ -1296,8 +1240,6 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
     print("="*70)
     plot_training_diagnostics(trainer, config)
 
-    # Update session with trained weights (GCP fine-tuned in Phase 2)
-    session_path = checkpoint_path.replace('.pt', '_session.pt')
     torch.save({
         'agent_start': agent_start,
         'ball_positions': first_balls,
@@ -1316,6 +1258,70 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
             pivotal_states=pivotal_states,
         )
 
+    return metrics
+
+
+def run_phase2_standalone(
+        checkpoint_path='phase1_checkpoint.pt',
+        config_overrides=None,
+        fixed_balls=True,
+        phase2_animation=True):
+    
+    """Run Phase 2 training using a saved Phase 1 checkpoint.
+    fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
+    fixed_balls=False: random ball positions every episode
+    """
+    pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
+
+    if config_overrides:
+        config.update(config_overrides)
+        resolve_device(config)
+        vae_system.to(config['device'])
+        policy.to(config['device'])
+
+    env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'])
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+
+    # Find a valid start position: not a wall, ≥6 reachable cells
+    attempt = 0
+    while True:
+        attempt += 1
+        x = random.randint(1, env.size - 2)
+        y = random.randint(1, env.size - 2)
+        if isinstance(env.grid.get(x, y), Wall):
+            continue
+        reachables = env.BFS_all_reachable((x, y))
+        if len(reachables) >= 6:
+            env.agent_start_pos = (x, y)
+            env.agent_pos = (x, y)
+            env.placeable_grid[x][y] = False
+            break
+
+    agent_start = (x, y)
+    print(f"Valid start found after {attempt} attempt(s): {agent_start} ({len(reachables)} reachable cells)")
+
+    env.firstgen = False
+
+    reachable = world_graph.get_reachable_nodes(agent_start)
+    print(f"Graph reachability from {agent_start}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
+    unreachable = [n for n in pivotal_states if n not in reachable]
+    print(f"  Unreachable from start: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
+
+    if fixed_balls:
+        first_balls = env.ResetMultiGoals(agent_start, goals=config.get('num_balls', 5))
+        env.fixed_ball_positions = first_balls
+        print(f"Fixed ball positions: {first_balls}")
+    else:
+        first_balls = None
+        print("Ball positions: random each episode")
+
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    metrics = _run_phase2_training(
+        config, pivotal_states, world_graph, policy, env,
+        agent_start, first_balls, session_path, grid_state, phase2_animation,
+    )
+
     print(f"Best reward: {max(metrics['rewards']):.2f}")
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:]) / 10:.2f}")
     return metrics
@@ -1328,6 +1334,7 @@ externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
         'phase1_iterations': 2,
         'phase2_episodes': 10,
+        'num_balls': 5,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,
         'neighborhood_size': math.ceil(24/8),
@@ -1419,108 +1426,18 @@ def train_full_phase1_phase2(
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
 
-    # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
-    manager = HierarchicalManager(
-        pivotal_states, 
-        neighborhood_size=config['neighborhood_size'],
-        lr=config['manager_lr'],
-        horizon=config['manager_horizon'],
-        diagnostic_interval=config['diagnostic_interval'],  
-        diagnostic_checkstart=config['diagnostic_checkstart'],
-        device=config['device']
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    metrics = _run_phase2_training(
+        config, pivotal_states, world_graph, policy, env,
+        env.agent_start_pos, None, session_path, GRIDSTATE, phase2_animation,
     )
 
-    worker = HierarchicalWorker(
-        world_graph,
-        pivotal_states,
-        lr=config['worker_lr'],
-        goal_policy=policy,
-        device=config['device']
-    )
-
-    manager.initialize_from_goal_policy(policy)
-    worker.initialize_from_goal_policy(policy)
-
-    print("\nDiagnosing Worker behavior BEFORE training:")
-    diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states)
-    
-    env.phase = 2
-    trainer = HierarchicalTrainer(
-        manager, worker, env,
-        horizon=config['manager_horizon'],
-        diagnostic_interval=config['diagnostic_interval'],
-        diagnostic_checkstart=config['diagnostic_checkstart'],
-        goal_timeout=config.get('goal_timeout', 3))
-    
-    print("\nPHASE 2: Hierarchical Training")
-    
-    # Tracking
-    metrics = {
-        'rewards': [],
-        'steps': [],
-        'manager_updates': [],
-        'worker_updates': [],
-        'traversals': [],
-        'times': [],
-        'optimal_rewards': []
-    }
-    
-    # Determine debug interval for detailed breakdowns (e.g., every 5% of total episodes)
-    debug_interval = max(1, config['phase2_episodes'] // 20)
-    for episode in range(config['phase2_episodes']):
-        ep_start = time.time()
-        stats = trainer.train_episode(
-            max_steps=config['max_steps_per_episode'],
-            full_breakdown_every=debug_interval,
-        )
-
-        metrics['rewards'].append(stats['episode_reward'])
-        metrics['steps'].append(stats['episode_steps'])
-        metrics['manager_updates'].append(stats['manager_updates'])
-        metrics['worker_updates'].append(stats['worker_updates'])
-        metrics['times'].append(time.time() - ep_start)
-        metrics['optimal_rewards'].append(stats['optimal_reward'])
-        if episode % debug_interval == 0 and episode > 0:
-            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
-    
-    # AFTER all episodes complete, plot diagnostics
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE - Generating diagnostic plots...")
-    print("="*70)
-    
-    plot_training_diagnostics(trainer,config) 
-
-    # Results
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE")
-    print("="*70)
     print(f"Phase 1 time: {phase1_time:.1f}s")
     print(f"Phase 2 time: {sum(metrics['times']):.1f}s")
     print(f"Best reward: {max(metrics['rewards']):.2f}")
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:])/10:.2f}")
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
     print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
-    
-    # Save trained weights to session (GCP fine-tuned in Phase 2)
-    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
-    session_path = checkpoint_path.replace('.pt', '_session.pt')
-    torch.save({
-        'agent_start': env.agent_start_pos,
-        'ball_positions': None,
-        'manager_state_dict': manager.state_dict(),
-        'worker_state_dict': worker.state_dict(),
-        'goal_policy_state_dict': policy.state_dict(),
-    }, session_path)
-
-    print(f"Session updated with trained weights: '{session_path}'")
-
-    if phase2_animation:
-        render_phase2_episode_gif_from_objects(
-            manager, worker, config, GRIDSTATE,
-            agent_start_pos=env.agent_start_pos,
-            world_graph=world_graph,
-            pivotal_states=pivotal_states,
-        )
 
 def _plot_phase1_run(vae_system, metrics, mu0, title_prefix, save_path):
     history = vae_system.training_history
