@@ -42,4 +42,32 @@ def sample_goal_position(env, start_pos, max_distance=20):
         return random.choice(fallback) if fallback else (start_pos[0] + 1, start_pos[1])
 
     return random.choice(candidates)
+
 #-----------------------------------------------------------------------------
+
+def _walk_away_from_spawn(env, spawn: tuple, walk_length: int = 400, bias: float = 0.7) -> tuple:
+    """
+    Random walk biased toward moving away from spawn.
+    At each step: if move_forward increases manhattan distance from spawn,
+    take it with probability `bias`; otherwise pick a random action.
+    Returns the position reached. No map knowledge required — only env.step().
+    """
+    env.reset()
+    current_pos = tuple(env.agent_pos)
+    dir_delta = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
+    for _ in range(walk_length):
+        dx, dy = dir_delta[env.agent_dir]
+        fwd = (current_pos[0] + dx, current_pos[1] + dy)
+        if (manhattan_distance(fwd, spawn) > manhattan_distance(current_pos, spawn)
+                and random.random() < bias):
+            action = 2  # move_forward (away from spawn)
+        else:
+            action = random.choice([0, 1, 2])
+        try:
+            _, _, term, trunc, _ = env.step(action)
+            current_pos = tuple(env.agent_pos)
+            if term or trunc:
+                break
+        except Exception:
+            break
+    return current_pos
