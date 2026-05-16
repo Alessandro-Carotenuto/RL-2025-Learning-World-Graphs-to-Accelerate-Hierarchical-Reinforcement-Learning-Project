@@ -357,11 +357,6 @@ class GoalConditionedPolicy(nn.Module):
             'values_mean': values.mean().item()
         }
         
-        # Print diagnostics every few episodes (could be controlled with a flag)
-        if len(states) > 5:  # Only for longer episodes
-            if old_diag_phase_1:
-                print(f"    Policy update: loss={total_loss:.4f}, adv_mean={advantage_mean:.3f}, grad_norm={total_grad_norm:.4f}, param_change={param_change_norm:.6f}")
-        
         return diagnostics
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 

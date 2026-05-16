@@ -75,7 +75,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         # Train VAE with persistent KL weight
         print(f"First Half: Training VAE on {buffer.episodes_in_buffer} episodes...")
         try:
-            pivotal_states = vae_system.train(
+            pivotal_states = vae_system.train_vae(
                 buffer,
                 num_epochs=25,
                 batch_size=8,
@@ -649,7 +649,7 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     print("\nPHASE 2: Hierarchical Training")
     metrics = {
         'rewards': [], 'steps': [], 'manager_updates': [],
-        'worker_updates': [], 'times': [], 'optimal_rewards': [],
+        'worker_updates': [], 'times': [],
     }
 
     debug_interval = max(1, config['phase2_episodes'] // 20)
@@ -664,7 +664,6 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         metrics['manager_updates'].append(stats['manager_updates'])
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
-        metrics['optimal_rewards'].append(stats['optimal_reward'])
         if episode % debug_interval == 0 and episode > 0:
             print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
 
@@ -775,7 +774,7 @@ externalconfig = {
         'diagnostic_interval': 10000,
         'diagnostic_checkstart': False,
         'full_breakdown_every': 10,
-        'goal_timeout': 10,             # max horizons before forcing a new Manager goal (horizon*timeout = max steps per goal)
+        'goal_timeout': 15,             # max horizons before forcing a new Manager goal (horizon*timeout = max steps per goal)
         'pivotal_spread_alpha': 0.02,   # Phase 1: spread incentive for pivotal state selection (0=off, ~0.05=strong)
         'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
         'diversity_walk_number': 30,    # Phase 1: biased random walks per iteration

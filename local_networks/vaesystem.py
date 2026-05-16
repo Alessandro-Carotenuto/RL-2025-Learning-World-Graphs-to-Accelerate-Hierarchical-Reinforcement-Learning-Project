@@ -234,6 +234,7 @@ class VAESystem(nn.Module):
         self.mu0 = mu0
         self.state_dim = state_dim
         self.action_vocab_size = action_vocab_size
+        self.grid_size = grid_size
         
         # Initialize encoders
         self.state_encoder = StateEncoder(
@@ -618,9 +619,9 @@ class VAESystem(nn.Module):
         self.current_pivotal_states = set(pivotal_states)
         return pivotal_states
     
-    def train(
-        self, 
-        stat_buffer, 
+    def train_vae(
+        self,
+        stat_buffer,
         num_epochs: int = 100,
         batch_size: int = 8,
         convergence_threshold: float = 1e-4,
