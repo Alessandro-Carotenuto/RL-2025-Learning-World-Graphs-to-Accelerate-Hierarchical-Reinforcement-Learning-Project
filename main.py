@@ -1452,13 +1452,13 @@ def train_full_phase1_phase2(
     if phase1_animation:
         create_phase1_gif(all_pivotal_states, GRIDSTATE)
 
-    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
-    save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
-
     if len(pivotal_states) < 2:
         print(f"\nERROR: Phase 1 produced only {len(pivotal_states)} pivotal state(s). "
               f"Phase 2 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
         return
+
+    checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
+    save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
 
     # Phase 2: PASS THE LEARNING RATES AND DIAGNOSTIC PARAMS!
     manager = HierarchicalManager(
@@ -1466,10 +1466,11 @@ def train_full_phase1_phase2(
         neighborhood_size=config['neighborhood_size'],
         lr=config['manager_lr'],
         horizon=config['manager_horizon'],
-        diagnostic_interval=config['diagnostic_interval'],  # NEW
-        diagnostic_checkstart=config['diagnostic_checkstart'],  # NEW
+        diagnostic_interval=config['diagnostic_interval'],  
+        diagnostic_checkstart=config['diagnostic_checkstart'],
         device=config['device']
     )
+
     worker = HierarchicalWorker(
         world_graph,
         pivotal_states,
@@ -1477,23 +1478,20 @@ def train_full_phase1_phase2(
         goal_policy=policy,
         device=config['device']
     )
+
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
 
     print("\nDiagnosing Worker behavior BEFORE training:")
-    diagnose_worker_behavior_single_episode(
-        env, manager, worker, world_graph, pivotal_states
-    )
+    diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states)
     
-    
-
     env.phase = 2
     trainer = HierarchicalTrainer(
-    manager, worker, env,
-    horizon=config['manager_horizon'],
-    diagnostic_interval=config['diagnostic_interval'],
-    diagnostic_checkstart=config['diagnostic_checkstart'],
-    goal_timeout=config.get('goal_timeout', 3))
+        manager, worker, env,
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        goal_timeout=config.get('goal_timeout', 3))
     
     print("\nPHASE 2: Hierarchical Training")
     
@@ -1508,6 +1506,7 @@ def train_full_phase1_phase2(
         'optimal_rewards': []
     }
     
+    # Determine debug interval for detailed breakdowns (e.g., every 5% of total episodes)
     debug_interval = max(1, config['phase2_episodes'] // 20)
     for episode in range(config['phase2_episodes']):
         ep_start = time.time()
@@ -1525,12 +1524,12 @@ def train_full_phase1_phase2(
         if episode % debug_interval == 0 and episode > 0:
             print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
     
-    # AFTER all episodes complete - NOW plot the diagnostics
+    # AFTER all episodes complete, plot diagnostics
     print("\n" + "="*70)
     print("TRAINING COMPLETE - Generating diagnostic plots...")
     print("="*70)
     
-    plot_training_diagnostics(trainer,config)  # ← HERE, after the loop
+    plot_training_diagnostics(trainer,config) 
 
     # Results
     print("\n" + "="*70)
@@ -1543,46 +1542,6 @@ def train_full_phase1_phase2(
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
     print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
     
-    # Plots
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-    axes[0, 0].plot(metrics['rewards'], 'b-', label='Agent')
-    axes[0, 0].plot(metrics['optimal_rewards'], 'r--', label='Optimal')
-    axes[0, 0].set_title('Episode Rewards')
-    axes[0, 0].set_xlabel('Episodes')
-    axes[0, 0].set_ylabel('Reward')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-    
-    axes[0, 1].plot(metrics['steps'])
-    axes[0, 1].set_title('Episode Lengths')
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].grid(True, alpha=0.3)
-    
-    axes[1, 0].plot(metrics['manager_updates'], label='Manager')
-    axes[1, 0].plot(metrics['worker_updates'], label='Worker')
-    axes[1, 0].set_title('Updates per Episode')
-    axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    axes[1, 1].plot(metrics['times'])
-    axes[1, 1].set_title('Time per Episode')
-    axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Seconds')
-    axes[1, 1].grid(True, alpha=0.3)
-    
-
-    # Plots - BOTH with config in filename
-    simple_plot_path = (f"training_simple_"
-                       f"size{config['maze_size'].name}_"
-                       f"h{config['manager_horizon']}_"
-                       f"ep{config['phase2_episodes']}.png")
-    
-    plt.tight_layout()
-    plt.savefig(simple_plot_path)
-    print("\nPlots saved to training_diagnostics.png")
-
     # Save trained weights to session (GCP fine-tuned in Phase 2)
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     session_path = checkpoint_path.replace('.pt', '_session.pt')
