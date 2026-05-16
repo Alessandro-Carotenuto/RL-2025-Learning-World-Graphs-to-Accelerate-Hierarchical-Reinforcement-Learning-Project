@@ -3,7 +3,11 @@ import torch
 
 #-----------------------------------------------------------------------------
 
-def resolve_device(config):
+def resolve_device(config=None):
+    """Validate and print the active device. If config is given, mutates config['device'] in place.
+    Always returns the resolved device string."""
+    if config is None:
+        config = {'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
     if config['device'] == 'cuda':
         if not torch.cuda.is_available():
             print("WARNING: CUDA requested but not available. Falling back to CPU.")
@@ -12,6 +16,7 @@ def resolve_device(config):
             print(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         print("Using CPU")
+    return config['device']
 
 #-----------------------------------------------------------------------------
 def manhattan_distance(pos1, pos2):

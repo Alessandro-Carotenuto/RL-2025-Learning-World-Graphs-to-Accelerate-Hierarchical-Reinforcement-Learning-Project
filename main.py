@@ -71,7 +71,7 @@ def _walk_away_from_spawn(env, spawn: tuple, walk_length: int = 400, bias: float
     return current_pos
 
 
-def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, fast_training=True,
+def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, convergence_threshold: float = 0.01,
                               explore_top_fraction: float = 0.20,
                               diversity_walk_number: int = 10,
                               walk_length: int = 250,
@@ -241,12 +241,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
 
             print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
 
-            if fast_training:
-                threshold_reconstruction_loss=0.01
-            else:
-                threshold_reconstruction_loss=0.005
-
-            if avg_change < threshold_reconstruction_loss:
+            if avg_change < convergence_threshold:
                 print("Reconstruction loss has plateaued - training converged!")
                 break
     
@@ -545,57 +540,23 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     plt.close()
 
 
-def save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=None):
-    """
-    Save a standalone visualization of the world graph, rendering the
-    actual feasible paths for each edge.
-    
-    Args:
-        world_graph (GraphManager): The fully constructed world graph instance.
-        pivotal_states (list): The list of discovered pivotal states.
-        config (dict): Configuration dictionary to get parameters like vae_mu0.
-    """
-    # --- Step 1: Basic validation ---
-    if not pivotal_states:
-        print("No pivotal states to visualize. Skipping graph saving.")
+def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
+    if not pivotal_states or world_graph is None or not world_graph.nodes:
+        print("Skipping graph visualization: no pivotal states or empty graph.")
         return
-        
-    if world_graph is None or not world_graph.nodes:
-        print("World graph is empty or not provided. Skipping graph saving.")
-        return
-
-    print("Generating and saving world graph visualization...")
-    
-    try:
-        # --- Step 2: Instantiate the UPDATED visualizer ---
-        # This visualizer now knows how to read the {'weight': w, 'path': p}
-        # structure from the world_graph.edges.
-        viz = GraphVisualizer(world_graph, figsize=(12, 12)) # Slightly larger for clarity
-        
-        # --- Step 3: Generate the visualization ---
-        # The .visualize() method will automatically plot the detailed coordinate
-        # paths instead of simple straight lines. No change is needed in this call.
-        fig, ax = viz.visualize(
-            show_weights=True,
-            show_labels=True,
-            node_size=250,
-            edge_width=1.5,
-            title=f'World Graph (mu0={config["vae_mu0"]}) - Feasible Paths',
-            grid_state=grid_state
-        )
-        
-        # --- Step 4: Save the figure ---
-        filename = f'world_graph_mu{config["vae_mu0"]:.1f}.png'
-        plt.savefig(filename, dpi=200, bbox_inches='tight') # Higher DPI for better quality
-        plt.close(fig)
-        
-        print(f"Successfully saved graph visualization to '{filename}'")
-
-    except Exception as e:
-        print(f"An error occurred while saving the graph visualization: {e}")
-        # Ensure the plot is closed even if an error occurs
-        if 'fig' in locals():
-            plt.close(fig)
+    viz = GraphVisualizer(world_graph, figsize=(12, 12))
+    fig, ax = viz.visualize(
+        show_weights=True,
+        show_labels=True,
+        node_size=250,
+        edge_width=1.5,
+        title=f'World Graph (mu0={mu0}) - Feasible Paths',
+        grid_state=grid_state
+    )
+    filename = f'world_graph_mu{mu0:.1f}.png'
+    plt.savefig(filename, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved graph visualization to '{filename}'")
 
 def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_evolution.gif', fps=2):
     """One frame per Phase 1 iteration — same style as the final graph visualization."""
@@ -990,7 +951,7 @@ def test_phase1_with_diagnostics(config=None):
     print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
     plt.close()
 
-    save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
+    save_graph_visualization(world_graph, pivotal_states, config['vae_mu0'], grid_state=GRIDSTATE)
     create_phase1_gif(all_pivotal_states_history, GRIDSTATE)
 
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
@@ -1386,14 +1347,12 @@ externalconfig = {
         'walk_episodes': 10,             # Phase 1: episodes collected per walk destination
         'graph_walk_length': 50,         # Phase 1: max steps per random walk for edge discovery
         'graph_num_attempts': 150,       # Phase 1: random walk attempts per pivotal state
+        'convergence_threshold': 0.01,   # Phase 1: early-stop when avg loss change drops below this
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
-fast_training_toggle=True
-
 def train_full_phase1_phase2(
         config=externalconfig,
-        fast_training=fast_training_toggle,
         phase1_animation=True,
         phase2_animation=True):
     
@@ -1423,7 +1382,7 @@ def train_full_phase1_phase2(
     
     pivotal_states, world_graph, stat_buffer, all_pivotal_states = alternating_training_loop(
         env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
-        fast_training=fast_training,
+        convergence_threshold=config.get('convergence_threshold', 0.01),
         explore_top_fraction=config.get('explore_top_fraction', 0.20),
         diversity_walk_number=config.get('diversity_walk_number', 10),
         walk_length=config.get('walk_length', 250),
@@ -1447,7 +1406,7 @@ def train_full_phase1_phase2(
     )
 
     GRIDSTATE=env.getGridState()
-    save_separate_graph_visualization(world_graph, pivotal_states, config, grid_state=GRIDSTATE)
+    save_graph_visualization(world_graph, pivotal_states, config['vae_mu0'], grid_state=GRIDSTATE)
 
     if phase1_animation:
         create_phase1_gif(all_pivotal_states, GRIDSTATE)
@@ -1592,8 +1551,7 @@ def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations
     if mu0_values is None:
         mu0_values = [3.0, 6.0, 9.0]
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    device = resolve_device()
 
     base_env = MinigridWrapper(size=maze_size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
     base_env.phase = 1
@@ -1614,7 +1572,7 @@ def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations
         base_env.phase = 1
 
         pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            base_env, policy, vae_system, buffer, max_iterations=iterations, fast_training=True
+            base_env, policy, vae_system, buffer, max_iterations=iterations
         )
 
         final_loss = vae_system.training_history[-1]['total_loss']
@@ -1626,7 +1584,7 @@ def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations
         }
 
         _plot_phase1_run(vae_system, metrics, mu0, f'mu0={mu0}', f'phase1_comparison_mu{mu0:.1f}.png')
-        save_separate_graph_visualization(world_graph, pivotal_states, {'vae_mu0': mu0})
+        save_graph_visualization(world_graph, pivotal_states, mu0)
         print(f"Completed mu0={mu0} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
 
     print(f"\n{'='*70}\nCOMPARISON SUMMARY\n{'='*70}")
@@ -1642,8 +1600,7 @@ def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
     if sizes is None:
         sizes = [EnvSizes.SMALL, EnvSizes.MEDIUM]
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    device = resolve_device()
 
     results = {}
 
@@ -1661,7 +1618,7 @@ def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
         buffer = StatBuffer()
 
         pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            env, policy, vae_system, buffer, max_iterations=iterations, fast_training=True
+            env, policy, vae_system, buffer, max_iterations=iterations
         )
 
         final_loss = vae_system.training_history[-1]['total_loss']
@@ -1674,7 +1631,7 @@ def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
         }
 
         _plot_phase1_run(vae_system, metrics, mu0, size.name, f'phase1_size_{size.name}.png')
-        save_separate_graph_visualization(world_graph, pivotal_states, {'vae_mu0': mu0})
+        save_graph_visualization(world_graph, pivotal_states, mu0)
         print(f"Completed {size.name} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
 
     print(f"\n{'='*70}\nSIZE COMPARISON SUMMARY (mu0={mu0})\n{'='*70}")
