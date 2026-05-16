@@ -600,15 +600,6 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
     """
     pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
 
-    # Fall back to sensible defaults for older Phase 1 checkpoints
-    config.setdefault('max_steps_per_episode', 2000)
-    config.setdefault('neighborhood_size', math.ceil(config['maze_size'].value / 4))
-    config.setdefault('manager_horizon', config['max_steps_per_episode'] // 120)
-    config.setdefault('manager_lr', 5e-4)
-    config.setdefault('worker_lr', 1e-4)
-    config.setdefault('diagnostic_interval', 10000)
-    config.setdefault('diagnostic_checkstart', False)
-
     session_path = checkpoint_path.replace('.pt', '_session.pt')
     session = torch.load(session_path, map_location='cpu', weights_only=False)
     agent_start = session['agent_start']
@@ -642,19 +633,6 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
 
     _run_and_save_episode(manager, worker, config, grid_state, agent_start, ball_positions, filename, fps, max_steps)
 
-
-def render_phase2_episode_gif_from_objects(manager, worker, config, grid_state, agent_start_pos,
-                                           ball_positions=None, filename='phase2_final_episode.mp4',
-                                           fps=15, max_steps=500,
-                                           world_graph=None, pivotal_states=None):
-    """
-    Run one greedy episode with trained manager/worker and save as MP4.
-    Called at end of training when all objects are in memory.
-    """
-    _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos, ball_positions, filename, fps, max_steps,
-                          world_graph=world_graph, pivotal_states=pivotal_states)
-
-
 def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                           ball_positions, filename, fps, max_steps,
                           world_graph=None, pivotal_states=None):
@@ -684,8 +662,6 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     overlay_enabled = world_graph is not None and pivotal_states is not None
     if overlay_enabled:
         print(f"[VIDEO] Overlay ON: {len(pivotal_states)} nodes, {len(world_graph.edges)} edges")
-        sample_frame = env.render()
-        print(f"[VIDEO] Frame shape: {sample_frame.shape}, env.width={env.width}")
     else:
         print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
 
@@ -797,12 +773,10 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 goal_reached_prev = goal_reached_this_horizon
                 ball_collected_prev = (len(starting_balls_snapshot) - len(env.active_balls)) > 0
 
-    writer = imageio.get_writer(filename, fps=fps, format='ffmpeg')
-    for frame in frames:
-        writer.append_data(np.array(frame, dtype=np.uint8))
-    writer.close()
+    with imageio.get_writer(filename, fps=fps, format='ffmpeg') as writer:
+        for frame in frames:
+            writer.append_data(frame)
     print(f"Phase 2 video saved to '{filename}' ({len(frames)} frames, {len(frames)/fps:.1f}s)")
-
 
 def test_phase1_with_diagnostics(config=None):
     """
@@ -813,9 +787,9 @@ def test_phase1_with_diagnostics(config=None):
         'phase1_iterations': 15,
         'vae_mu0': 10.0,
         'goal_policy_lr': 5e-3,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'device': resolve_device()
     }
-    
+
     if config is not None:
         default_config.update(config)
     config = default_config
@@ -860,9 +834,9 @@ def test_phase1_with_diagnostics(config=None):
         'vae_reconstruction': [h['reconstruction_loss'] for h in vae_system.training_history],
         'vae_kl': [h['kl_divergence'] for h in vae_system.training_history],
         'vae_l0': [h['expected_l0'] for h in vae_system.training_history],
-        'num_pivotal_states': loop_metrics['num_pivotal_states_per_iteration'],  # CHANGED
+        'num_pivotal_states': loop_metrics['num_pivotal_states_per_iteration'],
         'policy_episodes': buffer.episodes_in_buffer,
-        'policy_success_rate': loop_metrics['policy_success_rates']  # CHANGED
+        'policy_success_rate': loop_metrics['policy_success_rates']
     }
     
     # Graph statistics
@@ -892,64 +866,11 @@ def test_phase1_with_diagnostics(config=None):
         print(f"  Connectivity: {graph_stats['connectivity']*100:.1f}%")
 
 
-    GRIDSTATE=env.getGridState()
+    GRIDSTATE = env.getGridState()
 
-    # Generate plots (around line 800)
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))  # Changed from (2, 2)
-
-    # Plot 1: VAE Total Loss
-    if metrics['vae_losses']:
-        axes[0, 0].plot(metrics['vae_losses'], 'b-', linewidth=2)
-        axes[0, 0].set_title('VAE Total Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].grid(True, alpha=0.3)
-
-    # Plot 2: Reconstruction Loss
-    if metrics['vae_reconstruction']:
-        axes[0, 1].plot(metrics['vae_reconstruction'], 'r-', linewidth=2)
-        axes[0, 1].set_title('Reconstruction Loss')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].grid(True, alpha=0.3)
-
-    # Plot 3: KL Divergence
-    if metrics['vae_kl']:
-        axes[0, 2].plot(metrics['vae_kl'], 'g-', linewidth=2)
-        axes[0, 2].set_title('KL Divergence (Should Stay > 0.01)')
-        axes[0, 2].set_xlabel('Epoch')
-        axes[0, 2].axhline(y=0.01, color='orange', linestyle='--', label='Floor')
-        axes[0, 2].legend()
-        axes[0, 2].grid(True, alpha=0.3)
-
-    # Plot 4: Expected L0
-    if metrics['vae_l0']:
-        axes[1, 0].plot(metrics['vae_l0'], 'purple', linewidth=2, label='Actual')
-        axes[1, 0].axhline(y=config['vae_mu0'], color='orange', linestyle='--', label='Target')
-        axes[1, 0].set_title('Expected L0 (Sparsity)')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-
-    # Plot 5: Pivotal States Discovered (NEW)
-    if metrics['num_pivotal_states']:
-        axes[1, 1].plot(metrics['num_pivotal_states'], 'cyan', linewidth=2, marker='o')
-        axes[1, 1].set_title('Pivotal States Discovered')
-        axes[1, 1].set_xlabel('Iteration')
-        axes[1, 1].set_ylabel('Count')
-        axes[1, 1].grid(True, alpha=0.3)
-
-    # Plot 6: Policy Success Rate (NEW)
-    if metrics['policy_success_rate']:
-        axes[1, 2].plot(metrics['policy_success_rate'], 'magenta', linewidth=2, marker='s')
-        axes[1, 2].set_title('Goal Policy Success Rate')
-        axes[1, 2].set_xlabel('Iteration')
-        axes[1, 2].set_ylabel('Success Rate')
-        axes[1, 2].set_ylim([0, 1])
-        axes[1, 2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png', dpi=150)
-    print(f"\nSaved diagnostics to phase1_diagnostics_mu{config['vae_mu0']:.1f}.png")
-    plt.close()
+    _plot_phase1_run(vae_system, loop_metrics, config['vae_mu0'],
+                     f"mu0={config['vae_mu0']:.1f}",
+                     f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png')
 
     save_graph_visualization(world_graph, pivotal_states, config['vae_mu0'], grid_state=GRIDSTATE)
     create_phase1_gif(all_pivotal_states_history, GRIDSTATE)
@@ -980,9 +901,9 @@ def test_phase1_with_diagnostics(config=None):
         'vae_system': vae_system
     }
 
-#STILL TO USE ------------------------------------------------------------
 def analyze_phase1_metrics(results):
-    """Extract key metrics and diagnose Phase 1 issues."""
+    """Extract key metrics and diagnose Phase 1 issues.
+    Expects results from test_phase1_with_diagnostics() — not from run_phase1_comparison()."""
     
     metrics = results['metrics']
     graph_stats = results['graph_stats']
@@ -1072,7 +993,9 @@ def analyze_phase1_metrics(results):
     }
 
 def compare_phase1_runs(runs_dict):
-    """Compare multiple Phase 1 runs with different parameters."""
+    """Print a comparison table across multiple Phase 1 runs.
+    Expects {name: results} where each results comes from test_phase1_with_diagnostics().
+    Do NOT pass the output of run_phase1_comparison() — it uses a different metrics structure."""
     
     print("\n" + "="*70)
     print("PHASE 1 COMPARISON")
@@ -1095,6 +1018,7 @@ def compare_phase1_runs(runs_dict):
         succ = m['policy_success_rate'][-1]*100 if m['policy_success_rate'] else 0
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
+
 #----------------------------------------------------------------------------#
 #                        PHASE 1 CHECKPOINT SAVE / LOAD                      #
 #----------------------------------------------------------------------------#
@@ -1107,10 +1031,10 @@ def save_phase1_checkpoint(path, pivotal_states, world_graph, policy, vae_system
         'policy_state_dict': policy.state_dict(),
         'vae_state_dict': vae_system.state_dict(),
         'vae_kwargs': {
-            'state_dim': 16,
-            'action_vocab_size': 7,
-            'mu0': config['vae_mu0'],
-            'grid_size': int(config['maze_size'].value) + 4,
+            'state_dim': vae_system.state_dim,
+            'action_vocab_size': vae_system.action_vocab_size,
+            'mu0': vae_system.mu0,
+            'grid_size': vae_system.grid_size,
         },
         'config': config,
         'grid_state': grid_state,
@@ -1119,7 +1043,7 @@ def save_phase1_checkpoint(path, pivotal_states, world_graph, policy, vae_system
     print(f"Phase 1 checkpoint saved to '{path}'")
 
 
-def load_phase1_checkpoint(path, device=None):
+def load_phase1_checkpoint(path):
     """Load Phase 1 checkpoint. Returns (pivotal_states, world_graph, policy, vae_system, config, grid_state)."""
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
@@ -1129,10 +1053,9 @@ def load_phase1_checkpoint(path, device=None):
     config.setdefault('manager_horizon', config['max_steps_per_episode'] // 120)
     config.setdefault('manager_lr', 5e-4)
     config.setdefault('worker_lr', 1e-4)
+    config.setdefault('goal_policy_lr', 5e-3)
     config.setdefault('diagnostic_interval', 10000)
     config.setdefault('diagnostic_checkstart', False)
-    if device is not None:
-        config['device'] = device
 
     vae_kw = checkpoint['vae_kwargs']
     vae_system = VAESystem(
@@ -1182,6 +1105,7 @@ def restore_maze_from_grid_state(env, grid_state):
 def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
                          agent_start, first_balls, session_path, grid_state,
                          phase2_animation=True):
+    
     manager = HierarchicalManager(
         pivotal_states,
         neighborhood_size=config['neighborhood_size'],
@@ -1250,12 +1174,10 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     print(f"Session updated with trained weights: '{session_path}'")
 
     if phase2_animation:
-        render_phase2_episode_gif_from_objects(
-            manager, worker, config, grid_state,
-            agent_start_pos=agent_start,
-            ball_positions=first_balls,
-            world_graph=world_graph,
-            pivotal_states=pivotal_states,
+        _run_and_save_episode(
+            manager, worker, config, grid_state, agent_start, first_balls,
+            'phase2_final_episode.mp4', fps=15, max_steps=500,
+            world_graph=world_graph, pivotal_states=pivotal_states,
         )
 
     return metrics
