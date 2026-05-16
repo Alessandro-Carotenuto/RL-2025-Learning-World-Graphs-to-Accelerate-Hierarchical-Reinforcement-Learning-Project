@@ -1552,6 +1552,7 @@ def train_full_phase1_phase2(
         'worker_state_dict': worker.state_dict(),
         'goal_policy_state_dict': policy.state_dict(),
     }, session_path)
+
     print(f"Session updated with trained weights: '{session_path}'")
 
     if phase2_animation:
@@ -1562,227 +1563,127 @@ def train_full_phase1_phase2(
             pivotal_states=pivotal_states,
         )
 
-def run_phase1_comparison():
-    """
-    Run Phase 1 training 3 times on the SAME map with different mu0 values.
-    """
-    mu0_values = [3.0, 6.0, 9.0]
-    maze_size = EnvSizes.MEDIUM
-    iterations = 50
-    
-    # Detect available device
+def _plot_phase1_run(vae_system, metrics, mu0, title_prefix, save_path):
+    history = vae_system.training_history
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+    axes[0, 0].plot([h['total_loss'] for h in history], 'b-')
+    axes[0, 0].set_title(f'VAE Loss ({title_prefix})')
+    axes[0, 1].plot([h['reconstruction_loss'] for h in history], 'r-')
+    axes[0, 1].set_title('Reconstruction Loss')
+    axes[0, 2].plot([h['kl_divergence'] for h in history], 'g-')
+    axes[0, 2].set_title('KL Divergence')
+    axes[1, 0].plot([h['expected_l0'] for h in history], 'purple')
+    axes[1, 0].axhline(y=mu0, color='orange', linestyle='--', label='Target')
+    axes[1, 0].set_title('Expected L0')
+    axes[1, 0].legend()
+    axes[1, 1].plot(metrics['num_pivotal_states_per_iteration'], 'cyan', marker='o')
+    axes[1, 1].set_title('Pivotal States Discovered')
+    axes[1, 2].plot(metrics['policy_success_rates'], 'magenta', marker='s')
+    axes[1, 2].set_title('Policy Success Rate')
+    axes[1, 2].set_ylim([0, 1])
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations=50):
+    """Run Phase 1 training on the same map with different mu0 values."""
+    if mu0_values is None:
+        mu0_values = [3.0, 6.0, 9.0]
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # Create ONE environment that will be reused
-    base_env = MinigridWrapper(
-        size=maze_size, 
-        mode=EnvModes.MULTIGOAL,
-        phase_one_eps=iterations * 10000
-    )
+    base_env = MinigridWrapper(size=maze_size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
     base_env.phase = 1
-    base_env.randomgen = True  # Generate once
-    
-    # Generate the map once
-    print("Generating base map...")
-    base_env.reset()  # This creates self.h and self.w
-    base_grid_state = base_env.getGridState()
-    print_grid_image(base_grid_state, name='base_map')
-    
-    # NOW disable random generation for subsequent runs
+    base_env.randomgen = True
+    base_env.reset()
+    print_grid_image(base_env.getGridState(), name='base_map')
     base_env.randomgen = False
     base_env.firstgen = False
-    
+
     results = {}
-    
+
     for mu0 in mu0_values:
-        print(f"\n{'='*70}")
-        print(f"Running Phase 1 with mu0={mu0}")
-        print(f"{'='*70}")
-        
-        # Create fresh networks
+        print(f"\n{'='*70}\nRunning Phase 1 with mu0={mu0}\n{'='*70}")
+
         policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
-        vae_system = VAESystem(
-            state_dim=16,
-            action_vocab_size=7,
-            mu0=mu0,
-            grid_size=base_env.size,
-            device='cpu'
-        )
+        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=base_env.size, device=device)
         buffer = StatBuffer()
-        
-        # Use the base_env directly (already has the generated map)
         base_env.phase = 1
-        
-        # Run training
+
         pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            base_env, policy, vae_system, buffer,
-            max_iterations=iterations,
-            fast_training=True
+            base_env, policy, vae_system, buffer, max_iterations=iterations, fast_training=True
         )
-        
-        # Save results
-        results[f'mu0_{mu0}'] = {
+
+        final_loss = vae_system.training_history[-1]['total_loss']
+        results[mu0] = {
             'pivotal_states': pivotal_states,
             'world_graph': world_graph,
             'metrics': metrics,
-            'vae_system': vae_system,
-            'buffer': buffer
+            'final_loss': final_loss,
         }
-        
-        # Generate plots
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        
-        axes[0, 0].plot([h['total_loss'] for h in vae_system.training_history], 'b-')
-        axes[0, 0].set_title(f'VAE Loss (mu0={mu0})')
-        
-        axes[0, 1].plot([h['reconstruction_loss'] for h in vae_system.training_history], 'r-')
-        axes[0, 1].set_title('Reconstruction Loss')
-        
-        axes[0, 2].plot([h['kl_divergence'] for h in vae_system.training_history], 'g-')
-        axes[0, 2].set_title('KL Divergence')
-        
-        axes[1, 0].plot([h['expected_l0'] for h in vae_system.training_history], 'purple')
-        axes[1, 0].axhline(y=mu0, color='orange', linestyle='--', label='Target')
-        axes[1, 0].set_title('Expected L0')
-        axes[1, 0].legend()
-        
-        axes[1, 1].plot(metrics['num_pivotal_states_per_iteration'], 'cyan', marker='o')
-        axes[1, 1].set_title('Pivotal States Discovered')
-        
-        axes[1, 2].plot(metrics['policy_success_rates'], 'magenta', marker='s')
-        axes[1, 2].set_title('Policy Success Rate')
-        axes[1, 2].set_ylim([0, 1])
-        
-        plt.tight_layout()
-        plt.savefig(f'phase1_comparison_mu{mu0:.1f}.png', dpi=150)
-        plt.close()
-        
+
+        _plot_phase1_run(vae_system, metrics, mu0, f'mu0={mu0}', f'phase1_comparison_mu{mu0:.1f}.png')
         save_separate_graph_visualization(world_graph, pivotal_states, {'vae_mu0': mu0})
-        
-        print(f"\n✓ Completed mu0={mu0}")
-        print(f"  Pivotal states: {len(pivotal_states)}")
-        print(f"  Graph edges: {len(world_graph.edges)}")
-    
-    # Summary
-    print(f"\n{'='*70}")
-    print("COMPARISON SUMMARY")
-    print(f"{'='*70}")
+        print(f"Completed mu0={mu0} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
+
+    print(f"\n{'='*70}\nCOMPARISON SUMMARY\n{'='*70}")
     print(f"{'mu0':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
     print("-" * 70)
-    
-    for mu0 in mu0_values:
-        key = f'mu0_{mu0}'
-        res = results[key]
-        final_loss = res['vae_system'].training_history[-1]['total_loss']
-        print(f"{mu0:<8.1f} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {final_loss:<12.4f}")
-    
+    for mu0, res in results.items():
+        print(f"{mu0:<8.1f} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
+
     return results
 
-def run_phase1_size_comparison():
-    """
-    Run Phase 1 training on different environment sizes with mu0=9.0.
-    """
-    sizes = [EnvSizes.SMALL, EnvSizes.MEDIUM]
-    mu0 = 9.0
-    iterations = 50
-    
+def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
+    """Run Phase 1 training on different environment sizes."""
+    if sizes is None:
+        sizes = [EnvSizes.SMALL, EnvSizes.MEDIUM]
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    
+
     results = {}
-    
+
     for size in sizes:
-        print(f"\n{'='*70}")
-        print(f"Running Phase 1 with size={size.name} (grid={size.value}x{size.value})")
-        print(f"{'='*70}")
-        
-        # Create environment for this size
-        env = MinigridWrapper(
-            size=size,
-            mode=EnvModes.MULTIGOAL,
-            phase_one_eps=iterations * 10000
-        )
+        print(f"\n{'='*70}\nRunning Phase 1 with size={size.name} (grid={size.value}x{size.value})\n{'='*70}")
+
+        env = MinigridWrapper(size=size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
         env.phase = 1
         env.randomgen = True
-        
-        # Generate and save map
         env.reset()
-        grid_state = env.getGridState()
-        print_grid_image(grid_state, name=f'map_{size.name}')
-        
-        # Create networks
+        print_grid_image(env.getGridState(), name=f'map_{size.name}')
+
         policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
-        vae_system = VAESystem(
-            state_dim=16,
-            action_vocab_size=7,
-            mu0=mu0,
-            grid_size=env.size,
-            device=device
-        )
+        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=env.size, device=device)
         buffer = StatBuffer()
-        
-        # Train
+
         pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            env, policy, vae_system, buffer,
-            max_iterations=iterations,
-            fast_training=True
+            env, policy, vae_system, buffer, max_iterations=iterations, fast_training=True
         )
-        
+
+        final_loss = vae_system.training_history[-1]['total_loss']
         results[size.name] = {
             'pivotal_states': pivotal_states,
             'world_graph': world_graph,
             'metrics': metrics,
-            'vae_system': vae_system,
-            'size': size.value
+            'final_loss': final_loss,
+            'grid_size': size.value,
         }
-        
-        # Generate plots
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        
-        axes[0, 0].plot([h['total_loss'] for h in vae_system.training_history], 'b-')
-        axes[0, 0].set_title(f'VAE Loss ({size.name})')
-        
-        axes[0, 1].plot([h['reconstruction_loss'] for h in vae_system.training_history], 'r-')
-        axes[0, 1].set_title('Reconstruction Loss')
-        
-        axes[0, 2].plot([h['kl_divergence'] for h in vae_system.training_history], 'g-')
-        axes[0, 2].set_title('KL Divergence')
-        
-        axes[1, 0].plot([h['expected_l0'] for h in vae_system.training_history], 'purple')
-        axes[1, 0].axhline(y=mu0, color='orange', linestyle='--', label='Target')
-        axes[1, 0].set_title('Expected L0')
-        axes[1, 0].legend()
-        
-        axes[1, 1].plot(metrics['num_pivotal_states_per_iteration'], 'cyan', marker='o')
-        axes[1, 1].set_title('Pivotal States Discovered')
-        
-        axes[1, 2].plot(metrics['policy_success_rates'], 'magenta', marker='s')
-        axes[1, 2].set_title('Policy Success Rate')
-        axes[1, 2].set_ylim([0, 1])
-        
-        plt.tight_layout()
-        plt.savefig(f'phase1_size_{size.name}.png', dpi=150)
-        plt.close()
-        
+
+        _plot_phase1_run(vae_system, metrics, mu0, size.name, f'phase1_size_{size.name}.png')
         save_separate_graph_visualization(world_graph, pivotal_states, {'vae_mu0': mu0})
-        
-        print(f"\n✓ Completed {size.name}")
-        print(f"  Grid size: {size.value}x{size.value}")
-        print(f"  Pivotal states: {len(pivotal_states)}")
-        print(f"  Graph edges: {len(world_graph.edges)}")
-    
-    # Comparison summary
-    print(f"\n{'='*70}")
-    print("SIZE COMPARISON SUMMARY (mu0=9.0)")
-    print(f"{'='*70}")
+        print(f"Completed {size.name} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
+
+    print(f"\n{'='*70}\nSIZE COMPARISON SUMMARY (mu0={mu0})\n{'='*70}")
     print(f"{'Size':<10} {'Grid':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
     print("-" * 70)
-    
-    for size_name, res in results.items():
-        final_loss = res['vae_system'].training_history[-1]['total_loss']
-        print(f"{size_name:<10} {res['size']}x{res['size']:<6} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {final_loss:<12.4f}")
-    
+    for name, res in results.items():
+        g = res['grid_size']
+        print(f"{name:<10} {g}x{g:<6} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
+
     return results
 
 
