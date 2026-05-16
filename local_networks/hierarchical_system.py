@@ -6,7 +6,6 @@ from typing import List, Tuple, Optional
 import numpy as np
 
 # PROJECT-SPECIFIC IMPORTS
-from utils.optimal_reward_computer import compute_optimal_reward_for_episode
 from collections import Counter
 from utils.misc import manhattan_distance
 
@@ -121,31 +120,39 @@ class HierarchicalManager(nn.Module):
         
         return wide_idx.item(), wide_log_prob, value.squeeze()
     
-    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int]) -> Tuple[Tuple[int, int], torch.Tensor]:
+    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None) -> Tuple[Tuple[int, int], torch.Tensor]:
         # SELECT NARROW GOAL FROM NEIGHBORHOOD
     # GET LSTM FEATURES
         _, features, _ = self.forward(state)
-        
+
     # CONCATENATE FEATURES WITH WIDE GOAL
         wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
         narrow_input = torch.cat([features, wide_goal_tensor])  # [64 + 2]
-        
+
     # NARROW POLICY OUTPUT
         narrow_logits = self.narrow_head(narrow_input)  # [neighborhood_size^2]
-        
+
+    # MASK OUT WALL/OUT-OF-BOUNDS CELLS
+        neighborhood = self.get_neighborhood(wide_goal)
+        if valid_cells is not None:
+            mask = torch.tensor(
+                [1.0 if cell in valid_cells else 0.0 for cell in neighborhood],
+                dtype=torch.float32, device=self.device
+            )
+            if mask.sum() > 0:
+                narrow_logits = narrow_logits.masked_fill(mask == 0, -1e9)
+
     # SAMPLE FROM CATEGORICAL DISTRIBUTION
         narrow_probs = F.softmax(narrow_logits, dim=0)
         narrow_dist = torch.distributions.Categorical(narrow_probs)
         narrow_idx = narrow_dist.sample()
         narrow_log_prob = narrow_dist.log_prob(narrow_idx)
-        
-    # CONVERT INDEX TO COORDINATES
-        neighborhood = self.get_neighborhood(wide_goal)
+
         narrow_goal = neighborhood[narrow_idx.item()]
-        
+
         return narrow_goal, narrow_log_prob
     
-    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0):
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None):
         verbose = (self.diagnostic_checkstart and step_count < 15) or (step_count % self.diagnostic_interval == 0)
 
         if verbose:
@@ -177,7 +184,7 @@ class HierarchicalManager(nn.Module):
             print(f"    Entropy: {entropy.item():.3f}/{max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
 
         # Pass 2: narrow goal — LSTM now sees updated prev_wide_goal as context
-        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal)
+        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells)
         combined_log_prob = wide_log_prob + narrow_log_prob
 
         if verbose:
@@ -898,6 +905,12 @@ class HierarchicalTrainer:
         # Reset environment and networks
         obs = self.env.reset()
         state = tuple(self.env.agent_pos)
+        valid_cells = {
+            (x, y)
+            for x in range(self.env.width)
+            for y in range(self.env.height)
+            if self.env._is_traversable(self.env.grid.get(x, y))
+        }
 
         if diag2:
             print(f"\n[EPISODE {self.global_episode_counter + 1} START]")
@@ -905,8 +918,6 @@ class HierarchicalTrainer:
             print(f"  Balls at: {list(self.env.active_balls)}")
             print(f"  Pivotal states (first 5): {self.manager.pivotal_states[:5]}")
 
-        optimal_reward, optimal_steps = compute_optimal_reward_for_episode(self.env)
-        
         self.manager.reset_manager_state()
         self.worker.reset_worker_state()
         self.worker._traversal_starts_this_episode = 0
@@ -917,9 +928,7 @@ class HierarchicalTrainer:
         active_log_prob = None
         active_value = None
         active_entropy = None
-        active_goal_state = None
         horizons_on_goal = 0
-        cumulative_goal_reward = 0.0
         goal_reached_prev = False   # did the worker reach the goal last horizon?
         ball_collected_prev = False  # was a ball collected last horizon?
 
@@ -963,15 +972,7 @@ class HierarchicalTrainer:
             )
 
             if need_new_goal:
-                # Push completed goal experience to buffer before selecting new one
                 if active_wide_goal is not None:
-                    manager_states.append(active_goal_state)
-                    manager_wide_goals.append(active_wide_goal)
-                    manager_narrow_goals.append(active_narrow_goal)
-                    manager_rewards.append(cumulative_goal_reward)
-                    manager_values.append(active_value)
-                    manager_log_probs.append(active_log_prob)
-                    manager_entropies_for_update.append(active_entropy)
                     # flush only traversal state — LSTM context stays valid across goals
                     self.worker.current_traversal_path = []
                     self.worker.traversal_step = 0
@@ -979,7 +980,7 @@ class HierarchicalTrainer:
                     self.worker.current_action_idx = 0
 
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
-                    state, step_count=self.global_step_counter
+                    state, step_count=self.global_step_counter, valid_cells=valid_cells
                 )
                 if self.manager.hidden_state is not None:
                     self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
@@ -989,9 +990,7 @@ class HierarchicalTrainer:
                 active_log_prob = manager_log_prob
                 active_value = manager_value
                 active_entropy = entropy.detach()
-                active_goal_state = state
                 horizons_on_goal = 0
-                cumulative_goal_reward = 0.0
             else:
                 wide_goal = active_wide_goal
                 narrow_goal = active_narrow_goal
@@ -1164,8 +1163,25 @@ class HierarchicalTrainer:
                         progress_reward = progress * self.manager_shaping_weight
                         manager_reward += progress_reward
 
-            # Accumulate reward for the current goal (pushed to buffer on next selection)
-            cumulative_goal_reward += manager_reward
+            # Bonus for choosing a reachable narrow goal close to a ball
+            if goal_reached_this_horizon:
+                narrow_bonus = 0.2
+                if len(starting_balls_snapshot) > 0:
+                    dist_narrow_to_ball = min(
+                        manhattan_distance(narrow_goal, ball) for ball in starting_balls_snapshot
+                    )
+                    narrow_bonus += 2.0 / (1.0 + dist_narrow_to_ball)
+                manager_reward += narrow_bonus
+
+            # Push manager experience every horizon
+            manager_states.append(starting_state_snapshot)
+            manager_wide_goals.append(active_wide_goal)
+            manager_narrow_goals.append(active_narrow_goal)
+            manager_rewards.append(manager_reward)
+            manager_values.append(active_value)
+            manager_log_probs.append(active_log_prob)
+            manager_entropies_for_update.append(active_entropy)
+
             horizons_on_goal += 1
             horizon_counter += 1
             goal_reached_prev = goal_reached_this_horizon
@@ -1180,16 +1196,7 @@ class HierarchicalTrainer:
             if terminated or truncated:
                 break
 
-        # ── FINALIZE LAST GOAL EXPERIENCE + FINAL UPDATE ──────────────────────
-        if active_wide_goal is not None:
-            manager_states.append(active_goal_state)
-            manager_wide_goals.append(active_wide_goal)
-            manager_narrow_goals.append(active_narrow_goal)
-            manager_rewards.append(cumulative_goal_reward)
-            manager_values.append(active_value)
-            manager_log_probs.append(active_log_prob)
-            manager_entropies_for_update.append(active_entropy)
-
+        # ── FINAL MANAGER UPDATE ──────────────────────────────────────────────
         if len(manager_rewards) > 0:
             self.manager.update_policy(
                 manager_states, manager_wide_goals, manager_narrow_goals,
@@ -1248,7 +1255,7 @@ class HierarchicalTrainer:
             print(f"Episode {self.global_episode_counter} Complete")
             print(f"{'#'*70}")
             print(f"Task Performance:")
-            print(f"  Episode reward: {episode_reward:.2f} (optimal: {optimal_reward:.2f})")
+            print(f"  Episode reward: {episode_reward:.2f}")
             print(f"  Balls collected: {balls_collected}/{self.env.total_balls}")
             print(f"  Episode steps: {episode_steps}")
             print(f"\nManager Diagnostics:")
@@ -1281,7 +1288,5 @@ class HierarchicalTrainer:
             'final_entropy': manager_entropies[-1] if manager_entropies else 0,
             'unique_manager_goals': len(unique_manager_goals),
             'goal_diversity_history': None,
-            'optimal_reward': optimal_reward,
-            'optimal_steps': optimal_steps,
             'balls_collected': balls_collected,
         }

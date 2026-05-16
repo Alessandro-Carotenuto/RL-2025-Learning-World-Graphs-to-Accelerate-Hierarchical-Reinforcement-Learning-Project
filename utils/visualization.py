@@ -271,7 +271,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     else:
         print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
 
-    def apply_overlay(frame, wg, ng):
+    def apply_overlay(frame, wg, ng, traversal_path=None):
         tile_size = frame.shape[1] // env.width
 
         def px(coord):
@@ -282,18 +282,28 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
         ov = Image.new('RGBA', frame_pil.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(ov)
 
+        path_set = set(traversal_path) if traversal_path else set()
+        path_edges = set(zip(traversal_path, traversal_path[1:])) if traversal_path else set()
+
         for (start, end) in world_graph.edges:
-            draw.line([px(start), px(end)], fill=(255, 220, 0, 64), width=2)
+            if (start, end) in path_edges:
+                draw.line([px(start), px(end)], fill=(0, 220, 80, 160), width=3)
+            else:
+                draw.line([px(start), px(end)], fill=(255, 220, 0, 64), width=2)
 
         r = max(2, tile_size // 5)
         for ps in pivotal_states:
-            cx, cy = px(ps)
-            draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(255, 220, 0, 64))
+            if ps in path_set:
+                cx, cy = px(ps)
+                draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(0, 220, 80, 160))
+            else:
+                cx, cy = px(ps)
+                draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(255, 220, 0, 64))
 
         if wg is not None:
             cx, cy = px(wg)
             draw.ellipse([(cx - r * 2, cy - r * 2), (cx + r * 2, cy + r * 2)],
-                         fill=(255, 160, 0, 255))
+                         fill=(0, 220, 80, 128))
         if ng is not None:
             nx, ny = ng
             draw.rectangle(
@@ -366,7 +376,8 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
 
             frame = env.render()
             if overlay_enabled:
-                frame = apply_overlay(frame, wide_goal, narrow_goal)
+                frame = apply_overlay(frame, wide_goal, narrow_goal,
+                                      traversal_path=worker.current_traversal_path or None)
             frames.append(frame)
             done = terminated or truncated
             step += 1

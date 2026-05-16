@@ -10,7 +10,6 @@ from typing import List, Tuple, Dict
 from utils.misc import manhattan_distance,sample_goal_position
 from utils.graph_manager import GraphManager
 
-old_diag_phase_1 = False  # Toggle detailed diagnostics in phase 1
 #-----------------------------------------------------------------------------
 
 class GoalConditionedPolicy(nn.Module):
@@ -76,14 +75,7 @@ class GoalConditionedPolicy(nn.Module):
         current_pos = start_pos
         goal_reached = False
 
-        if old_diag_phase_1:
-            print(f"    Goal: {goal_pos}, Distance: {manhattan_distance(start_pos, goal_pos)}")
-
-        # DIAGNOSTICS TRACKING
-        total_goal_reward = 0
-        distance_changes = []
-
-        episode_trajectory = []  # Store (state, action) pairs
+        episode_trajectory = []
         # RUN EPISODE
         for step in range(max_episode_length):
             # Get action from policy
@@ -108,11 +100,6 @@ class GoalConditionedPolicy(nn.Module):
             if next_pos != current_pos:
                 visited_states.append(next_pos)
 
-            # ACTION NAME FOR DEBUG
-            action_names = ['turn_left', 'turn_right', 'move_forward', 'pickup', 'drop', 'toggle', 'done']
-            action_name = action_names[action] if action < len(action_names) else f'action_{action}'
-
-            # REWARD BREAKDOWN
             old_distance = manhattan_distance(current_pos, goal_pos)
             new_distance = manhattan_distance(next_pos, goal_pos)
             goal_reward = 10.0 if next_pos == goal_pos else 0.0
@@ -122,7 +109,6 @@ class GoalConditionedPolicy(nn.Module):
             # CURIOSITY REWARD COMPUTATION
             curiosity_reward = 0.0
             if vae_system is not None and len(visited_states) > 1:
-                # CORRECT - uses episode_trajectory (state-action pairs) + new method
                 window_size = min(5, len(episode_trajectory))
                 recent_trajectory = episode_trajectory[-window_size:]
                 base_curiosity = vae_system.compute_curiosity_reward_from_trajectory(recent_trajectory)
@@ -133,36 +119,15 @@ class GoalConditionedPolicy(nn.Module):
             total_reward = goal_reward + progress_reward + step_penalty + curiosity_reward
             rewards.append(total_reward)
 
-            # DIAGNOSTICS UPDATE
-            total_goal_reward += goal_reward
-            distance_changes.append(new_distance - old_distance)
-
-            # DEBUG OUTPUT (CONDITIONAL)
-            if next_pos != current_pos or step % 10 == 0:
-                reward_breakdown = f"(goal:{goal_reward:.1f}, prog:{progress_reward:.2f}, step:{step_penalty:.2f}"
-                if curiosity_reward > 0.01:
-                    reward_breakdown += f", cur:{curiosity_reward:.3f}"
-                reward_breakdown += f") = {total_reward:.2f}"
-                if self.verbose:    
-                    if old_diag_phase_1:
-                        print(f"    Step {step}: {current_pos} -> {action_name} -> {next_pos} {reward_breakdown}")
-
             # TERMINATION CHECKS
             if goal_reward > 0:
                 goal_reached = True
-                if old_diag_phase_1:
-                    print(f"    GOAL REACHED in {step+1} steps! Total goal reward: {total_goal_reward}")
                 break
 
             if terminated or truncated:
                 break
 
             current_pos = next_pos
-
-        # EPISODE SUMMARY DIAGNOSTICS
-        avg_distance_change = sum(distance_changes) / len(distance_changes) if distance_changes else 0
-        if old_diag_phase_1:
-            print(f"    Episode summary: {len(actions)} steps, goal_reward: {total_goal_reward:.1f}, avg_dist_change: {avg_distance_change:.2f}")
 
         # UPDATE POLICY
         policy_losses = self.update_policy_with_diagnostics(states, actions, rewards, values, log_probs)

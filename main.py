@@ -3,8 +3,10 @@ import math
 import time
 import torch
 
+# minigrid imports
 from minigrid.core.world_object import Wall
 
+# Local imports
 from wrappers.minigrid_wrapper import MinigridWrapper, EnvModes, EnvSizes
 from utils.statistics_buffer import StatBuffer
 from local_networks.vaesystem import VAESystem
@@ -190,7 +192,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
     
     return pivotal_states, world_graph, metrics, all_pivotal_states
 
-# PLOT AND DIAGNOSTICS -------------------------------------------------------
+# DIAGNOSTIC FUNCTIONS ----------------------------------------------------
 
 def diagnose_graph_connectivity(world_graph, pivotal_states, env):
     """
@@ -688,7 +690,6 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         )
 
     return metrics
-
 
 def run_phase2_standalone(
         checkpoint_path='phase1_checkpoint.pt',
