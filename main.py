@@ -271,7 +271,7 @@ def diagnose_graph_connectivity(world_graph, pivotal_states, env):
     
     # Get spawn position
     env.phase = 2
-    obs = env.reset()
+    env.reset()
     spawn_pos = tuple(env.agent_pos)
     
     print(f"\nAgent spawn position: {spawn_pos}")
@@ -317,7 +317,7 @@ def diagnose_graph_connectivity(world_graph, pivotal_states, env):
     for i, start in enumerate(pivotal_states):
         for j, end in enumerate(pivotal_states):
             if i != j:
-                path, dist = world_graph.shortest_path(start, end)
+                path, _ = world_graph.shortest_path(start, end)
                 if path:
                     connected_pairs += 1
     
@@ -335,7 +335,7 @@ def diagnose_graph_connectivity(world_graph, pivotal_states, env):
     
     return reachable_from_spawn, unreachable_from_spawn
 
-def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states):
+def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph):
     """
     Run ONE episode with detailed Worker diagnostics.
     """
@@ -362,7 +362,7 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
         print(f"Start position: {current_pos}")
         
         # Manager selects goals
-        wide_goal, narrow_goal, log_prob, value, entropy = manager.get_manager_action(current_pos)
+        wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(current_pos)
         print(f"Manager goals: wide={wide_goal}, narrow={narrow_goal}")
         
         # Check if wide goal is reachable
@@ -399,7 +399,7 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, p
                 obs, reward, terminated, truncated, info = env.step(action)
                 current_pos = tuple(env.agent_pos)
                 positions_visited.append(current_pos)
-            except:
+            except Exception:
                 break
             
             # Check if reached goals
@@ -466,17 +466,11 @@ def plot_training_diagnostics(trainer, config, save_path=None):
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
-    # 1. Episode Rewards vs Optimal
-    ax = axes[0, 0]
-    ax.plot(episodes, history['episode_rewards'], 'b-', linewidth=1.5, alpha=0.5, label='Agent')
-    ma_r = moving_average(history['episode_rewards'])
-    if len(ma_r) > 0:
-        ax.plot(range(ma_start, ma_start + len(ma_r)), ma_r, 'b-', linewidth=2, label=f'MA({ma_start})')
-    ax.set_title('Episode Rewards')
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Reward')
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    # 1. Episode Rewards
+    plot_with_ma(axes[0, 0],
+                 history['episode_rewards'],
+                 'b', 'Agent', 'Reward',
+                 'Episode Rewards')
 
     # 2. Balls Collected per Episode
     plot_with_ma(axes[0, 1],
@@ -532,12 +526,12 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     axes[2, 1].set_visible(False)
     axes[2, 2].set_visible(False)
 
-    plt.tight_layout()
+    fig.tight_layout()
     if save_path is None:
         save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase2_episodes']}.png"
-    plt.savefig(save_path, dpi=150)
+    fig.savefig(save_path, dpi=150)
     print(f"\nDiagnostic plots saved to {save_path}")
-    plt.close()
+    plt.close(fig)
 
 
 def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
@@ -554,7 +548,7 @@ def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
         grid_state=grid_state
     )
     filename = f'world_graph_mu{mu0:.1f}.png'
-    plt.savefig(filename, dpi=200, bbox_inches='tight')
+    fig.savefig(filename, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved graph visualization to '{filename}'")
 
@@ -582,9 +576,7 @@ def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_e
             grid_state=grid_state,
         )
 
-        fig.canvas.draw()
-        width, height = fig.canvas.get_width_height()
-        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape((height, width, 3))
+        frame = np.array(fig.canvas.buffer_rgba())[..., :3]
         frames.append(frame)
         plt.close(fig)
 
@@ -1126,7 +1118,7 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     worker.initialize_from_goal_policy(policy)
 
     print("\nDiagnosing Worker behavior BEFORE training:")
-    diagnose_worker_behavior_single_episode(env, manager, worker, world_graph, pivotal_states)
+    diagnose_worker_behavior_single_episode(env, manager, worker, world_graph)
 
     env.phase = 2
     trainer = HierarchicalTrainer(
