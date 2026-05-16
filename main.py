@@ -54,8 +54,10 @@ from utils.optimal_reward_computer import compute_optimal_reward_for_episode, co
 
 import pickle
 import imageio
-def replay_and_save_video(env_config, episode_data, filename):
+def replay_and_save_video(env_config, episode_data, filename, world_graph=None, pivotal_states=None):
     """Replay episode and save as video."""
+    from PIL import Image, ImageDraw
+
     env = MinigridWrapper(
         size=env_config['maze_size'],
         mode=EnvModes.MULTIGOAL,
@@ -63,7 +65,7 @@ def replay_and_save_video(env_config, episode_data, filename):
         render_mode='rgb_array'
     )
     env.phase = 2
-    
+
     # Restore grid state
     env.grid = Grid(env.size, env.size)
     for y, row in enumerate(episode_data['grid_state']):
@@ -72,12 +74,12 @@ def replay_and_save_video(env_config, episode_data, filename):
                 env.grid.set(x, y, Wall())
             elif cell == 'B':
                 env.grid.set(x, y, Ball(COLOR_NAMES[0]))
-    
+
     # Set agent
     env.agent_pos = episode_data['initial_agent_pos']
     env.agent_dir = episode_data['initial_agent_dir']
     env.active_balls = set(episode_data['ball_positions'])
-    
+
     # Restore step_count if present, else set to 0 to avoid AttributeError
     if hasattr(env, 'step_count'):
         if 'step_count' in episode_data:
@@ -85,12 +87,55 @@ def replay_and_save_video(env_config, episode_data, filename):
         else:
             env.step_count = 0
     else:
-        # If env does not have step_count, create it
         env.step_count = episode_data.get('step_count', 0)
 
+    goals = episode_data.get('goals', [])
+    overlay_enabled = world_graph is not None and pivotal_states is not None
+
+    def draw_graph_overlay(frame, step_idx):
+        tile_size = frame.shape[1] // env.width
+
+        def px(coord):
+            return (coord[0] * tile_size + tile_size // 2,
+                    coord[1] * tile_size + tile_size // 2)
+
+        frame_pil = Image.fromarray(frame).convert('RGBA')
+        overlay = Image.new('RGBA', frame_pil.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # Edges: yellow, 25% opacity
+        for (start, end) in world_graph.edges:
+            draw.line([px(start), px(end)], fill=(255, 220, 0, 64), width=2)
+
+        # Nodes: yellow circles, 25% opacity
+        r = max(2, tile_size // 5)
+        for ps in pivotal_states:
+            cx, cy = px(ps)
+            draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(255, 220, 0, 64))
+
+        # Current goal overlay
+        if step_idx < len(goals):
+            wide_goal, narrow_goal = goals[step_idx]
+            # Wide goal: bright orange, 100% opacity
+            cx, cy = px(wide_goal)
+            draw.ellipse([(cx - r * 2, cy - r * 2), (cx + r * 2, cy + r * 2)],
+                         fill=(255, 160, 0, 255))
+            # Narrow goal cell: cyan, 20% opacity
+            nx, ny = narrow_goal
+            draw.rectangle(
+                [(nx * tile_size, ny * tile_size),
+                 ((nx + 1) * tile_size - 1, (ny + 1) * tile_size - 1)],
+                fill=(0, 200, 255, 51)
+            )
+
+        return np.array(Image.alpha_composite(frame_pil, overlay).convert('RGB'))
+
     frames = []
-    for action in episode_data['actions']:
-        frames.append(env.render())
+    for i, action in enumerate(episode_data['actions']):
+        frame = env.render()
+        if overlay_enabled:
+            frame = draw_graph_overlay(frame, i)
+        frames.append(frame)
         env.step(action)
 
     imageio.mimsave(filename, frames, fps=10)
@@ -150,7 +195,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                               walk_bias: float = 0.65,
                               walk_episodes: int = 4,
                               graph_walk_length: int = 20,
-                              graph_num_attempts: int = 70):
+                              graph_num_attempts: int = 70,
+                              spread_alpha: float = 0.0):
     """
     Main alternating training loop with persistent KL annealing.
     explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
@@ -205,11 +251,12 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"First Half: Training VAE on {buffer.episodes_in_buffer} episodes...")
         try:
             pivotal_states = vae_system.train(
-                buffer, 
-                num_epochs=25, 
+                buffer,
+                num_epochs=25,
                 batch_size=8,
                 initial_kl_weight=persistent_kl_weight,
-                annealing_rate=0.0  # No annealing within iteration
+                annealing_rate=0.0,  # No annealing within iteration
+                spread_alpha=spread_alpha
             )
         except Exception as e:
             print(f"VAE training failed: {e}")
@@ -525,7 +572,7 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     episodes = list(range(1, num_episodes + 1))
     ma_start = 20  # moving average window
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14))
     fig.suptitle('Hierarchical RL Training Diagnostics', fontsize=16, fontweight='bold')
 
     def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
@@ -574,7 +621,7 @@ def plot_training_diagnostics(trainer, config, save_path=None):
                  entropy_pct,
                  'red', 'Entropy %', '% of Max Entropy',
                  'Manager Policy Entropy\n(↓ = more decisive)',
-                 ylim=[80, 101])
+                 ylim=[0, 101])
 
     # 5. Avg Distance: Manager Goals → Nearest Ball  (drops as manager learns ball locations)
     dist_data = history['goal_distance_to_balls']
@@ -596,6 +643,16 @@ def plot_training_diagnostics(trainer, config, save_path=None):
                  history['manager_value_mean'],
                  'cyan', 'Value', 'Average Value',
                  'Manager Value Estimate\n(stabilises when critic converges)')
+
+    # 7. Worker Goal Achievement  (row 2, left — narrow goal reached rate)
+    plot_with_ma(axes[2, 0],
+                 history['worker_goal_achievement'],
+                 'teal', 'Achievement', 'Success Rate',
+                 'Worker Goal Achievement\n(narrow goal reached)',
+                 ylim=[0, 1])
+
+    axes[2, 1].set_visible(False)
+    axes[2, 2].set_visible(False)
 
     plt.tight_layout()
     if save_path is None:
@@ -744,16 +801,21 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
 
 def render_phase2_episode_gif_from_objects(manager, worker, config, grid_state, agent_start_pos,
                                            ball_positions=None, filename='phase2_final_episode.mp4',
-                                           fps=15, max_steps=500):
+                                           fps=15, max_steps=500,
+                                           world_graph=None, pivotal_states=None):
     """
     Run one greedy episode with trained manager/worker and save as MP4.
     Called at end of training when all objects are in memory.
     """
-    _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos, ball_positions, filename, fps, max_steps)
+    _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos, ball_positions, filename, fps, max_steps,
+                          world_graph=world_graph, pivotal_states=pivotal_states)
 
 
 def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
-                          ball_positions, filename, fps, max_steps):
+                          ball_positions, filename, fps, max_steps,
+                          world_graph=None, pivotal_states=None):
+    from PIL import Image, ImageDraw
+
     env = MinigridWrapper(
         size=config['maze_size'],
         mode=EnvModes.MULTIGOAL,
@@ -775,29 +837,121 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     manager.reset_manager_state()
     worker.reset_worker_state()
 
-    frames = [env.render()]
-    done = False
-    step = 0
-    horizon_step = 0
+    overlay_enabled = world_graph is not None and pivotal_states is not None
+    if overlay_enabled:
+        print(f"[VIDEO] Overlay ON: {len(pivotal_states)} nodes, {len(world_graph.edges)} edges")
+        sample_frame = env.render()
+        print(f"[VIDEO] Frame shape: {sample_frame.shape}, env.width={env.width}")
+    else:
+        print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
+
+    def apply_overlay(frame, wg, ng):
+        tile_size = frame.shape[1] // env.width
+
+        def px(coord):
+            return (coord[0] * tile_size + tile_size // 2,
+                    coord[1] * tile_size + tile_size // 2)
+
+        frame_pil = Image.fromarray(frame).convert('RGBA')
+        ov = Image.new('RGBA', frame_pil.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(ov)
+
+        for (start, end) in world_graph.edges:
+            draw.line([px(start), px(end)], fill=(255, 220, 0, 64), width=2)
+
+        r = max(2, tile_size // 5)
+        for ps in pivotal_states:
+            cx, cy = px(ps)
+            draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)], fill=(255, 220, 0, 64))
+
+        if wg is not None:
+            cx, cy = px(wg)
+            draw.ellipse([(cx - r * 2, cy - r * 2), (cx + r * 2, cy + r * 2)],
+                         fill=(255, 160, 0, 255))
+        if ng is not None:
+            nx, ny = ng
+            draw.rectangle(
+                [(nx * tile_size, ny * tile_size),
+                 ((nx + 1) * tile_size - 1, (ny + 1) * tile_size - 1)],
+                fill=(0, 200, 255, 51)
+            )
+
+        return np.array(Image.alpha_composite(frame_pil, ov).convert('RGB'))
+
+    # Goal persistence state — mirrors train_episode exactly
+    goal_timeout = config.get('goal_timeout', 3)
+    horizon = config['manager_horizon']
+    active_wide_goal = None
+    active_narrow_goal = None
+    horizons_on_goal = 0
+    goal_reached_prev = False
+    ball_collected_prev = False
     wide_goal = manager.pivotal_states[0]
     narrow_goal = manager.pivotal_states[0]
 
+    first_frame = env.render()
+    if overlay_enabled:
+        first_frame = apply_overlay(first_frame, None, None)
+    frames = [first_frame]
+
+    done = False
+    step = 0
+    horizon_step = 0
+    goal_reached_this_horizon = False
+    starting_balls_snapshot = list(env.active_balls)
+
     with torch.no_grad():
         while not done and step < max_steps:
+            # Horizon boundary: goal persistence logic (mirrors train_episode)
             if horizon_step == 0:
-                wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999)
-                if manager.hidden_state is not None:
-                    manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
+                need_new_goal = (
+                    active_wide_goal is None
+                    or goal_reached_prev
+                    or ball_collected_prev
+                    or horizons_on_goal >= goal_timeout
+                )
+                if need_new_goal:
+                    # Flush traversal state, keep worker LSTM context
+                    worker.current_traversal_path = []
+                    worker.traversal_step = 0
+                    worker.current_edge_actions = None
+                    worker.current_action_idx = 0
+                    wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999)
+                    if manager.hidden_state is not None:
+                        manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
+                    active_wide_goal = wide_goal
+                    active_narrow_goal = narrow_goal
+                    horizons_on_goal = 0
+                else:
+                    wide_goal = active_wide_goal
+                    narrow_goal = active_narrow_goal
+                goal_reached_this_horizon = False
+                starting_balls_snapshot = list(env.active_balls)
+
             action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
             try:
                 obs, _, terminated, truncated, _ = env.step(action)
             except (AssertionError, IndexError):
                 terminated, truncated = False, False
             state = tuple(env.agent_pos)
-            frames.append(env.render())
+
+            if state == narrow_goal:
+                goal_reached_this_horizon = True
+
+            frame = env.render()
+            if overlay_enabled:
+                frame = apply_overlay(frame, wide_goal, narrow_goal)
+            frames.append(frame)
             done = terminated or truncated
             step += 1
-            horizon_step = (horizon_step + 1) % config['manager_horizon']
+            horizon_step += 1
+
+            # End of horizon: update persistence state
+            if horizon_step >= horizon:
+                horizon_step = 0
+                horizons_on_goal += 1
+                goal_reached_prev = goal_reached_this_horizon
+                ball_collected_prev = (len(starting_balls_snapshot) - len(env.active_balls)) > 0
 
     writer = imageio.get_writer(filename, fps=fps, format='ffmpeg')
     for frame in frames:
@@ -852,7 +1006,8 @@ def test_phase1_with_diagnostics(config=None):
         walk_bias=config.get('walk_bias', 0.65),
         walk_episodes=config.get('walk_episodes', 4),
         graph_walk_length=config.get('graph_walk_length', 20),
-        graph_num_attempts=config.get('graph_num_attempts', 70)
+        graph_num_attempts=config.get('graph_num_attempts', 70),
+        spread_alpha=config.get('pivotal_spread_alpha', 0.0)
     )
     
     # Extract metrics from VAE training history
@@ -1315,6 +1470,8 @@ def run_phase2_standalone(checkpoint_path='phase1_checkpoint.pt', config_overrid
             manager, worker, config, grid_state,
             agent_start_pos=agent_start,
             ball_positions=first_balls,
+            world_graph=world_graph,
+            pivotal_states=pivotal_states,
         )
 
     print(f"Best reward: {max(metrics['rewards']):.2f}")
@@ -1331,14 +1488,15 @@ externalconfig = {
         'phase2_episodes': 10,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,
-        'neighborhood_size': math.ceil(24/4),
+        'neighborhood_size': math.ceil(24/8),
         'manager_lr': 5e-4,
         'worker_lr': 1e-4,
         'vae_mu0': 9.0,
         'diagnostic_interval': 10000,
         'diagnostic_checkstart': False,
         'full_breakdown_every': 10,
-        'goal_timeout': 3,              # max horizons before forcing a new Manager goal
+        'goal_timeout': 10,             # max horizons before forcing a new Manager goal (horizon*timeout = max steps per goal)
+        'pivotal_spread_alpha': 0.02,   # Phase 1: spread incentive for pivotal state selection (0=off, ~0.05=strong)
         'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
         'diversity_walk_number': 30,    # Phase 1: biased random walks per iteration
         'walk_length': 400,             # Phase 1: steps per diversity walk
@@ -1394,7 +1552,8 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         walk_bias=config.get('walk_bias', 0.65),
         walk_episodes=config.get('walk_episodes', 4),
         graph_walk_length=config.get('graph_walk_length', 20),
-        graph_num_attempts=config.get('graph_num_attempts', 70)
+        graph_num_attempts=config.get('graph_num_attempts', 70),
+        spread_alpha=config.get('pivotal_spread_alpha', 0.0)
     )
     
     phase1_time = time.time() - start_time
@@ -1559,9 +1718,11 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
 
         # After plots, before return
     if recordflag and recording_data['bad_episode'] is not None:
-        replay_and_save_video(config, recording_data['bad_episode'], 'bad_episode.mp4')
+        replay_and_save_video(config, recording_data['bad_episode'], 'bad_episode.mp4',
+                              world_graph=world_graph, pivotal_states=pivotal_states)
     if recordflag and recording_data['good_episode'] is not None:
-        replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4')
+        replay_and_save_video(config, recording_data['good_episode'], 'good_episode.mp4',
+                              world_graph=world_graph, pivotal_states=pivotal_states)
 
     # Save trained weights to session (GCP fine-tuned in Phase 2)
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
@@ -1579,6 +1740,8 @@ def train_full_phase1_phase2(config=externalconfig, fast_training=fast_training_
         render_phase2_episode_gif_from_objects(
             manager, worker, config, GRIDSTATE,
             agent_start_pos=env.agent_start_pos,
+            world_graph=world_graph,
+            pivotal_states=pivotal_states,
         )
 
 

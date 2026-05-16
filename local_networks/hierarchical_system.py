@@ -46,7 +46,7 @@ class HierarchicalManager(nn.Module):
         self.wide_head = nn.Linear(64, len(pivotal_states)).to(device)
         
     # NARROW POLICY OUTPUT LAYER
-        self.narrow_head = nn.Linear(64 + 2, neighborhood_size**2).to(device)  # +2 for gw coords
+        self.narrow_head = nn.Linear(64 + 2, (2 * neighborhood_size) ** 2).to(device)  # +2 for gw coords; neighborhood_size = radius
         
     # VALUE FUNCTION OUTPUT LAYER
         self.critic = nn.Linear(64, 1).to(device)
@@ -73,17 +73,13 @@ class HierarchicalManager(nn.Module):
         self.prev_wide_goal = (0, 0)
     
     def get_neighborhood(self, wide_goal: Tuple[int, int]) -> List[Tuple[int, int]]:
-        # GET N×N NEIGHBORHOOD AROUND WIDE GOAL
+        # neighborhood_size = radius → (2r)×(2r) = 144 cells for r=6
         gw_x, gw_y = wide_goal
         neighborhood = []
-        
-        # Generate N×N grid centered on wide goal
-        offset = self.neighborhood_size // 2
-        for dx in range(-offset, offset + 1):
-            for dy in range(-offset, offset + 1):
-                neighbor = (gw_x + dx, gw_y + dy)
-                neighborhood.append(neighbor)
-        
+        r = self.neighborhood_size
+        for dx in range(-r, r):
+            for dy in range(-r, r):
+                neighborhood.append((gw_x + dx, gw_y + dy))
         return neighborhood
     
     def forward(self, state: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -900,6 +896,7 @@ class HierarchicalTrainer:
         if recording_data is not None:
             episode_record = {
                 'actions': [],
+                'goals': [],
                 'initial_agent_pos': tuple(self.env.agent_pos),
                 'initial_agent_dir': self.env.agent_dir,
                 'ball_positions': list(self.env.active_balls),
@@ -1069,6 +1066,7 @@ class HierarchicalTrainer:
                 
                 if record_this_episode:
                     episode_record['actions'].append(action)
+                    episode_record['goals'].append((wide_goal, narrow_goal))
 
                 if diag2:
                     if env_reward != 0:

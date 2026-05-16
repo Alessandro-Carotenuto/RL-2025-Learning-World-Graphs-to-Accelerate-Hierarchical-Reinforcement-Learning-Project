@@ -546,7 +546,7 @@ class VAESystem(nn.Module):
         
         return logged_losses
         
-    def extract_pivotal_states(self, trajectories: List[List[Tuple]], threshold_percentile: float = 80) -> List[Tuple]:
+    def extract_pivotal_states(self, trajectories: List[List[Tuple]], threshold_percentile: float = 80, spread_alpha: float = 0.0) -> List[Tuple]:
         """
         Extract pivotal states after training by analyzing prior means.
         
@@ -593,8 +593,26 @@ class VAESystem(nn.Module):
         threshold_percentage=100-threshold_percentile
         sorted_states = sorted(avg_importance.items(), key=lambda x: x[1], reverse=True)
         num_pivotal = max(1, int(len(sorted_states) * (threshold_percentage / 100)))
-        
-        pivotal_states = [coord for coord, score in sorted_states[:num_pivotal]]
+
+        if spread_alpha > 0.0 and num_pivotal > 1:
+            # Greedy selection: combined_score = importance + alpha * min_dist_to_selected
+            remaining = list(sorted_states)
+            selected = []
+            while len(selected) < num_pivotal and remaining:
+                if not selected:
+                    best_idx = 0
+                else:
+                    best_idx = max(
+                        range(len(remaining)),
+                        key=lambda i: remaining[i][1] + spread_alpha * min(
+                            abs(remaining[i][0][0] - s[0]) + abs(remaining[i][0][1] - s[1])
+                            for s in selected
+                        )
+                    )
+                selected.append(remaining.pop(best_idx)[0])
+            pivotal_states = selected
+        else:
+            pivotal_states = [coord for coord, _ in sorted_states[:num_pivotal]]
         
         self.current_pivotal_states = set(pivotal_states)
         return pivotal_states
@@ -607,7 +625,8 @@ class VAESystem(nn.Module):
         convergence_threshold: float = 1e-4,
         patience: int = 10,
         initial_kl_weight: float = 1.0,
-        annealing_rate: float = 0.00 # <-- MODIFIED: Annealing rate  
+        annealing_rate: float = 0.00, # <-- MODIFIED: Annealing rate
+        spread_alpha: float = 0.0
     ) -> List[Tuple]:
         """
         Full training loop for pivotal state discovery.
@@ -686,7 +705,7 @@ class VAESystem(nn.Module):
         
             
         # Extract final pivotal states
-        pivotal_states = self.extract_pivotal_states(all_trajectories)
+        pivotal_states = self.extract_pivotal_states(all_trajectories, spread_alpha=spread_alpha)
         
         print(f"Training completed. Discovered {len(pivotal_states)} pivotal states:")
         for i, (x, y) in enumerate(pivotal_states[:10]):  # Show first 10
