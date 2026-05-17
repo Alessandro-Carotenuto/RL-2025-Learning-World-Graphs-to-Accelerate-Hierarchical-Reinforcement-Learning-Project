@@ -141,6 +141,10 @@ class HierarchicalManager(nn.Module):
             )
             if mask.sum() > 0:
                 narrow_logits = narrow_logits.masked_fill(mask == 0, -1e9)
+            else:
+                # No valid cell in neighborhood: return wide_goal as fallback
+                log_prob = torch.tensor(0.0, device=self.device)
+                return wide_goal, log_prob
 
     # SAMPLE FROM CATEGORICAL DISTRIBUTION
         narrow_probs = F.softmax(narrow_logits, dim=0)
@@ -149,6 +153,10 @@ class HierarchicalManager(nn.Module):
         narrow_log_prob = narrow_dist.log_prob(narrow_idx)
 
         narrow_goal = neighborhood[narrow_idx.item()]
+
+        # Hard fallback: if sampled cell is still invalid, return wide_goal
+        if valid_cells is not None and narrow_goal not in valid_cells:
+            return wide_goal, narrow_log_prob
 
         return narrow_goal, narrow_log_prob
     

@@ -761,8 +761,8 @@ steps=2000
 
 externalconfig = {
         'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 2,
-        'phase2_episodes': 10,
+        'phase1_iterations': 3,
+        'phase2_episodes': 200,
         'num_balls': 5,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,

@@ -130,7 +130,7 @@ class GoalConditionedPolicy(nn.Module):
             current_pos = next_pos
 
         # UPDATE POLICY
-        policy_losses = self.update_policy_with_diagnostics(states, actions, rewards, values, log_probs)
+        self.update_policy(states, actions, rewards, values, log_probs)
 
         return states, actions, rewards, goal_reached
         
@@ -196,113 +196,41 @@ class GoalConditionedPolicy(nn.Module):
         
         return action.item(), log_prob, value.squeeze()
     
-    def update_policy(self, states: List, actions: List[int], rewards: List[float], 
-                         values: List[torch.Tensor], log_probs: List[torch.Tensor]):
-        """
-        Update policy parameters using A2C algorithm.
-        """
+    def update_policy(self, states: List, actions: List[int], rewards: List[float],
+                      values: List[torch.Tensor], log_probs: List[torch.Tensor],
+                      diagnostics: bool = False):
         if len(rewards) == 0:
-            return
+            return {} if diagnostics else None
 
-        # Convert to tensors
         returns = []
         discounted_reward = 0
-
-        # Compute discounted returns (backwards)
         for reward in reversed(rewards):
             discounted_reward = reward + self.gamma * discounted_reward
             returns.insert(0, discounted_reward)
 
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        values = torch.stack(values).squeeze()  # Ensure consistent shape
-        log_probs = torch.stack(log_probs)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-
-        # Ensure all tensors have same shape
-        if values.dim() == 0:  # Single value case
-            values = values.unsqueeze(0)
-        if returns.dim() == 0:
-            returns = returns.unsqueeze(0)
-
-        # Compute advantages
-        advantages = returns - values
-
-        # Normalize advantages (handle single-step episodes)
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # Compute losses
-        policy_loss = -(log_probs * advantages.detach()).mean()
-        value_loss = F.mse_loss(values, returns)
-
-        # Entropy for exploration (recompute from states)
-        entropy_loss = 0
-        for (state, goal) in states:
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
-            goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device)
-            action_logits, _ = self.forward(state_tensor, goal_tensor)
-            action_probs = F.softmax(action_logits, dim=-1)
-            entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
-
-        entropy_loss = entropy_loss / len(states)
-
-        # Total loss
-        total_loss = (policy_loss + 
-                     self.value_coef * value_loss - 
-                     self.entropy_coef * entropy_loss)
-
-        # Update parameters
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-    
-    def update_policy_with_diagnostics(self, states: List, actions: List[int], rewards: List[float], 
-                     values: List[torch.Tensor], log_probs: List[torch.Tensor]):
-        """
-        Update policy parameters using A2C algorithm with detailed diagnostics.
-        """
-        if len(rewards) == 0:
-            return {}
-            
-        # Convert to tensors
-        returns = []
-        discounted_reward = 0
-        
-        # Compute discounted returns (backwards)
-        for reward in reversed(rewards):
-            discounted_reward = reward + self.gamma * discounted_reward
-            returns.insert(0, discounted_reward)
-            
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
         values = torch.stack(values).squeeze()
         log_probs = torch.stack(log_probs)
         actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        
-        # Ensure all tensors have same shape
+
         if values.dim() == 0:
             values = values.unsqueeze(0)
         if returns.dim() == 0:
             returns = returns.unsqueeze(0)
-        
-        # Compute advantages
+
         advantages = returns - values
-        
-        # DIAGNOSTICS: Track advantage statistics
-        advantage_mean = advantages.mean().item()
-        advantage_std = advantages.std().item() if len(advantages) > 1 else 0.0
-        
-        # Normalize advantages (handle single-step episodes)
+
+        if diagnostics:
+            advantage_mean = advantages.mean().item()
+            advantage_std = advantages.std().item() if len(advantages) > 1 else 0.0
+            pre_update_params = {name: param.clone() for name, param in self.named_parameters()}
+
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Store pre-update parameters for gradient analysis
-        pre_update_params = {name: param.clone() for name, param in self.named_parameters()}
-        
-        # Compute losses
+
         policy_loss = -(log_probs * advantages.detach()).mean()
         value_loss = F.mse_loss(values, returns)
-        
-        # Entropy for exploration
+
         entropy_loss = 0
         for (state, goal) in states:
             state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
@@ -310,40 +238,31 @@ class GoalConditionedPolicy(nn.Module):
             action_logits, _ = self.forward(state_tensor, goal_tensor)
             action_probs = F.softmax(action_logits, dim=-1)
             entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
-        
         entropy_loss = entropy_loss / len(states)
-        
-        # Total loss
-        total_loss = (policy_loss + 
-                     self.value_coef * value_loss - 
-                     self.entropy_coef * entropy_loss)
-        
-        # Update parameters
+
+        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
+
         self.optimizer.zero_grad()
         total_loss.backward()
-        
-        # DIAGNOSTICS: Compute gradient norms before clipping
-        total_grad_norm = 0
-        param_count = 0
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                param_grad_norm = param.grad.data.norm(2)
-                total_grad_norm += param_grad_norm.item() ** 2
-                param_count += 1
-        total_grad_norm = total_grad_norm ** (1. / 2)
-        
+
+        if diagnostics:
+            total_grad_norm = sum(
+                p.grad.data.norm(2).item() ** 2
+                for p in self.parameters() if p.grad is not None
+            ) ** 0.5
+
         self.optimizer.step()
-        
-        # DIAGNOSTICS: Compute parameter change magnitude
-        param_change_norm = 0
-        for name, param in self.named_parameters():
-            if name in pre_update_params:
-                change = param - pre_update_params[name]
-                param_change_norm += change.norm().item() ** 2
-        param_change_norm = param_change_norm ** (1. / 2)
-        
-        # Return diagnostic information
-        diagnostics = {
+
+        if not diagnostics:
+            return None
+
+        param_change_norm = sum(
+            (param - pre_update_params[name]).norm().item() ** 2
+            for name, param in self.named_parameters()
+            if name in pre_update_params
+        ) ** 0.5
+
+        return {
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
             'entropy_loss': entropy_loss.item(),
@@ -354,10 +273,8 @@ class GoalConditionedPolicy(nn.Module):
             'param_change_norm': param_change_norm,
             'returns_mean': returns.mean().item(),
             'returns_std': returns.std().item(),
-            'values_mean': values.mean().item()
+            'values_mean': values.mean().item(),
         }
-        
-        return diagnostics
         
     def collect_episodes_from_position(self, env, start_pos: Tuple[int, int], 
                                      num_episodes: int = 6, 
