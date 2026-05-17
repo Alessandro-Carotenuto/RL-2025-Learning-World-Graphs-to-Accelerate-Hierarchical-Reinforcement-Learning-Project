@@ -66,6 +66,7 @@ class HierarchicalManager(nn.Module):
     # DIAGNOSTIC PARAMETERS
         self.diagnostic_interval = diagnostic_interval
         self.diagnostic_checkstart = diagnostic_checkstart
+        self._valid_cells = None
     
     def reset_manager_state(self):
         # RESET MANAGER STATE
@@ -120,45 +121,35 @@ class HierarchicalManager(nn.Module):
         
         return wide_idx.item(), wide_log_prob, value.squeeze()
     
+    def _nearest_valid_cell(self, center: Tuple[int, int], valid_cells: set) -> Tuple[int, int]:
+        return min(valid_cells, key=lambda c: abs(c[0] - center[0]) + abs(c[1] - center[1]))
+
     def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None) -> Tuple[Tuple[int, int], torch.Tensor]:
-        # SELECT NARROW GOAL FROM NEIGHBORHOOD
-    # GET LSTM FEATURES
         _, features, _ = self.forward(state)
-
-    # CONCATENATE FEATURES WITH WIDE GOAL
         wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
-        narrow_input = torch.cat([features, wide_goal_tensor])  # [64 + 2]
+        narrow_input = torch.cat([features, wide_goal_tensor])
+        narrow_logits = self.narrow_head(narrow_input)
 
-    # NARROW POLICY OUTPUT
-        narrow_logits = self.narrow_head(narrow_input)  # [neighborhood_size^2]
-
-    # MASK OUT WALL/OUT-OF-BOUNDS CELLS
         neighborhood = self.get_neighborhood(wide_goal)
+
         if valid_cells is not None:
-            mask = torch.tensor(
-                [1.0 if cell in valid_cells else 0.0 for cell in neighborhood],
-                dtype=torch.float32, device=self.device
-            )
-            if mask.sum() > 0:
-                narrow_logits = narrow_logits.masked_fill(mask == 0, -1e9)
-            else:
-                # No valid cell in neighborhood: return wide_goal as fallback
-                log_prob = torch.tensor(0.0, device=self.device)
-                return wide_goal, log_prob
+            valid_indices = [i for i, cell in enumerate(neighborhood) if cell in valid_cells]
+            if not valid_indices:
+                return self._nearest_valid_cell(wide_goal, valid_cells), torch.tensor(0.0, device=self.device)
 
-    # SAMPLE FROM CATEGORICAL DISTRIBUTION
+            idx_t = torch.tensor(valid_indices, dtype=torch.long, device=self.device)
+            valid_logits = narrow_logits[idx_t]
+            valid_probs = F.softmax(valid_logits, dim=0)
+            valid_dist = torch.distributions.Categorical(valid_probs)
+            local_idx = valid_dist.sample()
+            log_prob = valid_dist.log_prob(local_idx)
+            narrow_goal = neighborhood[valid_indices[local_idx.item()]]
+            return narrow_goal, log_prob
+
         narrow_probs = F.softmax(narrow_logits, dim=0)
-        narrow_dist = torch.distributions.Categorical(narrow_probs)
-        narrow_idx = narrow_dist.sample()
-        narrow_log_prob = narrow_dist.log_prob(narrow_idx)
-
-        narrow_goal = neighborhood[narrow_idx.item()]
-
-        # Hard fallback: if sampled cell is still invalid, return wide_goal
-        if valid_cells is not None and narrow_goal not in valid_cells:
-            return wide_goal, narrow_log_prob
-
-        return narrow_goal, narrow_log_prob
+        dist = torch.distributions.Categorical(narrow_probs)
+        idx = dist.sample()
+        return neighborhood[idx.item()], dist.log_prob(idx)
     
     def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None):
         verbose = (self.diagnostic_checkstart and step_count < 15) or (step_count % self.diagnostic_interval == 0)
@@ -192,6 +183,7 @@ class HierarchicalManager(nn.Module):
             print(f"    Entropy: {entropy.item():.3f}/{max_entropy.item():.3f} ({100*entropy/max_entropy:.1f}%)")
 
         # Pass 2: narrow goal — LSTM now sees updated prev_wide_goal as context
+        self._valid_cells = valid_cells
         narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells)
         combined_log_prob = wide_log_prob + narrow_log_prob
 
@@ -339,6 +331,12 @@ class HierarchicalManager(nn.Module):
             wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
             narrow_input = torch.cat([features_i, wide_goal_tensor])
             narrow_logits = self.narrow_head(narrow_input)
+            if self._valid_cells is not None:
+                neighborhood_i = self.get_neighborhood(wide_goal_i)
+                valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
+                if valid_idx:
+                    idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
+                    narrow_logits = narrow_logits[idx_t]
             narrow_probs = F.softmax(narrow_logits, dim=0)
             narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
             narrow_entropies.append(narrow_entropy)
@@ -794,12 +792,27 @@ class HierarchicalWorker(nn.Module):
         policy_loss = -(log_probs * advantages.detach()).mean()
         value_loss = F.mse_loss(values, returns)
         
-        # Entropy
+        # Entropy — computed on the network that actually selects actions
         entropy_loss = 0
-        for i, (state, wide_goal, narrow_goal) in enumerate(states):
-            action_logits, _ = self.forward(state, wide_goal, narrow_goal)
-            action_probs = F.softmax(action_logits, dim=0)
-            entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
+        if self.goal_policy is not None:
+            saved_hs = self.goal_policy.hidden_state
+            self.goal_policy.hidden_state = None
+            for (state, wide_goal, narrow_goal) in states:
+                state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
+                gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=self.device)
+                gp_logits, _ = self.goal_policy.forward(state_t, gn_t)
+                if gp_logits.dim() > 1:
+                    gp_logits = gp_logits.squeeze(0)
+                masked = torch.full_like(gp_logits, float('-inf'))
+                masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]
+                action_probs = F.softmax(masked, dim=-1)
+                entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
+            self.goal_policy.hidden_state = saved_hs
+        else:
+            for (state, wide_goal, narrow_goal) in states:
+                action_logits, _ = self.forward(state, wide_goal, narrow_goal)
+                action_probs = F.softmax(action_logits, dim=0)
+                entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
         entropy_loss = entropy_loss / len(states)
         
         # Total loss
