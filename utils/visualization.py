@@ -262,6 +262,12 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
 
     env.reset()
     state = tuple(env.agent_pos)
+    valid_cells = {
+        (x, y)
+        for x in range(env.width)
+        for y in range(env.height)
+        if env._is_traversable(env.grid.get(x, y))
+    }
     manager.reset_manager_state()
     worker.reset_worker_state()
 
@@ -352,7 +358,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     worker.traversal_step = 0
                     worker.current_edge_actions = None
                     worker.current_action_idx = 0
-                    wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999)
+                    wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999, valid_cells=valid_cells)
                     if manager.hidden_state is not None:
                         manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
                     active_wide_goal = wide_goal
@@ -373,6 +379,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
 
             if state == narrow_goal:
                 goal_reached_this_horizon = True
+                horizon_step = horizon - 1  # force horizon end at next increment
 
             frame = env.render()
             if overlay_enabled:

@@ -60,7 +60,7 @@ class HierarchicalManager(nn.Module):
         
     # HYPERPARAMETERS
         self.gamma = 0.99
-        self.entropy_coef = 1e-5
+        self.entropy_coef = 5e-4
         self.value_coef = 0.05
 
     # DIAGNOSTIC PARAMETERS
@@ -308,9 +308,13 @@ class HierarchicalManager(nn.Module):
             gae = delta + self.gamma * gae_lambda * gae
             advantages[t] = gae
 
-        # Normalize advantages
+        # Normalize advantages — guard against near-zero std (manager converged)
         raw_advantages = advantages.clone()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        adv_std = advantages.std()
+        if adv_std > 1e-6:
+            advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+        else:
+            advantages = advantages - advantages.mean()
         advantages = advantages.clamp(-3.0, 3.0)
 
         # Policy and value losses
