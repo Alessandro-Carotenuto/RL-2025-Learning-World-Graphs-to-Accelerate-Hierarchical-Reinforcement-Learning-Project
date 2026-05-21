@@ -644,6 +644,7 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         diagnostic_interval=config['diagnostic_interval'],
         diagnostic_checkstart=config['diagnostic_checkstart'],
         goal_timeout=config.get('goal_timeout', 3),
+        traversal_shaping_weight=config.get('traversal_shaping_weight', 2.0),
     )
 
     print("\nPHASE 2: Hierarchical Training")
@@ -775,6 +776,7 @@ externalconfig = {
         'diagnostic_checkstart': False,
         'full_breakdown_every': 10,
         'goal_timeout': 15,             # max horizons before forcing a new Manager goal (horizon*timeout = max steps per goal)
+        'traversal_shaping_weight': 2.0, # reward manager when traversal completes at wide_goal, scaled by dist(wide_goal, nearest_ball)
         'pivotal_spread_alpha': 0.02,   # Phase 1: spread incentive for pivotal state selection (0=off, ~0.05=strong)
         'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
         'diversity_walk_number': 30,    # Phase 1: biased random walks per iteration

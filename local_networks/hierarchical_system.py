@@ -693,9 +693,7 @@ class HierarchicalWorker(nn.Module):
         Paper: "Worker receives rewards from Manager by reaching subgoals"
         """
         if current_state == narrow_goal:
-            return 1.0  # Full success
-        elif current_state == wide_goal:
-            return 0.5  # Partial success (reached wide goal)
+            return 1.0  # Success
         else:
             return -0.001  # Step penalty
     
@@ -892,6 +890,7 @@ class HierarchicalTrainer:
                  workershaping=True,
                  managershaping=True,
                  narrow_shaping_weight: float = 1.0,
+                 traversal_shaping_weight: float = 2.0,
                  goal_timeout: int = 3):
         self.manager = manager
         self.worker = worker
@@ -920,6 +919,7 @@ class HierarchicalTrainer:
         self.worker_shaping_weight=0.2   # max ~0.15/horizon << success reward 1.0
         self.manager_shaping_weight=1
         self.narrow_shaping_weight=narrow_shaping_weight
+        self.traversal_shaping_weight=traversal_shaping_weight
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
     
@@ -1053,23 +1053,30 @@ class HierarchicalTrainer:
             worker_values = []
             worker_log_probs = []
             
-            horizon_env_reward = 0 
+            horizon_env_reward = 0
             goal_reached_this_horizon = False
+            traversal_completed_this_horizon = False
 
             # Save starting state for Manager reward shaping
             starting_state_snapshot = state
             starting_balls_snapshot = list(self.env.active_balls)
-            
+
             for h in range(self.horizon):
                 # BEFORE taking action, record distance FOR SHAPING
                 old_dist_narrow = manhattan_distance(state, narrow_goal)
                 old_dist_wide = manhattan_distance(state, wide_goal)
+
+                # Detect traversal completion: traversal was active but will finish inside get_action
+                was_traversing = bool(self.worker.current_traversal_path)
 
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
                     state, wide_goal, narrow_goal,
                     agent_dir=self.env.agent_dir
                 )
+
+                if was_traversing and not self.worker.current_traversal_path and state == wide_goal:
+                    traversal_completed_this_horizon = True
                 
                 # NEW: Track Worker values
                 worker_values_list.append(worker_value.item())
@@ -1206,6 +1213,15 @@ class HierarchicalTrainer:
                     )
                     narrow_bonus += 2.0 / (1.0 + dist_narrow_to_ball)
                 manager_reward += narrow_bonus
+
+            # Traversal completion bonus: reward manager for arriving at wide_goal via graph,
+            # scaled by proximity of wide_goal to nearest ball. Fires reliably (traversal is
+            # deterministic) giving the wide head a direct gradient toward ball-adjacent pivotals.
+            if traversal_completed_this_horizon and len(starting_balls_snapshot) > 0:
+                dist_wide_to_ball = min(
+                    manhattan_distance(wide_goal, ball) for ball in starting_balls_snapshot
+                )
+                manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball)
 
             # Push manager experience every horizon
             manager_states.append(starting_state_snapshot)
