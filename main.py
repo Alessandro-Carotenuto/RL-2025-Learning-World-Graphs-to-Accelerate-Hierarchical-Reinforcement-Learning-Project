@@ -760,9 +760,9 @@ def run_phase2_standalone(
 steps=2000
 
 externalconfig = {
-        'maze_size': EnvSizes.MEDIUM,
+        'maze_size': EnvSizes.SMALL,
         'phase1_iterations': 3,
-        'phase2_episodes': 200,
+        'phase2_episodes': 50,
         'num_balls': 5,
         'max_steps_per_episode': steps,
         'manager_horizon': steps//250,
@@ -975,12 +975,12 @@ def main():
         'device': externalconfig['device'],
     })
     """
-    train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)  # fixed_balls=False for random
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
     # run_phase1_comparison()
     # run_phase1_size_comparison()
-
+    render_phase2_episode_gif('phase1_checkpoint_SMALL.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=2000)
 
 if __name__ == "__main__":
     main()

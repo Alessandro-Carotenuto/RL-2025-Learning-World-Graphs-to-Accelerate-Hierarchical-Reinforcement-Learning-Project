@@ -36,7 +36,7 @@ class HierarchicalManager(nn.Module):
         
     # A2C-LSTM ARCHITECTURE
         self.lstm = nn.LSTM(
-            input_size=4,  # [state_x, state_y, prev_gw_x, prev_gw_y] 
+            input_size=7,  # [state_x, state_y, prev_gw_x, prev_gw_y, nearest_ball_x, nearest_ball_y, n_remaining]
             hidden_size=64,
             num_layers=1,
             batch_first=True
@@ -83,13 +83,19 @@ class HierarchicalManager(nn.Module):
                 neighborhood.append((gw_x + dx, gw_y + dy))
         return neighborhood
     
-    def forward(self, state: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, state: Tuple[int, int], active_balls=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # FORWARD PASS: WIDE GOAL SELECTION
     # PREPARE LSTM INPUT
+        if active_balls and len(active_balls) > 0:
+            nearest = min(active_balls, key=lambda b: abs(b[0] - state[0]) + abs(b[1] - state[1]))
+            nb_x, nb_y, n_remaining = float(nearest[0]), float(nearest[1]), float(len(active_balls))
+        else:
+            nb_x, nb_y, n_remaining = 0.0, 0.0, 0.0
         lstm_input = torch.tensor([
-            state[0], state[1], 
-            self.prev_wide_goal[0], self.prev_wide_goal[1]
-        ], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)  # [1, 1, 4]
+            state[0], state[1],
+            self.prev_wide_goal[0], self.prev_wide_goal[1],
+            nb_x, nb_y, n_remaining
+        ], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)  # [1, 1, 7]
         
     # LSTM FORWARD PASS
         lstm_out, self.hidden_state = self.lstm(lstm_input, self.hidden_state)
@@ -124,8 +130,8 @@ class HierarchicalManager(nn.Module):
     def _nearest_valid_cell(self, center: Tuple[int, int], valid_cells: set) -> Tuple[int, int]:
         return min(valid_cells, key=lambda c: abs(c[0] - center[0]) + abs(c[1] - center[1]))
 
-    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None) -> Tuple[Tuple[int, int], torch.Tensor]:
-        _, features, _ = self.forward(state)
+    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None, active_balls=None) -> Tuple[Tuple[int, int], torch.Tensor]:
+        _, features, _ = self.forward(state, active_balls)
         wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
         narrow_input = torch.cat([features, wide_goal_tensor])
         narrow_logits = self.narrow_head(narrow_input)
@@ -151,7 +157,7 @@ class HierarchicalManager(nn.Module):
         idx = dist.sample()
         return neighborhood[idx.item()], dist.log_prob(idx)
     
-    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None):
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None):
         verbose = (self.diagnostic_checkstart and step_count < 15) or (step_count % self.diagnostic_interval == 0)
 
         if verbose:
@@ -162,7 +168,7 @@ class HierarchicalManager(nn.Module):
                 print(f"  Hidden state norms: h={h.norm().item():.3f}, c={c.norm().item():.3f}")
 
         # Pass 1: wide goal — also captures logits/entropy without an extra forward
-        wide_logits, _, value = self.forward(state)
+        wide_logits, _, value = self.forward(state, active_balls)
         wide_probs = F.softmax(wide_logits, dim=0)
         entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
 
@@ -184,7 +190,7 @@ class HierarchicalManager(nn.Module):
 
         # Pass 2: narrow goal — LSTM now sees updated prev_wide_goal as context
         self._valid_cells = valid_cells
-        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells)
+        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells, active_balls=active_balls)
         combined_log_prob = wide_log_prob + narrow_log_prob
 
         if verbose:
@@ -250,7 +256,7 @@ class HierarchicalManager(nn.Module):
         print("Manager initialized from goal policy LSTM")
 
 
-    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0):
+    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None):
         """Update Manager policy with wide + narrow entropy regularization."""
         if len(rewards) == 0:
             return
@@ -330,8 +336,9 @@ class HierarchicalManager(nn.Module):
         # does not corrupt the recurrent state used outside this update
         saved_hidden = tuple(h.detach().clone() for h in self.hidden_state) if self.hidden_state else None
         narrow_entropies = []
-        for state_i, wide_goal_i in zip(states, wide_goals):
-            _, features_i, _ = self.forward(state_i)
+        balls_iter = balls_snapshots if balls_snapshots is not None else [None] * len(states)
+        for state_i, wide_goal_i, balls_i in zip(states, wide_goals, balls_iter):
+            _, features_i, _ = self.forward(state_i, balls_i)
             wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
             narrow_input = torch.cat([features_i, wide_goal_tensor])
             narrow_logits = self.narrow_head(narrow_input)
@@ -984,6 +991,7 @@ class HierarchicalTrainer:
         manager_values = []
         manager_log_probs = []
         manager_entropies_for_update = []
+        manager_balls_snapshots = []
         
         horizon_counter = 0
         
@@ -1005,7 +1013,8 @@ class HierarchicalTrainer:
                     self.worker.current_action_idx = 0
 
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
-                    state, step_count=self.global_step_counter, valid_cells=valid_cells
+                    state, step_count=self.global_step_counter, valid_cells=valid_cells,
+                    active_balls=list(self.env.active_balls)
                 )
                 if self.manager.hidden_state is not None:
                     self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)
@@ -1206,6 +1215,7 @@ class HierarchicalTrainer:
             manager_values.append(active_value)
             manager_log_probs.append(active_log_prob)
             manager_entropies_for_update.append(active_entropy)
+            manager_balls_snapshots.append(starting_balls_snapshot)
 
             horizons_on_goal += 1
             horizon_counter += 1
@@ -1227,7 +1237,8 @@ class HierarchicalTrainer:
                 manager_states, manager_wide_goals, manager_narrow_goals,
                 manager_rewards, manager_values, manager_log_probs,
                 manager_entropies_for_update,
-                step_count=self.global_step_counter
+                step_count=self.global_step_counter,
+                balls_snapshots=manager_balls_snapshots
             )
             manager_updates += 1
             if self.manager.hidden_state is not None:

@@ -192,6 +192,7 @@ def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_e
             grid_state=grid_state,
         )
 
+        fig.canvas.draw()
         frame = np.array(fig.canvas.buffer_rgba())[..., :3]
         frames.append(frame)
         plt.close(fig)
@@ -238,7 +239,8 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
     worker.load_state_dict(session['worker_state_dict'])
     worker.eval()
 
-    _run_and_save_episode(manager, worker, config, grid_state, agent_start, ball_positions, filename, fps, max_steps)
+    _run_and_save_episode(manager, worker, config, grid_state, agent_start, ball_positions, filename, fps, max_steps,
+                          world_graph=world_graph, pivotal_states=pivotal_states)
 
 
 def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
@@ -277,7 +279,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     else:
         print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
 
-    def apply_overlay(frame, wg, ng, traversal_path=None):
+    def apply_overlay(frame, wg, ng, traversal_path=None, active_balls=None, agent_state=None):
         tile_size = frame.shape[1] // env.width
 
         def px(coord):
@@ -318,6 +320,11 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 fill=(0, 200, 255, 51)
             )
 
+        if agent_state is not None and active_balls:
+            nearest_ball = min(active_balls,
+                               key=lambda b: abs(b[0] - agent_state[0]) + abs(b[1] - agent_state[1]))
+            draw.line([px(agent_state), px(nearest_ball)], fill=(255, 0, 0, 220), width=2)
+
         return np.array(Image.alpha_composite(frame_pil, ov).convert('RGB'))
 
     # Goal persistence state — mirrors train_episode exactly
@@ -333,7 +340,8 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
 
     first_frame = env.render()
     if overlay_enabled:
-        first_frame = apply_overlay(first_frame, None, None)
+        first_frame = apply_overlay(first_frame, None, None,
+                                    active_balls=list(env.active_balls), agent_state=state)
     frames = [first_frame]
 
     done = False
@@ -358,7 +366,10 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     worker.traversal_step = 0
                     worker.current_edge_actions = None
                     worker.current_action_idx = 0
-                    wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(state, step_count=999999, valid_cells=valid_cells)
+                    wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
+                        state, step_count=999999, valid_cells=valid_cells,
+                        active_balls=list(env.active_balls)
+                    )
                     if manager.hidden_state is not None:
                         manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
                     active_wide_goal = wide_goal
@@ -384,7 +395,8 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
             frame = env.render()
             if overlay_enabled:
                 frame = apply_overlay(frame, wide_goal, narrow_goal,
-                                      traversal_path=worker.current_traversal_path or None)
+                                      traversal_path=worker.current_traversal_path or None,
+                                      active_balls=list(env.active_balls), agent_state=state)
             frames.append(frame)
             done = terminated or truncated
             step += 1
