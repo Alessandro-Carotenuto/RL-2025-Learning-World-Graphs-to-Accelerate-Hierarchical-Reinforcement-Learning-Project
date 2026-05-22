@@ -149,6 +149,96 @@ def plot_training_diagnostics(trainer, config, save_path=None):
     plt.close(fig)
 
 
+def plot_worker_pretrain_diagnostics(achievement_history, reward_history,
+                                     save_path='pretrain_worker_diagnostics.png'):
+    """1×2: achievement rate (%) and avg episode reward over Worker pre-training."""
+    if not achievement_history:
+        return
+
+    def moving_average(data, window=20):
+        if len(data) < window:
+            return np.array([])
+        return np.convolve(data, np.ones(window) / window, mode='valid')
+
+    n = len(achievement_history)
+    episodes = list(range(1, n + 1))
+    ma_w = 20
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle('Intermediate Phase: Worker/GCP Pre-training', fontsize=14, fontweight='bold')
+
+    def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
+        ax.plot(episodes, data, color=color, linewidth=1.0, alpha=0.5, label=label)
+        ma = moving_average(data)
+        if len(ma) > 0:
+            ax.plot(range(ma_w, ma_w + len(ma)), ma, 'k-', linewidth=2, label=f'MA({ma_w})')
+        ax.set_title(title)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plot_with_ma(axes[0], [x * 100 for x in achievement_history],
+                 'teal', 'Achievement', 'Success Rate (%)',
+                 'Goal Achievement Rate\n(↑ = GCP learning to navigate)', ylim=[0, 101])
+
+    plot_with_ma(axes[1], reward_history,
+                 'steelblue', 'Reward', 'Episode Reward',
+                 'Avg Episode Reward\n(↑ = reaching goal faster, fewer timeouts)')
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"Worker pre-training diagnostics saved to {save_path}")
+    plt.close(fig)
+
+
+def plot_manager_wide_pretrain_diagnostics(coverage_history, reward_history,
+                                           save_path='pretrain_manager_wide_diagnostics.png'):
+    """1×2: ball coverage (%) and avg reward per horizon over Manager Wide pre-training."""
+    if not coverage_history:
+        return
+
+    def moving_average(data, window=20):
+        if len(data) < window:
+            return np.array([])
+        return np.convolve(data, np.ones(window) / window, mode='valid')
+
+    n = len(coverage_history)
+    episodes = list(range(1, n + 1))
+    ma_w = 20
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle('Intermediate Phase: Manager Wide Goal Pre-training', fontsize=14, fontweight='bold')
+
+    def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
+        ax.plot(episodes, data, color=color, linewidth=1.0, alpha=0.5, label=label)
+        ma = moving_average(data)
+        if len(ma) > 0:
+            ax.plot(range(ma_w, ma_w + len(ma)), ma, 'k-', linewidth=2, label=f'MA({ma_w})')
+        ax.set_title(title)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plot_with_ma(axes[0], [x * 100 for x in coverage_history],
+                 'green', 'Coverage', 'Balls Covered (%)',
+                 'Ball Coverage per Episode\n(↑ = Manager targeting balls)', ylim=[0, 101])
+
+    plot_with_ma(axes[1], reward_history,
+                 'orange', 'Reward', 'Avg Reward / Horizon',
+                 'Avg Reward per Horizon\n(↑ = wide goals closer to balls)')
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"Manager Wide pre-training diagnostics saved to {save_path}")
+    plt.close(fig)
+
+
 def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
     if not pivotal_states or world_graph is None or not world_graph.nodes:
         print("Skipping graph visualization: no pivotal states or empty graph.")

@@ -15,7 +15,9 @@ from utils.misc import manhattan_distance, resolve_device, _walk_away_from_spawn
 from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state
 from utils.visualization import (plot_training_diagnostics, save_graph_visualization,
                                   create_phase1_gif, render_phase2_episode_gif,
-                                  _run_and_save_episode, print_grid_image, _plot_phase1_run)
+                                  _run_and_save_episode, print_grid_image, _plot_phase1_run,
+                                  plot_worker_pretrain_diagnostics,
+                                  plot_manager_wide_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 
 
@@ -178,6 +180,12 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 print("Reconstruction loss has plateaued - training converged!")
                 break
     
+
+    # Ensure spawn point is a pivotal state so Phase 2 always starts on the graph
+    spawn = tuple(env.agent_start_pos)
+    if spawn not in pivotal_states:
+        pivotal_states.append(spawn)
+        print(f"[Phase 1] Spawn {spawn} not in pivotal states — added (total: {len(pivotal_states)})")
 
     # Construct world graph
     world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
@@ -611,6 +619,231 @@ def compare_phase1_runs(runs_dict):
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 
+def run_worker_pretrain(env, worker, grid_state, config, device):
+    """
+    Intermediate phase: pre-train Worker/GCP on short-range navigation.
+    No Manager, no balls.
+    Rewards: +1.0 on goal reached, -0.01 per step, -1.0 on timeout.
+    """
+    import torch.nn.functional as F
+    from torch.distributions import Categorical
+
+    episodes = config.get('worker_pretrain_episodes', 0)
+    max_steps = config.get('worker_pretrain_max_steps', 60)
+    r = config.get('neighborhood_size', 3)
+
+    env.phase = 1
+    env.randomgen = False
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.reset()
+
+    valid_cells = [
+        (x, y)
+        for x in range(1, env.width - 1)
+        for y in range(1, env.height - 1)
+        if env._is_traversable(env.grid.get(x, y))
+    ]
+    valid_set = set(valid_cells)
+
+    print(f"\n{'='*70}")
+    print(f"INTERMEDIATE PHASE: Worker/GCP Pre-training")
+    print(f"  {episodes} episodes | max {max_steps} steps | r={r} | {len(valid_cells)} valid cells")
+    print(f"{'='*70}")
+
+    goal_reached_history = []
+    episode_reward_history = []
+
+    for episode in range(episodes):
+        spawn = random.choice(valid_cells)
+        env.agent_start_pos = spawn
+        env.agent_start_dir = random.randint(0, 3)
+        env.reset()
+        state = tuple(env.agent_pos)
+
+        candidates = [
+            (state[0] + dx, state[1] + dy)
+            for dx in range(-r, r)
+            for dy in range(-r, r)
+            if (dx != 0 or dy != 0) and (state[0] + dx, state[1] + dy) in valid_set
+        ]
+        if not candidates:
+            goal_reached_history.append(0.0)
+            episode_reward_history.append(0.0)
+            continue
+
+        narrow_goal = random.choice(candidates)
+        wide_goal = state  # agent already at wide goal → LSTM has context, no traversal triggered
+
+        worker.reset_worker_state()
+
+        worker_states, worker_actions, worker_rewards, worker_values, worker_log_probs = [], [], [], [], []
+        goal_reached = False
+
+        for step in range(max_steps):
+            # Direct GCP call — bypasses get_action to avoid traversal logic corrupting gradients
+            _, value = worker.forward(state, wide_goal, narrow_goal)
+
+            state_t = torch.tensor(state, dtype=torch.float32, device=device)
+            gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=device)
+            gp_logits, _ = worker.goal_policy.forward(state_t, gn_t)
+            if gp_logits.dim() > 1:
+                gp_logits = gp_logits.squeeze(0)
+            masked = torch.full_like(gp_logits, float('-inf'))
+            masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]
+            probs = F.softmax(masked, dim=-1)
+            dist = Categorical(probs)
+            idx = dist.sample()
+            log_prob = dist.log_prob(idx)
+            action = idx.item()
+
+            try:
+                _, _, terminated, truncated, _ = env.step(action)
+                next_state = tuple(env.agent_pos)
+            except (AssertionError, IndexError):
+                next_state = state
+                terminated = False
+                truncated = False
+
+            reward = 1.0 if next_state == narrow_goal else -0.01
+
+            worker_states.append((state, wide_goal, narrow_goal))
+            worker_actions.append(action)
+            worker_rewards.append(reward)
+            worker_values.append(value.squeeze())
+            worker_log_probs.append(log_prob)
+
+            state = next_state
+            if next_state == narrow_goal:
+                goal_reached = True
+                break
+            if terminated or truncated:
+                break
+
+        if not goal_reached and worker_rewards:
+            worker_rewards[-1] += -1.0  # timeout penalty on last step
+
+        goal_reached_history.append(float(goal_reached))
+        episode_reward_history.append(sum(worker_rewards) if worker_rewards else 0.0)
+
+        if len(worker_rewards) > 0:
+            worker.update_policy(worker_states, worker_actions, worker_rewards, worker_values, worker_log_probs)
+
+        if (episode + 1) % 50 == 0:
+            recent = goal_reached_history[-50:]
+            print(f"  Ep {episode+1:>5}/{episodes} | Achievement: {sum(recent)/len(recent)*100:.1f}%")
+
+    final_ach = sum(goal_reached_history[-100:]) / min(100, len(goal_reached_history)) * 100
+    print(f"\nWorker Pre-training complete. Final achievement (last 100 ep): {final_ach:.1f}%")
+    plot_worker_pretrain_diagnostics(goal_reached_history, episode_reward_history)
+    return goal_reached_history
+
+
+def run_manager_wide_pretrain(env, manager, grid_state, config, device):
+    """
+    Intermediate phase: pre-train Manager wide head on ball-proximity goal selection.
+    No Worker, no traversal. Per episode: N goal selections, agent teleports to wide_goal after each.
+    Reward: +1.0 if ball in neighborhood(wide_goal), else -dist_to_nearest / maze_diagonal.
+    Balls are simulated as collected when covered, so Manager learns to sequence across all balls.
+    """
+    episodes = config.get('manager_wide_pretrain_episodes', 0)
+    horizons_per_ep = config.get('manager_wide_horizons_per_episode', 20)
+    r = config.get('neighborhood_size', 3)
+
+    env.phase = 2
+    env.randomgen = False
+    env.fixed_ball_positions = None  # random balls each episode
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.reset()
+
+    valid_cells = [
+        (x, y)
+        for x in range(1, env.width - 1)
+        for y in range(1, env.height - 1)
+        if env._is_traversable(env.grid.get(x, y))
+    ]
+    valid_set = set(valid_cells)
+    maze_diagonal = (env.width - 2) + (env.height - 2)
+
+    print(f"\n{'='*70}")
+    print(f"INTERMEDIATE PHASE: Manager Wide Goal Pre-training")
+    print(f"  {episodes} episodes | {horizons_per_ep} horizons/ep | r={r} | diagonal={maze_diagonal}")
+    print(f"{'='*70}")
+
+    ball_coverage_history = []
+    avg_reward_history = []
+
+    for episode in range(episodes):
+        spawn = random.choice(valid_cells)
+        env.agent_start_pos = spawn
+        env.agent_start_dir = random.randint(0, 3)
+        env.reset()
+        state = tuple(env.agent_pos)
+
+        active_balls = set(env.active_balls)
+        initial_ball_count = len(active_balls)
+
+        manager.reset_manager_state()
+
+        m_states, m_wide, m_narrow = [], [], []
+        m_rewards, m_values, m_log_probs, m_entropies = [], [], [], []
+
+        for h in range(horizons_per_ep):
+            if not active_balls:
+                break
+
+            wide_goal, narrow_goal, log_prob, value, entropy = manager.get_manager_action(
+                state, step_count=episode * horizons_per_ep + h,
+                valid_cells=valid_set, active_balls=list(active_balls)
+            )
+            if manager.hidden_state is not None:
+                manager.hidden_state = tuple(hs.detach() for hs in manager.hidden_state)
+
+            neighborhood = {
+                (wide_goal[0] + dx, wide_goal[1] + dy)
+                for dx in range(-r, r)
+                for dy in range(-r, r)
+            }
+
+            covered = [b for b in active_balls if b in neighborhood]
+            if covered:
+                reward = 1.0
+                active_balls.discard(covered[0])
+            else:
+                dist = min(manhattan_distance(wide_goal, b) for b in active_balls)
+                reward = -dist / maze_diagonal
+
+            m_states.append(state)
+            m_wide.append(wide_goal)
+            m_narrow.append(narrow_goal)
+            m_rewards.append(reward)
+            m_values.append(value)
+            m_log_probs.append(log_prob)
+            m_entropies.append(entropy.detach())
+
+            state = wide_goal  # teleport for next selection
+
+        covered_count = initial_ball_count - len(active_balls)
+        ball_coverage_history.append(covered_count / max(1, initial_ball_count))
+        avg_reward_history.append(sum(m_rewards) / len(m_rewards) if m_rewards else 0.0)
+
+        if m_rewards:
+            manager.update_policy(
+                m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
+                step_count=episode
+            )
+
+        if (episode + 1) % 50 == 0:
+            recent = ball_coverage_history[-50:]
+            print(f"  Ep {episode+1:>5}/{episodes} | Ball coverage: {sum(recent)/len(recent)*100:.1f}%")
+
+    final_cov = sum(ball_coverage_history[-100:]) / min(100, len(ball_coverage_history)) * 100
+    print(f"\nManager Wide Pre-training complete. Final ball coverage (last 100 ep): {final_cov:.1f}%")
+    plot_manager_wide_pretrain_diagnostics(ball_coverage_history, avg_reward_history)
+    return ball_coverage_history
+
+
 def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
                          agent_start, first_balls, session_path, grid_state,
                          phase2_animation=True):
@@ -633,6 +866,17 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     )
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
+
+    if config.get('worker_pretrain_episodes', 0) > 0:
+        run_worker_pretrain(env, worker, grid_state, config, config['device'])
+
+    if config.get('manager_wide_pretrain_episodes', 0) > 0:
+        run_manager_wide_pretrain(env, manager, grid_state, config, config['device'])
+
+    # Pre-training phases modify env.agent_start_pos to random cells — restore correct Phase 2 spawn
+    env.agent_start_pos = agent_start
+    env.agent_start_dir = 0
+    env.phase = 2
 
     print("\nDiagnosing Worker behavior BEFORE training:")
     diagnose_worker_behavior_single_episode(env, manager, worker, world_graph)
@@ -786,6 +1030,10 @@ externalconfig = {
         'graph_walk_length': 50,         # Phase 1: max steps per random walk for edge discovery
         'graph_num_attempts': 150,       # Phase 1: random walk attempts per pivotal state
         'convergence_threshold': 0.01,   # Phase 1: early-stop when avg loss change drops below this
+        'worker_pretrain_episodes': 500,         # Intermediate phase Worker: episodes (0 = skip)
+        'worker_pretrain_max_steps': 60,          # Intermediate phase Worker: max steps per episode
+        'manager_wide_pretrain_episodes': 300,    # Intermediate phase Manager Wide: episodes (0 = skip)
+        'manager_wide_horizons_per_episode': 20,  # Intermediate phase Manager Wide: goal selections per episode
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
