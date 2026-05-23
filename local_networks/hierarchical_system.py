@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,13 +19,14 @@ class HierarchicalManager(nn.Module):
     HIERARCHICAL MANAGER: SELECTS GOALS USING WIDE-THEN-NARROW STRATEGY
     """
     
-    def __init__(self, 
+    def __init__(self,
                  pivotal_states: List[Tuple[int, int]],
                  neighborhood_size: int = 3,
                  lr: float = 5e-3,
                  horizon: int = 15,
-                 diagnostic_interval: int = 30,  # NEW
-                 diagnostic_checkstart: bool = True,  # NEW
+                 diagnostic_interval: int = 30,
+                 diagnostic_checkstart: bool = True,
+                 action_verbose: bool = False,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         # INITIALIZE MANAGER NETWORKS AND PARAMETERS
         super().__init__()
@@ -46,7 +48,7 @@ class HierarchicalManager(nn.Module):
         self.wide_head = nn.Linear(64, len(pivotal_states)).to(device)
         
     # NARROW POLICY OUTPUT LAYER
-        self.narrow_head = nn.Linear(64 + 2, (2 * neighborhood_size) ** 2).to(device)  # +2 for gw coords; neighborhood_size = radius
+        self.narrow_head = nn.Linear(64 + 2, 2 * neighborhood_size * (neighborhood_size + 1)).to(device)  # +2 for gw coords; Manhattan ball: 2r(r+1) cells
         
     # VALUE FUNCTION OUTPUT LAYER
         self.critic = nn.Linear(64, 1).to(device)
@@ -66,6 +68,7 @@ class HierarchicalManager(nn.Module):
     # DIAGNOSTIC PARAMETERS
         self.diagnostic_interval = diagnostic_interval
         self.diagnostic_checkstart = diagnostic_checkstart
+        self.action_verbose = action_verbose
         self._valid_cells = None
     
     def reset_manager_state(self):
@@ -74,13 +77,14 @@ class HierarchicalManager(nn.Module):
         self.prev_wide_goal = (0, 0)
     
     def get_neighborhood(self, wide_goal: Tuple[int, int]) -> List[Tuple[int, int]]:
-        # neighborhood_size = radius → (2r)×(2r) = 144 cells for r=6
+        # Manhattan ball of radius r: all (dx,dy) with 0 < |dx|+|dy| <= r → 2r(r+1) cells
         gw_x, gw_y = wide_goal
-        neighborhood = []
         r = self.neighborhood_size
-        for dx in range(-r, r):
-            for dy in range(-r, r):
-                neighborhood.append((gw_x + dx, gw_y + dy))
+        neighborhood = []
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if 0 < abs(dx) + abs(dy) <= r:
+                    neighborhood.append((gw_x + dx, gw_y + dy))
         return neighborhood
     
     def forward(self, state: Tuple[int, int], active_balls=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -158,7 +162,10 @@ class HierarchicalManager(nn.Module):
         return neighborhood[idx.item()], dist.log_prob(idx)
     
     def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None):
-        verbose = (self.diagnostic_checkstart and step_count < 15) or (step_count % self.diagnostic_interval == 0)
+        verbose = self.action_verbose and (
+            (self.diagnostic_checkstart and step_count < 15) or
+            (step_count % self.diagnostic_interval == 0)
+        )
 
         if verbose:
             print(f"\n[Manager Action] Step {step_count}")
@@ -265,13 +272,10 @@ class HierarchicalManager(nn.Module):
         if len(rewards) <= 1:
             return
 
-        # Diagnostic printing
-        if self.diagnostic_checkstart and step_count < 15:
-            verbose = True
-        elif step_count % self.diagnostic_interval == 0:
-            verbose = True
-        else:
-            verbose = False
+        verbose = self.action_verbose and (
+            (self.diagnostic_checkstart and step_count < 15) or
+            (step_count % self.diagnostic_interval == 0)
+        )
 
         if verbose:
             print(f"\n{'='*70}")
@@ -393,6 +397,7 @@ class HierarchicalWorker(nn.Module):
                  lr: float = 5e-3,
                  verbose: bool = False,
                  goal_policy=None,
+                 maze_size: int = 24,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -403,8 +408,9 @@ class HierarchicalWorker(nn.Module):
         """
         self.verbose = verbose
         super().__init__()
-        
+
         self.device = device
+        self.maze_size = maze_size
         self.world_graph = world_graph
         self.pivotal_states = set(pivotal_states)
 
@@ -414,14 +420,12 @@ class HierarchicalWorker(nn.Module):
         # double-counting in the optimizer and polluting worker.state_dict().
         object.__setattr__(self, 'goal_policy', goal_policy)
 
-        # A2C-LSTM architecture
-        self.lstm = nn.LSTM(
-            input_size=6,  # [state_x, state_y, gw_x, gw_y, gn_x, gn_y]
-            hidden_size=64,
-            num_layers=1,
-            batch_first=True
+        # A2C-MLP architecture (6 inputs: state_x, state_y, dir_sin, dir_cos, goal_dx, goal_dy)
+        self.net = nn.Sequential(
+            nn.Linear(6, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
         ).to(device)
-        
+
         self.actor = nn.Linear(64, 3).to(device)
         self.critic = nn.Linear(64, 1).to(device)
         
@@ -435,7 +439,6 @@ class HierarchicalWorker(nn.Module):
             self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
         # Worker state
-        self.hidden_state = None
         self.current_traversal_path = []
         self.traversal_step = 0
         self.current_edge_actions = None
@@ -450,18 +453,18 @@ class HierarchicalWorker(nn.Module):
         
         # Hyperparameters
         self.gamma = 0.99
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.05
         self.value_coef = 0.5
+        # Goal-delta normalization divisor — set per curriculum r-stage by run_worker_pretrain,
+        # then fixed to neighborhood_size for Phase 2.  Default 1.0 = raw (r=1 pretrain scale).
+        self.goal_norm_div: float = 1.0
     
     def reset_worker_state(self):
-        """Reset LSTM hidden state and traversal state."""
-        self.hidden_state = None
+        """Reset traversal state."""
         self.current_traversal_path = []
         self.traversal_step = 0
         self.current_edge_actions = None
         self.current_action_idx = 0
-        if self.goal_policy is not None:
-            self.goal_policy.hidden_state = None
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -509,29 +512,30 @@ class HierarchicalWorker(nn.Module):
         path = self.plan_traversal(current_state, wide_goal)
         return path is not None
     
-    def forward(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, state: Tuple[int, int], agent_dir: int, narrow_goal: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through Worker network.
-        
+
         Args:
             state: Current agent position
-            wide_goal: Manager's wide goal
+            agent_dir: Current agent facing direction (0=right,1=down,2=left,3=up)
             narrow_goal: Manager's narrow goal
-            
+
         Returns:
             action_logits: Logits over 3 navigation actions
             value: State value estimate
         """
-        # LSTM input: [state_x, state_y, gw_x, gw_y, gn_x, gn_y]
-        lstm_input = torch.tensor([
-            state[0], state[1],
-            wide_goal[0], wide_goal[1],
-            narrow_goal[0], narrow_goal[1]
-        ], dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)  # [1, 1, 6]
-        
-        # LSTM forward
-        lstm_out, self.hidden_state = self.lstm(lstm_input, self.hidden_state)
-        features = lstm_out.squeeze(0).squeeze(0)  # [64]
+        # dir encoded as (sin, cos) — preserves circular adjacency (all neighbours equidistant).
+        # Goal delta normalized by 24.0 (grid size) — matches GoalConditionedPolicy.forward()
+        # so that initialize_from_goal_policy weight transfer is calibrated correctly.
+        net_input = torch.tensor([
+            state[0] / self.maze_size, state[1] / self.maze_size,
+            math.sin(agent_dir * math.pi / 2),
+            math.cos(agent_dir * math.pi / 2),
+            float(narrow_goal[0] - state[0]) / self.goal_norm_div,
+            float(narrow_goal[1] - state[1]) / self.goal_norm_div,
+        ], dtype=torch.float32, device=self.device)  # [6]
+        features = self.net(net_input)               # [64]
         
         # Action and value
         action_logits = self.actor(features)  # [3]
@@ -602,19 +606,18 @@ class HierarchicalWorker(nn.Module):
 
                 # Return the action from the pre-computed plan
                 with torch.no_grad():
-                    _, value = self.forward(state, wide_goal, narrow_goal)
+                    _, value = self.forward(state, agent_dir, narrow_goal)
                 log_prob = torch.tensor(-1.0, device=self.device) # Dummy log_prob for planned actions
                 return action, log_prob, value.squeeze()
 
         # 3. FALLBACK: fine-tune Phase 1 GCP if available, else use worker A2C.
         if self.goal_policy is not None:
-            # Worker value: uses wide+narrow goal context
-            _, value = self.forward(state, wide_goal, narrow_goal)
+            _, value = self.forward(state, agent_dir, narrow_goal)
 
             # GCP selects action toward narrow_goal — gradients flow for fine-tuning
             state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
             gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=self.device)
-            gp_logits, _ = self.goal_policy.forward(state_t, gn_t)
+            gp_logits, _ = self.goal_policy.forward(state_t, agent_dir, gn_t)
             if gp_logits.dim() > 1:
                 gp_logits = gp_logits.squeeze(0)
             masked = torch.full_like(gp_logits, float('-inf'))
@@ -625,7 +628,7 @@ class HierarchicalWorker(nn.Module):
             log_prob = dist.log_prob(idx)
             action = idx.item()
         else:
-            action_logits, value = self.forward(state, wide_goal, narrow_goal)
+            action_logits, value = self.forward(state, agent_dir, narrow_goal)
             probs = F.softmax(action_logits, dim=0)
             dist = torch.distributions.Categorical(probs)
             idx = dist.sample()
@@ -736,112 +739,130 @@ class HierarchicalWorker(nn.Module):
     # Actual working version:
     def initialize_from_goal_policy(self, goal_policy):
         with torch.no_grad():
-            # Copy LSTM weights
-            if hasattr(goal_policy, 'lstm'):
-                # Goal policy LSTM: input=4, Worker LSTM: input=6
-                # Copy what we can
-                for name, param in goal_policy.lstm.named_parameters():
-                    if name in dict(self.lstm.named_parameters()):
-                        worker_param = dict(self.lstm.named_parameters())[name]
-                        if param.shape == worker_param.shape:
-                            worker_param.copy_(param)
-                        elif 'weight_ih' in name:  # Input weights - partial copy
-                            # Copy first 4 input dims (state_x, state_y, goal_x, goal_y)
-                            worker_param[:, :4].copy_(param)
-                            # Randomly init the extra 2 dims for narrow goal
-                            nn.init.xavier_uniform_(worker_param[:, 4:])
-                        else:  # Other weights match exactly
-                            worker_param.copy_(param)
-            
-            # Copy actor (first 3 actions)
+            # Both GCP and Worker share the same 5→64→64 MLP layout — direct copy.
+            if hasattr(goal_policy, 'net'):
+                for name, param in goal_policy.net.named_parameters():
+                    worker_param = dict(self.net.named_parameters()).get(name)
+                    if worker_param is not None and param.shape == worker_param.shape:
+                        worker_param.copy_(param)
+
+            # Copy actor (first 3 of GCP's 7 actions)
             if hasattr(goal_policy, 'actor'):
                 self.actor.weight.copy_(goal_policy.actor.weight[:3, :])
                 self.actor.bias.copy_(goal_policy.actor.bias[:3])
-            
+
             # Copy critic
             if hasattr(goal_policy, 'critic'):
                 self.critic.weight.copy_(goal_policy.critic.weight)
                 self.critic.bias.copy_(goal_policy.critic.bias)
-        
-        print("Worker initialized from goal policy LSTM")
+
+        print("Worker initialized from goal policy (direct copy, 5-dim MLP: state+dir+goal)")
 
 
-    def update_policy(self, states: List, actions: List, rewards: List, 
-                     values: List[torch.Tensor], log_probs: List[torch.Tensor]):
+    def update_policy(self, states: List, actions: List, rewards: List,
+                     values: List[torch.Tensor], log_probs: List[torch.Tensor],
+                     next_states=None, dones=None,
+                     ppo_epochs: int = 4, clip_eps: float = 0.2,
+                     gae_lambda: float = 0.95) -> dict:
         """
-        Update Worker policy with per-step A2C.
-        Paper: Worker operates at single-step resolution.
+        Update Worker policy with PPO (when next_states provided) or MC A2C (fallback).
+        PPO: GAE advantages + clipped surrogate + K epochs.
+        A2C fallback: MC returns, single epoch — used by Phase 2 HierarchicalTrainer.
         """
         if len(rewards) == 0:
-            return
-        
-        # Compute returns
-        returns = []
-        discounted_reward = 0
-        for reward in reversed(rewards):
-            discounted_reward = reward + self.gamma * discounted_reward
-            returns.insert(0, discounted_reward)
-        
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        values = torch.stack(values).squeeze()
-        log_probs = torch.stack(log_probs)
-        
-        # Handle single-step case
-        if values.dim() == 0:
-            values = values.unsqueeze(0)
-        if returns.dim() == 0:
-            returns = returns.unsqueeze(0)
-        
-        # Compute advantages
-        advantages = returns - values
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Losses
-        policy_loss = -(log_probs * advantages.detach()).mean()
-        value_loss = F.mse_loss(values, returns)
-        
-        # Entropy — computed on the network that actually selects actions
-        entropy_loss = 0
-        if self.goal_policy is not None:
-            saved_hs = self.goal_policy.hidden_state
-            self.goal_policy.hidden_state = None
-            for (state, wide_goal, narrow_goal) in states:
-                state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
-                gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=self.device)
-                gp_logits, _ = self.goal_policy.forward(state_t, gn_t)
-                if gp_logits.dim() > 1:
-                    gp_logits = gp_logits.squeeze(0)
-                masked = torch.full_like(gp_logits, float('-inf'))
-                masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]
-                action_probs = F.softmax(masked, dim=-1)
-                entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
-            self.goal_policy.hidden_state = saved_hs
-        else:
-            for (state, wide_goal, narrow_goal) in states:
-                action_logits, _ = self.forward(state, wide_goal, narrow_goal)
-                action_probs = F.softmax(action_logits, dim=0)
-                entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
-        entropy_loss = entropy_loss / len(states)
-        
-        # Total loss
-        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
-        
-        # Update
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        if self.goal_policy is not None:
-            all_params = list(self.parameters()) + list(self.goal_policy.parameters())
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=0.5)
-        else:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
-        self.optimizer.step()
+            return {}
 
-        # Truncated BPTT: detach hidden states so graphs don't grow across horizons
-        if self.hidden_state is not None:
-            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
-        if self.goal_policy is not None and self.goal_policy.hidden_state is not None:
-            self.goal_policy.hidden_state = tuple(h.detach() for h in self.goal_policy.hidden_state)
+        T = len(rewards)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        values_t  = torch.stack(values).squeeze()
+        if values_t.dim() == 0:
+            values_t = values_t.unsqueeze(0)
+
+        old_log_probs = torch.stack(log_probs).detach()
+
+        if next_states is not None:
+            # GAE advantages
+            dones_t = torch.tensor(
+                [float(d) for d in dones], dtype=torch.float32, device=self.device
+            )
+            with torch.no_grad():
+                next_vals = []
+                for (ns, nad, ng) in next_states:
+                    _, nv = self.forward(ns, nad, ng)
+                    next_vals.append(nv.squeeze())
+                next_values_t = torch.stack(next_vals)
+
+            advantages = torch.zeros(T, device=self.device)
+            gae = 0.0
+            for t in reversed(range(T)):
+                delta = (rewards_t[t]
+                         + self.gamma * next_values_t[t] * (1 - dones_t[t])
+                         - values_t[t].detach())
+                gae = delta + self.gamma * gae_lambda * (1 - dones_t[t]) * gae
+                advantages[t] = gae
+            returns = advantages + values_t.detach()
+            n_epochs = ppo_epochs
+        else:
+            # MC fallback for Phase 2 (no next_states tracked)
+            mc = []
+            R = 0.0
+            for r in reversed(rewards):
+                R = r + self.gamma * R
+                mc.insert(0, R)
+            returns = torch.tensor(mc, dtype=torch.float32, device=self.device)
+            advantages = returns - values_t.detach()
+            n_epochs = 1
+
+        adv_mean = advantages.mean().item()
+        adv_std  = advantages.std().item() if T > 1 else 0.0
+        if T > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        params = (list(self.parameters()) + list(self.goal_policy.parameters())
+                  if self.goal_policy is not None else list(self.parameters()))
+
+        last_metrics: dict = {}
+        for _ in range(n_epochs):
+            new_log_probs_list, new_values_list, entropy_list = [], [], []
+            for i, (s, ad, ng) in enumerate(states):
+                action_logits, new_val = self.forward(s, ad, ng)
+                dist = torch.distributions.Categorical(logits=action_logits)
+                new_log_probs_list.append(
+                    dist.log_prob(torch.tensor(actions[i], device=self.device))
+                )
+                new_values_list.append(new_val.squeeze())
+                entropy_list.append(dist.entropy())
+
+            new_log_probs_t = torch.stack(new_log_probs_list)
+            new_values_t    = torch.stack(new_values_list)
+            entropy         = torch.stack(entropy_list).mean()
+
+            ratios      = torch.exp(new_log_probs_t - old_log_probs)
+            surr1       = ratios * advantages.detach()
+            surr2       = torch.clamp(ratios, 1 - clip_eps, 1 + clip_eps) * advantages.detach()
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss  = F.mse_loss(new_values_t, returns)
+            total_loss  = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=0.5).item()
+            self.optimizer.step()
+
+            last_metrics = {
+                'policy_loss': policy_loss.item(),
+                'value_loss':  value_loss.item(),
+                'entropy':     entropy.item(),
+                'grad_norm':   grad_norm,
+            }
+
+        return {
+            **last_metrics,
+            'adv_mean':    adv_mean,
+            'adv_std':     adv_std,
+            'value_mean':  values_t.mean().item(),
+            'return_mean': returns.mean().item(),
+        }
 
     def generate_actions_from_path(self, path, current_agent_dir):
         """Convert position path to action sequence based on current orientation."""
@@ -1069,10 +1090,13 @@ class HierarchicalTrainer:
                 # Detect traversal completion: traversal was active but will finish inside get_action
                 was_traversing = bool(self.worker.current_traversal_path)
 
+                # Capture direction before step so forward() and worker_states stay in sync
+                agent_dir = self.env.agent_dir
+
                 # Worker selects action
                 action, worker_log_prob, worker_value = self.worker.get_action(
                     state, wide_goal, narrow_goal,
-                    agent_dir=self.env.agent_dir
+                    agent_dir=agent_dir
                 )
 
                 if was_traversing and not self.worker.current_traversal_path and state == wide_goal:
@@ -1118,7 +1142,7 @@ class HierarchicalTrainer:
                 # Store Worker experience
                 # Only store if worker is NOT traversing
                 if not self.worker.current_traversal_path:
-                    worker_states.append((state, wide_goal, narrow_goal))
+                    worker_states.append((state, agent_dir, narrow_goal))
                     worker_actions.append(action)
                     worker_rewards.append(worker_reward)
                     worker_values.append(worker_value)

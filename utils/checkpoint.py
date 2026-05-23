@@ -49,7 +49,7 @@ def load_phase1_checkpoint(path):
     vae_system.load_state_dict(checkpoint['vae_state_dict'])
     vae_system.to(config['device'])
 
-    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=config['device'])
     policy.load_state_dict(checkpoint['policy_state_dict'])
 
     print(f"Phase 1 checkpoint loaded from '{path}'")

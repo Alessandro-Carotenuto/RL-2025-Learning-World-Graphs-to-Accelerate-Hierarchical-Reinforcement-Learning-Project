@@ -404,9 +404,9 @@ def test_phase1_with_diagnostics(config=None):
     env.phase = 1
     env.randomgen = True
     
-    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=config['device'])
     vae_system = VAESystem(
-        state_dim=16, 
+        state_dim=16,
         action_vocab_size=7, 
         mu0=config['vae_mu0'], 
         grid_size=env.size,
@@ -619,18 +619,15 @@ def compare_phase1_runs(runs_dict):
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 
-def run_worker_pretrain(env, worker, grid_state, config, device):
+def run_worker_pretrain(env, worker, grid_state, config, device, curriculum_config=None):
     """
-    Intermediate phase: pre-train Worker/GCP on short-range navigation.
-    No Manager, no balls.
-    Rewards: +1.0 on goal reached, -0.01 per step, -1.0 on timeout.
+    Curriculum pre-training of Worker/GCP on short-range navigation.
+    Curriculum is driven by worker_pretrain_curriculum_config (or the curriculum_config arg).
+    Within each r, max_steps compresses each time `repeat` consecutive eval windows all
+    exceed the threshold. Sequence is i_steps → i_steps-dropby → ... → f_steps (clamped).
     """
     import torch.nn.functional as F
     from torch.distributions import Categorical
-
-    episodes = config.get('worker_pretrain_episodes', 0)
-    max_steps = config.get('worker_pretrain_max_steps', 60)
-    r = config.get('neighborhood_size', 3)
 
     env.phase = 1
     env.randomgen = False
@@ -646,96 +643,260 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
     ]
     valid_set = set(valid_cells)
 
+    def _build_steps_seq(i_steps, dropby, f_steps):
+        steps, cur = [], i_steps
+        while True:
+            steps.append(cur)
+            if cur <= f_steps:
+                break
+            cur = max(cur - dropby, f_steps)
+        return steps
+
+    cc = curriculum_config if curriculum_config is not None else worker_pretrain_curriculum_config
+    default_cap = config.get('worker_pretrain_substage_cap', 5000)
+    curriculum = [
+        (
+            r,
+            cc.get(f'threshold_r{r}', thresh_def),
+            cc.get(f'repeat_r{r}', 1),
+            _build_steps_seq(
+                cc.get(f'i_steps_r{r}', i_def),
+                cc.get(f'dropby_r{r}',  drop_def),
+                cc.get(f'f_steps_r{r}', f_def),
+            ),
+            cc.get(f'substage_cap_r{r}', default_cap),
+        )
+        for r, thresh_def, i_def, drop_def, f_def in [
+            (1, 0.95, 25,  5,  10),
+            (2, 0.90, 80,  10, 30),
+            (3, 0.90, 200, 40, 40),
+        ]
+    ]
+    eval_window = 50
+
+    # No normalization on goal delta throughout pretrain: raw cells give a strong gradient
+    # signal and Tanh handles values up to 3 without saturation (tanh(0.4*3)≈0.74).
+    # The critical invariant is that the divisor stays CONSTANT across all r-stages so
+    # the network doesn't have to relearn what the same input value means.
+    worker.goal_norm_div = 1.0
+
     print(f"\n{'='*70}")
-    print(f"INTERMEDIATE PHASE: Worker/GCP Pre-training")
-    print(f"  {episodes} episodes | max {max_steps} steps | r={r} | {len(valid_cells)} valid cells")
+    print(f"INTERMEDIATE PHASE: Worker/GCP Curriculum Pre-training")
+    print(f"  {len(valid_cells)} valid cells | eval window: {eval_window} episodes")
+    for r, threshold, repeat, steps_seq, substage_cap in curriculum:
+        print(f"  r={r}: threshold={threshold*100:.0f}% x{repeat}, steps={steps_seq}, cap={substage_cap}")
     print(f"{'='*70}")
 
-    goal_reached_history = []
+    goal_reached_history  = []
     episode_reward_history = []
+    episode_length_history = []
+    training_metrics      = []
+    total_episode         = 0
 
-    for episode in range(episodes):
-        spawn = random.choice(valid_cells)
-        env.agent_start_pos = spawn
-        env.agent_start_dir = random.randint(0, 3)
-        env.reset()
-        state = tuple(env.agent_pos)
+    ppo_epochs = config.get('ppo_epochs', 4)
+    clip_eps   = config.get('ppo_clip_eps', 0.2)
+    gae_lambda = config.get('gae_lambda', 0.95)
 
-        candidates = [
-            (state[0] + dx, state[1] + dy)
-            for dx in range(-r, r)
-            for dy in range(-r, r)
-            if (dx != 0 or dy != 0) and (state[0] + dx, state[1] + dy) in valid_set
-        ]
-        if not candidates:
-            goal_reached_history.append(0.0)
-            episode_reward_history.append(0.0)
-            continue
+    for r, threshold, repeat, steps_seq, substage_cap in curriculum:
+        # Reset Adam momentum accumulated from previous r-stage distribution
+        worker.optimizer.state.clear()
+        print(f"\n  [r={r}] optimizer momentum reset | goal_norm_div={worker.goal_norm_div}")
+        base_entropy_coef = worker.entropy_coef
+        base_lr           = worker.optimizer.param_groups[0]['lr']
+        lr_ramp_ep        = 3 * eval_window   # 150 ep up → peak 1.5x, 150 ep down → base
+        r_stage_ep = 0  # tracks episodes within this r-stage for entropy/LR decay
 
-        narrow_goal = random.choice(candidates)
-        wide_goal = state  # agent already at wide goal → LSTM has context, no traversal triggered
+        for max_steps in steps_seq:
+            # Reset Adam momentum at every step-stage: when max_steps shrinks the return
+            # distribution shifts (smaller scale), so stale momentum corrupts advantage estimates
+            # and causes the value-loss spike / policy collapse pattern.
+            worker.optimizer.state.clear()
 
-        worker.reset_worker_state()
+            # Target ~30 transitions per PPO call to prevent critic overfitting on tiny batches.
+            # With max_steps=5 this batches 6 episodes; at max_steps=30 it's 1 (no change).
+            batch_eps = max(1, math.ceil(30 / max_steps))
+            print(f"\n  Stage r={r}, max_steps={max_steps} "
+                  f"(threshold={threshold*100:.0f}%, repeat={repeat}, "
+                  f"advance after {repeat*eval_window} eps, batch_eps={batch_eps})")
+            substage_ep        = 0
+            consecutive_passes = 0
+            next_check         = eval_window   # next substage_ep at which to evaluate
 
-        worker_states, worker_actions, worker_rewards, worker_values, worker_log_probs = [], [], [], [], []
-        goal_reached = False
+            # Batch accumulators — flushed every batch_eps episodes or on stage advance
+            batch_states_acc, batch_actions_acc, batch_rewards_acc = [], [], []
+            batch_values_acc, batch_log_probs_acc                  = [], []
+            batch_next_states_acc, batch_dones_acc                 = [], []
+            episodes_in_batch = 0
 
-        for step in range(max_steps):
-            # Direct GCP call — bypasses get_action to avoid traversal logic corrupting gradients
-            _, value = worker.forward(state, wide_goal, narrow_goal)
+            def _flush_batch():
+                nonlocal episodes_in_batch
+                nonlocal batch_states_acc, batch_actions_acc, batch_rewards_acc
+                nonlocal batch_values_acc, batch_log_probs_acc
+                nonlocal batch_next_states_acc, batch_dones_acc
+                if not batch_states_acc:
+                    return
+                metrics = worker.update_policy(
+                    batch_states_acc, batch_actions_acc, batch_rewards_acc,
+                    batch_values_acc, batch_log_probs_acc,
+                    next_states=batch_next_states_acc, dones=batch_dones_acc,
+                    ppo_epochs=ppo_epochs, clip_eps=clip_eps, gae_lambda=gae_lambda,
+                )
+                if metrics:
+                    n = len(batch_actions_acc)
+                    metrics['frac_left']    = batch_actions_acc.count(0) / n
+                    metrics['frac_right']   = batch_actions_acc.count(1) / n
+                    metrics['frac_forward'] = batch_actions_acc.count(2) / n
+                    training_metrics.append(metrics)
+                batch_states_acc, batch_actions_acc, batch_rewards_acc = [], [], []
+                batch_values_acc, batch_log_probs_acc                  = [], []
+                batch_next_states_acc, batch_dones_acc                 = [], []
+                episodes_in_batch = 0
 
-            state_t = torch.tensor(state, dtype=torch.float32, device=device)
-            gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=device)
-            gp_logits, _ = worker.goal_policy.forward(state_t, gn_t)
-            if gp_logits.dim() > 1:
-                gp_logits = gp_logits.squeeze(0)
-            masked = torch.full_like(gp_logits, float('-inf'))
-            masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]
-            probs = F.softmax(masked, dim=-1)
-            dist = Categorical(probs)
-            idx = dist.sample()
-            log_prob = dist.log_prob(idx)
-            action = idx.item()
+            while substage_ep < substage_cap:
+                spawn = random.choice(valid_cells)
+                env.agent_start_pos = spawn
+                env.agent_start_dir = random.randint(0, 3)
+                env.reset()
+                state = tuple(env.agent_pos)
 
-            try:
-                _, _, terminated, truncated, _ = env.step(action)
-                next_state = tuple(env.agent_pos)
-            except (AssertionError, IndexError):
-                next_state = state
-                terminated = False
-                truncated = False
+                # Manhattan ball of radius r
+                candidates = [
+                    (state[0] + dx, state[1] + dy)
+                    for dx in range(-r, r + 1)
+                    for dy in range(-r, r + 1)
+                    if 0 < abs(dx) + abs(dy) <= r
+                    and (state[0] + dx, state[1] + dy) in valid_set
+                ]
+                if not candidates:
+                    goal_reached_history.append(0.0)
+                    episode_reward_history.append(0.0)
+                    total_episode += 1
+                    substage_ep   += 1
+                    continue
 
-            reward = 1.0 if next_state == narrow_goal else -0.01
+                narrow_goal = random.choice(candidates)
+                worker.reset_worker_state()
 
-            worker_states.append((state, wide_goal, narrow_goal))
-            worker_actions.append(action)
-            worker_rewards.append(reward)
-            worker_values.append(value.squeeze())
-            worker_log_probs.append(log_prob)
+                worker_states, worker_actions, worker_rewards, worker_values, worker_log_probs = [], [], [], [], []
+                worker_next_states, worker_dones = [], []
+                goal_reached = False
 
-            state = next_state
-            if next_state == narrow_goal:
-                goal_reached = True
-                break
-            if terminated or truncated:
-                break
+                for step in range(max_steps):
+                    agent_dir = env.agent_dir
+                    action_logits, value = worker.forward(state, agent_dir, narrow_goal)
+                    probs = F.softmax(action_logits, dim=0)
+                    dist = Categorical(probs)
+                    idx = dist.sample()
+                    log_prob = dist.log_prob(idx)
+                    action = idx.item()
 
-        if not goal_reached and worker_rewards:
-            worker_rewards[-1] += -1.0  # timeout penalty on last step
+                    prev_dist = abs(state[0] - narrow_goal[0]) + abs(state[1] - narrow_goal[1])
 
-        goal_reached_history.append(float(goal_reached))
-        episode_reward_history.append(sum(worker_rewards) if worker_rewards else 0.0)
+                    try:
+                        _, _, terminated, truncated, _ = env.step(action)
+                        next_state    = tuple(env.agent_pos)
+                        next_agent_dir = env.agent_dir
+                    except (AssertionError, IndexError):
+                        next_state    = state
+                        next_agent_dir = agent_dir
+                        terminated    = False
+                        truncated     = False
 
-        if len(worker_rewards) > 0:
-            worker.update_policy(worker_states, worker_actions, worker_rewards, worker_values, worker_log_probs)
+                    curr_dist = abs(next_state[0] - narrow_goal[0]) + abs(next_state[1] - narrow_goal[1])
+                    done   = (next_state == narrow_goal) or terminated or truncated
+                    reward = 1.0 if next_state == narrow_goal else (prev_dist - curr_dist) * 0.1 - 0.01
 
-        if (episode + 1) % 50 == 0:
-            recent = goal_reached_history[-50:]
-            print(f"  Ep {episode+1:>5}/{episodes} | Achievement: {sum(recent)/len(recent)*100:.1f}%")
+                    worker_states.append((state, agent_dir, narrow_goal))
+                    worker_actions.append(action)
+                    worker_rewards.append(reward)
+                    worker_values.append(value.squeeze())
+                    worker_log_probs.append(log_prob)
+                    worker_next_states.append((next_state, next_agent_dir, narrow_goal))
+                    worker_dones.append(done)
+
+                    state = next_state
+                    if next_state == narrow_goal:
+                        goal_reached = True
+                        break
+                    if terminated or truncated:
+                        break
+
+                # Force done=True on timeout so GAE doesn't bootstrap across episode boundary
+                if worker_dones and not worker_dones[-1]:
+                    worker_dones[-1] = True
+
+                goal_reached_history.append(float(goal_reached))
+                episode_reward_history.append(sum(worker_rewards) if worker_rewards else 0.0)
+                episode_length_history.append(len(worker_rewards))
+                total_episode += 1
+                substage_ep   += 1
+
+                # Entropy annealing: base → base*0.3 linearly over the substage budget.
+                # Resets at every step-stage so each new difficulty level starts with
+                # full entropy, then converges progressively as the episode cap is used up.
+                t = substage_ep / max(substage_cap, 1)
+                worker.entropy_coef = base_entropy_coef * (1.0 - 0.7 * t)
+
+                # LR triangular warm-up: ramp 1x→1.5x over lr_ramp_ep, then 1.5x→1x
+                if r_stage_ep < lr_ramp_ep:
+                    lr_factor = 1.0 + 0.5 * (r_stage_ep / lr_ramp_ep)
+                elif r_stage_ep < 2 * lr_ramp_ep:
+                    lr_factor = 1.5 - 0.5 * ((r_stage_ep - lr_ramp_ep) / lr_ramp_ep)
+                else:
+                    lr_factor = 1.0
+                for pg in worker.optimizer.param_groups:
+                    pg['lr'] = base_lr * lr_factor
+
+                r_stage_ep += 1
+
+                # Accumulate episode into batch
+                if worker_rewards:
+                    batch_states_acc.extend(worker_states)
+                    batch_actions_acc.extend(worker_actions)
+                    batch_rewards_acc.extend(worker_rewards)
+                    batch_values_acc.extend(worker_values)
+                    batch_log_probs_acc.extend(worker_log_probs)
+                    batch_next_states_acc.extend(worker_next_states)
+                    batch_dones_acc.extend(worker_dones)
+                    episodes_in_batch += 1
+
+                if total_episode % 50 == 0:
+                    recent     = goal_reached_history[-eval_window:]
+                    recent_ach = sum(recent) / len(recent)
+                    m = training_metrics[-1] if training_metrics else {}
+                    print(f"    Ep {total_episode:>5} | Ach: {recent_ach*100:.1f}% "
+                          f"[{consecutive_passes}/{repeat}] | "
+                          f"PL: {m.get('policy_loss',0):.3f} | VL: {m.get('value_loss',0):.3f} | "
+                          f"Ent: {m.get('entropy',0):.3f} | GN: {m.get('grad_norm',0):.3f}")
+
+                # Check threshold every eval_window episodes; require `repeat` consecutive passes
+                should_advance = False
+                if substage_ep >= next_check:
+                    next_check += eval_window
+                    recent_ach  = sum(goal_reached_history[-eval_window:]) / eval_window
+                    if recent_ach >= threshold:
+                        consecutive_passes += 1
+                        print(f"    [+] window ach={recent_ach*100:.1f}% "
+                              f"consecutive={consecutive_passes}/{repeat}")
+                        if consecutive_passes >= repeat:
+                            should_advance = True
+                    else:
+                        consecutive_passes = 0
+
+                # Fire PPO update when batch is full or we are about to advance stage
+                if (episodes_in_batch >= batch_eps or should_advance) and batch_states_acc:
+                    _flush_batch()
+
+                if should_advance:
+                    print(f"    -> Threshold met {repeat}x. Advancing.")
+                    break
 
     final_ach = sum(goal_reached_history[-100:]) / min(100, len(goal_reached_history)) * 100
-    print(f"\nWorker Pre-training complete. Final achievement (last 100 ep): {final_ach:.1f}%")
-    plot_worker_pretrain_diagnostics(goal_reached_history, episode_reward_history)
+    avg_len = sum(episode_length_history) / len(episode_length_history) if episode_length_history else 0
+    print(f"\nWorker curriculum complete. Final achievement (last 100 ep): {final_ach:.1f}%")
+    print(f"Total episodes: {total_episode} | Avg episode length: {avg_len:.1f}")
+    plot_worker_pretrain_diagnostics(goal_reached_history, episode_reward_history,
+                                     episode_length_history, training_metrics)
     return goal_reached_history
 
 
@@ -862,13 +1023,16 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         pivotal_states,
         lr=config['worker_lr'],
         goal_policy=policy,
+        maze_size=config['maze_size'].value,
         device=config['device'],
     )
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
 
-    if config.get('worker_pretrain_episodes', 0) > 0:
-        run_worker_pretrain(env, worker, grid_state, config, config['device'])
+    if config.get('worker_pretrain_substage_cap', 0) > 0:
+        run_worker_pretrain(env, worker, grid_state, config, config['device'],
+                            curriculum_config=worker_pretrain_curriculum_config)
+    worker.goal_norm_div = 1.0  # keep consistent with pretrain (raw cell deltas, no normalization)
 
     if config.get('manager_wide_pretrain_episodes', 0) > 0:
         run_manager_wide_pretrain(env, manager, grid_state, config, config['device'])
@@ -1001,6 +1165,150 @@ def run_phase2_standalone(
     return metrics
 
 
+def run_worker_pretrain_standalone(
+        use_checkpoint=True,
+        checkpoint_path='phase1_checkpoint_MEDIUM.pt',
+        config_overrides=None,
+        save_path=None):
+    """
+    Train the Worker/GCP pre-training phase in isolation.
+
+    use_checkpoint=True : load maze layout + existing GCP from a Phase 1 checkpoint.
+    use_checkpoint=False: generate a fresh random maze (like Phase 1 env setup) and a
+                          fresh GCP — no Phase 1 training loop, no VAE, no graph.
+
+    No balls, no world graph, no Manager. Pure GCP navigation pre-training.
+
+    Args:
+        use_checkpoint: whether to load maze + GCP from checkpoint_path.
+        checkpoint_path: Phase 1 .pt file (ignored when use_checkpoint=False).
+        config_overrides: dict of keys to override in externalconfig.
+        save_path: if given, saves fine-tuned GCP state dict here.
+
+    Returns:
+        policy (GCP) after pre-training.
+    """
+    config = dict(externalconfig)
+    if config_overrides:
+        config.update(config_overrides)
+    resolve_device(config)
+    device = config['device']
+
+    if use_checkpoint:
+        _, _, policy, _, _, grid_state = load_phase1_checkpoint(checkpoint_path)
+        policy.to(device)
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.reset()
+        restore_maze_from_grid_state(env, grid_state)
+        env.reset()
+        print(f"Loaded maze from checkpoint: {checkpoint_path}")
+    else:
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.phase = 1
+        env.randomgen = True
+        env.reset()
+        grid_state = env.getGridState()
+        policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=device)
+        print(f"Fresh maze ({config['maze_size'].name}), fresh GCP.")
+
+    # No graph needed — run_worker_pretrain bypasses traversal entirely
+    worker = HierarchicalWorker(
+        world_graph=None,
+        pivotal_states=[],
+        lr=config['worker_lr'],
+        goal_policy=policy,
+        maze_size=config['maze_size'].value,
+        device=device,
+    )
+    worker.initialize_from_goal_policy(policy)
+
+    run_worker_pretrain(env, worker, grid_state, config, device)
+
+    if save_path:
+        torch.save({'goal_policy': policy.state_dict()}, save_path)
+        print(f"GCP weights saved to {save_path}")
+
+    return policy
+
+
+def run_manager_pretrain_standalone(
+        use_checkpoint=True,
+        checkpoint_path='phase1_checkpoint_MEDIUM.pt',
+        config_overrides=None,
+        save_path=None):
+    """
+    Train the Manager Wide pre-training phase in isolation.
+
+    use_checkpoint=True : load maze layout + pivotal states from a Phase 1 checkpoint.
+    use_checkpoint=False: generate a fresh random maze and sample random valid cells as
+                          placeholder pivotal states — useful for testing the loop logic
+                          without running Phase 1.
+
+    No Worker, no traversal, no GCP needed.
+
+    Args:
+        use_checkpoint: whether to load maze + pivotal states from checkpoint_path.
+        checkpoint_path: Phase 1 .pt file (ignored when use_checkpoint=False).
+        config_overrides: dict of keys to override in externalconfig.
+        save_path: if given, saves manager state dict here after training.
+
+    Returns:
+        manager after pre-training.
+    """
+    config = dict(externalconfig)
+    if config_overrides:
+        config.update(config_overrides)
+    resolve_device(config)
+    device = config['device']
+
+    if use_checkpoint:
+        pivotal_states, _, _, _, _, grid_state = load_phase1_checkpoint(checkpoint_path)
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.reset()
+        restore_maze_from_grid_state(env, grid_state)
+        env.reset()
+        print(f"Loaded maze + {len(pivotal_states)} pivotal states from: {checkpoint_path}")
+    else:
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.phase = 1
+        env.randomgen = True
+        env.reset()
+        grid_state = env.getGridState()
+        valid_cells = [
+            (x, y)
+            for x in range(1, env.width - 1)
+            for y in range(1, env.height - 1)
+            if env._is_traversable(env.grid.get(x, y))
+        ]
+        n = config.get('num_fake_pivotal_states', 30)
+        pivotal_states = random.sample(valid_cells, min(n, len(valid_cells)))
+        print(f"Fresh maze ({config['maze_size'].name}), {len(pivotal_states)} random pivotal states.")
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        action_verbose=False,
+        device=device,
+    )
+    manager.initialize_from_goal_policy(GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=device))
+
+    run_manager_wide_pretrain(env, manager, grid_state, config, device)
+
+    if save_path:
+        torch.save({'manager': manager.state_dict()}, save_path)
+        print(f"Manager weights saved to {save_path}")
+
+    return manager
+
+
 # ACTUAL TRAINING CODE ----------------------------------------------------
 steps=2000
 
@@ -1030,12 +1338,43 @@ externalconfig = {
         'graph_walk_length': 50,         # Phase 1: max steps per random walk for edge discovery
         'graph_num_attempts': 150,       # Phase 1: random walk attempts per pivotal state
         'convergence_threshold': 0.01,   # Phase 1: early-stop when avg loss change drops below this
-        'worker_pretrain_episodes': 500,         # Intermediate phase Worker: episodes (0 = skip)
-        'worker_pretrain_max_steps': 60,          # Intermediate phase Worker: max steps per episode
-        'manager_wide_pretrain_episodes': 300,    # Intermediate phase Manager Wide: episodes (0 = skip)
+        'worker_pretrain_substage_cap': 5000,      # Intermediate phase Worker: max episodes per sub-stage (0 = skip)
+        'worker_pretrain_max_steps': 10,           # Intermediate phase Worker: max steps per episode
+        'worker_pretrain_r': 1,                    # Neighborhood radius used only during worker pretrain (independent of neighborhood_size)
+        'manager_wide_pretrain_episodes': 600,    # Intermediate phase Manager Wide: episodes (0 = skip)
         'manager_wide_horizons_per_episode': 20,  # Intermediate phase Manager Wide: goal selections per episode
+        'ppo_epochs': 4,                          # PPO: update epochs per batch
+        'ppo_clip_eps': 0.2,                      # PPO: clipping epsilon
+        'gae_lambda': 0.95,                       # PPO/GAE: lambda for advantage estimation
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
+
+worker_pretrain_curriculum_config = {
+    # --- thresholds: rolling-window achievement rate required to advance ---
+    'threshold_r1': 0.95,   # r=1
+    'threshold_r2': 0.85,   # r=2
+    'threshold_r3': 0.85,   # r=3
+    # --- repeat: consecutive eval windows that must all be >= threshold ---
+    'repeat_r1': 3,
+    'repeat_r2': 2,
+    'repeat_r3': 2,
+    # --- initial max_steps per substage ---
+    'i_steps_r1': 30,
+    'i_steps_r2': 80,
+    'i_steps_r3': 200,
+    # --- drop: reduce max_steps by this amount each time threshold is met ---
+    'dropby_r1': 5,
+    'dropby_r2': 10,
+    'dropby_r3': 40,
+    # --- final (minimum) max_steps; sequence stops here ---
+    'f_steps_r1': 5,
+    'f_steps_r2': 10,
+    'f_steps_r3': 20,
+    # --- max episodes per sub-stage (safety cap, per r-stage) ---
+    'substage_cap_r1': 5000,
+    'substage_cap_r2': 3000,
+    'substage_cap_r3': 2000,
+}
 
 def train_full_phase1_phase2(
         config=externalconfig,
@@ -1059,7 +1398,7 @@ def train_full_phase1_phase2(
     env.phase = 1
     env.randomgen = True
     
-    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], device=config['device'])
+    policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=config['device'])
     vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=config['vae_mu0'], grid_size=env.size)
     buffer = StatBuffer()
     
@@ -1138,7 +1477,7 @@ def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations
     for mu0 in mu0_values:
         print(f"\n{'='*70}\nRunning Phase 1 with mu0={mu0}\n{'='*70}")
 
-        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
         vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=base_env.size, device=device)
         buffer = StatBuffer()
         base_env.phase = 1
@@ -1185,7 +1524,7 @@ def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
         env.reset()
         print_grid_image(env.getGridState(), name=f'map_{size.name}')
 
-        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], device=device)
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
         vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=env.size, device=device)
         buffer = StatBuffer()
 
@@ -1225,12 +1564,13 @@ def main():
         'device': externalconfig['device'],
     })
     """
-    train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
-    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)  # fixed_balls=False for random
+    #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
+    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
-    # run_phase1_comparison()
-    # run_phase1_size_comparison()
-    #render_phase2_episode_gif('phase1_checkpoint_SMALL.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=2000)
 
 if __name__ == "__main__":
     main()

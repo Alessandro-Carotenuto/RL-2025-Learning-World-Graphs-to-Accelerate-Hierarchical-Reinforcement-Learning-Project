@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,24 +18,18 @@ class GoalConditionedPolicy(nn.Module):
     GOAL-CONDITIONED POLICY FOR WORLD GRAPH DISCOVERY
     """
     
-    def __init__(self, lr: float = 5e-3, verbose: bool =False, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, lr: float = 5e-3, verbose: bool = False, maze_size: int = 24, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         super().__init__()
-        
+
         self.verbose = verbose
         self.device = device
+        self.maze_size = maze_size
         
-        # NETWORK COMPONENTS
-        # PREVIOUS SEQUENTIAL ARCHITECTURE (COMMENTED OUT)
-        # LSTM USED INSTEAD OF SEQUENTIAL
-        self.lstm = nn.LSTM(
-            input_size=4,
-            hidden_size=64,
-            num_layers=1,
-            batch_first=True
+        # NETWORK COMPONENTS (6 inputs: state_x, state_y, dir_sin, dir_cos, goal_dx, goal_dy)
+        self.net = nn.Sequential(
+            nn.Linear(6, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
         ).to(device)
-
-         # LSTM HIDDEN STATE
-        self.hidden_state = None
 
         self.actor = nn.Linear(64, 7).to(device)
         self.critic = nn.Linear(64, 1).to(device)
@@ -55,7 +50,6 @@ class GoalConditionedPolicy(nn.Module):
         TRAIN POLICY FOR ONE EPISODE (GOAL-CONDITIONED)
         """
         # SAMPLE GOAL AND RESET STATE
-        self.hidden_state = None
         goal_pos = sample_goal_position(env, start_pos, max_distance=20)
 
         # INITIALIZE EPISODE BUFFERS
@@ -73,16 +67,17 @@ class GoalConditionedPolicy(nn.Module):
         env.agent_pos = start_pos
         env.agent_dir = 0
         current_pos = start_pos
+        current_dir = env.agent_dir
         goal_reached = False
 
         episode_trajectory = []
         # RUN EPISODE
         for step in range(max_episode_length):
             # Get action from policy
-            action, log_prob, value = self.get_action(current_pos, goal_pos)
+            action, log_prob, value = self.get_action(current_pos, current_dir, goal_pos)
             episode_trajectory.append((current_pos, action))
             # STORE STATE-ACTION
-            states.append((current_pos, goal_pos))
+            states.append((current_pos, current_dir, goal_pos))
             actions.append(action)
             values.append(value)
             log_probs.append(log_prob)
@@ -128,20 +123,22 @@ class GoalConditionedPolicy(nn.Module):
                 break
 
             current_pos = next_pos
+            current_dir = env.agent_dir
 
         # UPDATE POLICY
         self.update_policy(states, actions, rewards, values, log_probs)
 
         return states, actions, rewards, goal_reached
         
-    def forward(self, state: torch.Tensor, goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, state: torch.Tensor, agent_dir: int, goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the policy network.
-        
+
         Args:
             state: Agent position [batch_size, 2] or [2]
+            agent_dir: Current facing direction (0-3)
             goal: Goal position [batch_size, 2] or [2]
-            
+
         Returns:
             action_logits: Raw action logits [batch_size, 7]
             value: State value [batch_size, 1]
@@ -151,31 +148,33 @@ class GoalConditionedPolicy(nn.Module):
             state = state.unsqueeze(0)
         if goal.dim() == 1:
             goal = goal.unsqueeze(0)
-            
-        # Combine state and goal
-        #combined = torch.cat([state, goal], dim=-1)  # [batch_size, 4]
-        
-        combined = torch.cat([state, goal], dim=-1).unsqueeze(1)  # [batch_size, 1, 4] for LSTM
-        
-        lstm_out, self.hidden_state = self.lstm(combined, self.hidden_state) 
-        # Process through network
-        #features = self.net(combined)               # [batch_size, 64]
-        features = lstm_out.squeeze(1)              # [batch_size, 64]
+
+        batch_size = state.shape[0]
+        # dir as (sin, cos) — circular encoding, adjacent dirs always distance √2 apart.
+        # Scalar dir/3 makes dir=3 (1.0) and dir=0 (0.0) appear maximally different even though
+        # they are 1 turn apart, causing gradient conflicts in learning turning behavior.
+        state_norm = state / self.maze_size
+        goal_rel   = (goal - state) / self.maze_size
+        dir_sin = torch.full((batch_size, 1), math.sin(agent_dir * math.pi / 2), dtype=torch.float32, device=self.device)
+        dir_cos = torch.full((batch_size, 1), math.cos(agent_dir * math.pi / 2), dtype=torch.float32, device=self.device)
+
+        combined = torch.cat([state_norm, dir_sin, dir_cos, goal_rel], dim=-1)  # [batch_size, 6]
+        features = self.net(combined)                        # [batch_size, 64]
         action_logits = self.actor(features)        # [batch_size, 7]
         value = self.critic(features)               # [batch_size, 1]
         
         return action_logits, value
     
-    def get_action(self, state: Tuple[int, int], goal: Tuple[int, int]) -> Tuple[int, torch.Tensor, torch.Tensor]:
+    def get_action(self, state: Tuple[int, int], agent_dir: int, goal: Tuple[int, int]) -> Tuple[int, torch.Tensor, torch.Tensor]:
         """
         Sample action from policy for a single state-goal pair.
         Now with action masking for navigation-only actions - FIXED tensor indexing.
         """
         state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
         goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device)
-        
+
         with torch.no_grad():
-            action_logits, value = self.forward(state_tensor, goal_tensor)
+            action_logits, value = self.forward(state_tensor, agent_dir, goal_tensor)
             
         # MASK NON-NAVIGATION ACTIONS
         # Allow only: turn_left (0), turn_right (1), move_forward (2)
@@ -232,10 +231,10 @@ class GoalConditionedPolicy(nn.Module):
         value_loss = F.mse_loss(values, returns)
 
         entropy_loss = 0
-        for (state, goal) in states:
+        for (state, agent_dir, goal) in states:
             state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
             goal_tensor = torch.tensor(goal, dtype=torch.float32, device=self.device)
-            action_logits, _ = self.forward(state_tensor, goal_tensor)
+            action_logits, _ = self.forward(state_tensor, agent_dir, goal_tensor)
             action_probs = F.softmax(action_logits, dim=-1)
             entropy_loss += -(action_probs * torch.log(action_probs + 1e-8)).sum()
         entropy_loss = entropy_loss / len(states)
@@ -432,7 +431,6 @@ class GoalConditionedPolicy(nn.Module):
             print(f"  Refining {start_state} -> {end_state}")
 
             try:
-                self.hidden_state = None
                 env.reset()
                 env.agent_pos = start_state
                 env.agent_dir = 0

@@ -150,8 +150,10 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 
 
 def plot_worker_pretrain_diagnostics(achievement_history, reward_history,
+                                     length_history=None,
+                                     training_metrics=None,
                                      save_path='pretrain_worker_diagnostics.png'):
-    """1×2: achievement rate (%) and avg episode reward over Worker pre-training."""
+    """3×3 grid of worker pre-training diagnostics."""
     if not achievement_history:
         return
 
@@ -161,17 +163,20 @@ def plot_worker_pretrain_diagnostics(achievement_history, reward_history,
         return np.convolve(data, np.ones(window) / window, mode='valid')
 
     n = len(achievement_history)
-    episodes = list(range(1, n + 1))
-    ma_w = 20
+    ep_x = list(range(1, n + 1))
+    ma_w = min(20, max(1, n // 10))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle('Intermediate Phase: Worker/GCP Pre-training', fontsize=14, fontweight='bold')
+    has_metrics = bool(training_metrics)
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle('Intermediate Phase: Worker Pre-training', fontsize=14, fontweight='bold')
+    axes = axes.flatten()
 
-    def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
-        ax.plot(episodes, data, color=color, linewidth=1.0, alpha=0.5, label=label)
-        ma = moving_average(data)
+    def plot_with_ma(ax, x, data, color, label, ylabel, title, ylim=None):
+        ax.plot(x, data, color=color, linewidth=0.8, alpha=0.4, label=label)
+        ma = moving_average(data, ma_w)
         if len(ma) > 0:
-            ax.plot(range(ma_w, ma_w + len(ma)), ma, 'k-', linewidth=2, label=f'MA({ma_w})')
+            ax.plot(range(x[0] + ma_w - 1, x[0] + ma_w - 1 + len(ma)),
+                    ma, 'k-', linewidth=2, label=f'MA({ma_w})')
         ax.set_title(title)
         ax.set_xlabel('Episode')
         ax.set_ylabel(ylabel)
@@ -180,13 +185,119 @@ def plot_worker_pretrain_diagnostics(achievement_history, reward_history,
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
-    plot_with_ma(axes[0], [x * 100 for x in achievement_history],
-                 'teal', 'Achievement', 'Success Rate (%)',
-                 'Goal Achievement Rate\n(↑ = GCP learning to navigate)', ylim=[0, 101])
+    # Row 1: episode-level stats
+    plot_with_ma(axes[0], ep_x, [x * 100 for x in achievement_history],
+                 'teal', 'Achievement', 'Success Rate (%)', 'Goal Achievement Rate', ylim=[0, 101])
+    plot_with_ma(axes[1], ep_x, reward_history,
+                 'steelblue', 'Reward', 'Episode Reward', 'Episode Reward')
+    if length_history:
+        plot_with_ma(axes[2], ep_x, length_history,
+                     'darkorange', 'Steps', 'Steps', 'Episode Length (↓ = faster)')
+    else:
+        axes[2].set_visible(False)
 
-    plot_with_ma(axes[1], reward_history,
-                 'steelblue', 'Reward', 'Episode Reward',
-                 'Avg Episode Reward\n(↑ = reaching goal faster, fewer timeouts)')
+    if has_metrics:
+        m_x = list(range(1, len(training_metrics) + 1))
+
+        # Row 2: A2C losses
+        plot_with_ma(axes[3], m_x,
+                     [m['policy_loss'] for m in training_metrics],
+                     'crimson', 'Policy Loss', 'Loss', 'Policy Loss')
+        plot_with_ma(axes[4], m_x,
+                     [m['value_loss'] for m in training_metrics],
+                     'purple', 'Value Loss', 'Loss', 'Value Loss (↓ = critic learning)')
+
+        # Entropy + grad norm twin axes
+        ax5 = axes[5]
+        ent = [m['entropy'] for m in training_metrics]
+        gn  = [m['grad_norm'] for m in training_metrics]
+        ax5.plot(m_x, ent, color='green', linewidth=0.8, alpha=0.4, label='Entropy')
+        ma_e = moving_average(ent, ma_w)
+        if len(ma_e) > 0:
+            ax5.plot(range(ma_w, ma_w + len(ma_e)), ma_e, 'g-', linewidth=2)
+        ax5.set_ylabel('Entropy', color='green')
+        ax5.tick_params(axis='y', labelcolor='green')
+        ax5_r = ax5.twinx()
+        ax5_r.plot(m_x, gn, color='gray', linewidth=0.8, alpha=0.4, label='Grad Norm')
+        ma_g = moving_average(gn, ma_w)
+        if len(ma_g) > 0:
+            ax5_r.plot(range(ma_w, ma_w + len(ma_g)), ma_g, color='gray', linewidth=2)
+        ax5_r.set_ylabel('Grad Norm', color='gray')
+        ax5.set_title('Entropy & Grad Norm')
+        ax5.set_xlabel('Episode')
+        ax5.grid(True, alpha=0.3)
+        lines1, lab1 = ax5.get_legend_handles_labels()
+        lines2, lab2 = ax5_r.get_legend_handles_labels()
+        ax5.legend(lines1 + lines2, lab1 + lab2, fontsize=8)
+
+        # Row 3: critic accuracy, advantage quality, action distribution
+        # Panel 6: Value Mean vs Return Mean (how well the critic tracks actual returns)
+        ax6 = axes[6]
+        vm = [m.get('value_mean', 0) for m in training_metrics]
+        rm = [m.get('return_mean', 0) for m in training_metrics]
+        ax6.plot(m_x, vm, color='blue', linewidth=0.8, alpha=0.4, label='Value (critic)')
+        ax6.plot(m_x, rm, color='orange', linewidth=0.8, alpha=0.4, label='Return (actual)')
+        ma_v = moving_average(vm, ma_w)
+        ma_r = moving_average(rm, ma_w)
+        if len(ma_v) > 0:
+            ax6.plot(range(ma_w, ma_w + len(ma_v)), ma_v, 'b-', linewidth=2)
+        if len(ma_r) > 0:
+            ax6.plot(range(ma_w, ma_w + len(ma_r)), ma_r, color='orange', linewidth=2)
+        ax6.set_title('Critic Accuracy (Value vs Return)')
+        ax6.set_xlabel('Episode')
+        ax6.set_ylabel('Value / Return')
+        ax6.grid(True, alpha=0.3)
+        ax6.legend(fontsize=8)
+
+        # Panel 7: Advantage mean ± std (signal quality — should be non-zero and stable)
+        ax7 = axes[7]
+        adv_m = [m.get('adv_mean', 0) for m in training_metrics]
+        adv_s = [m.get('adv_std', 0) for m in training_metrics]
+        ax7.plot(m_x, adv_m, color='darkgreen', linewidth=0.8, alpha=0.4, label='Adv Mean')
+        ma_am = moving_average(adv_m, ma_w)
+        if len(ma_am) > 0:
+            xr = list(range(ma_w, ma_w + len(ma_am)))
+            ma_as = moving_average(adv_s, ma_w)
+            ax7.plot(xr, ma_am, 'g-', linewidth=2)
+            if len(ma_as) == len(ma_am):
+                ax7.fill_between(xr,
+                                 np.array(ma_am) - np.array(ma_as),
+                                 np.array(ma_am) + np.array(ma_as),
+                                 color='green', alpha=0.15, label='±std')
+        ax7.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax7.set_title('Advantage Mean ± Std (signal quality)')
+        ax7.set_xlabel('Episode')
+        ax7.set_ylabel('Advantage')
+        ax7.grid(True, alpha=0.3)
+        ax7.legend(fontsize=8)
+
+        # Panel 8: Action distribution (which action dominates over time)
+        ax8 = axes[8]
+        if 'frac_left' in training_metrics[0]:
+            fl = [m['frac_left']    for m in training_metrics]
+            fr = [m['frac_right']   for m in training_metrics]
+            ff = [m['frac_forward'] for m in training_metrics]
+            ma_fl = moving_average(fl, ma_w)
+            ma_fr = moving_average(fr, ma_w)
+            ma_ff = moving_average(ff, ma_w)
+            xr = list(range(ma_w, ma_w + len(ma_fl))) if len(ma_fl) > 0 else []
+            ax8.plot(m_x, fl, color='royalblue',  linewidth=0.6, alpha=0.3)
+            ax8.plot(m_x, fr, color='tomato',     linewidth=0.6, alpha=0.3)
+            ax8.plot(m_x, ff, color='seagreen',   linewidth=0.6, alpha=0.3)
+            if xr:
+                ax8.plot(xr, ma_fl, 'b-',  linewidth=2, label='turn_left')
+                ax8.plot(xr, ma_fr, 'r-',  linewidth=2, label='turn_right')
+                ax8.plot(xr, ma_ff, 'g-',  linewidth=2, label='move_fwd')
+            ax8.axhline(1/3, color='gray', linewidth=1, linestyle='--', label='uniform (1/3)')
+            ax8.set_ylim([0, 1])
+        ax8.set_title('Action Distribution')
+        ax8.set_xlabel('Episode')
+        ax8.set_ylabel('Fraction')
+        ax8.grid(True, alpha=0.3)
+        ax8.legend(fontsize=8)
+    else:
+        for i in [3, 4, 5, 6, 7, 8]:
+            axes[i].set_visible(False)
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -324,6 +435,7 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
         pivotal_states,
         lr=config['worker_lr'],
         goal_policy=policy,
+        maze_size=config['maze_size'].value,
         device='cpu',
     )
     worker.load_state_dict(session['worker_state_dict'])
