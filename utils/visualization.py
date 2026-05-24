@@ -131,14 +131,24 @@ def plot_training_diagnostics(trainer, config, save_path=None):
                  'cyan', 'Value', 'Average Value',
                  'Manager Value Estimate\n(stabilises when critic converges)')
 
-    # 7. Worker Goal Achievement  (row 2, left — narrow goal reached rate)
+    # 7. Worker Goal Achievement  (row 2, left — narrow goal reached per horizon)
     plot_with_ma(axes[2, 0],
                  history['worker_goal_achievement'],
                  'teal', 'Achievement', 'Success Rate',
-                 'Worker Goal Achievement\n(narrow goal reached)',
+                 'Worker Goal Achievement\n(narrow goal reached / horizon)',
                  ylim=[0, 1])
 
-    axes[2, 1].set_visible(False)
+    # 8. Worker Local Goal Achievement  (MLP step-level — both FINDING and NARROW_GOAL)
+    local_data = history.get('worker_local_goal_achievement', [])
+    if local_data:
+        plot_with_ma(axes[2, 1],
+                     local_data,
+                     'darkorange', 'Local Achievement', 'Success Rate',
+                     'Worker Local Goal Achievement\n(MLP step: reached local target)',
+                     ylim=[0, 1])
+    else:
+        axes[2, 1].set_visible(False)
+
     axes[2, 2].set_visible(False)
 
     fig.tight_layout()

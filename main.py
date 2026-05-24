@@ -922,12 +922,10 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     r = config.get('neighborhood_size', 3)
 
     env.phase = 2
-    env.randomgen = False
     env.fixed_ball_positions = None  # random balls each episode
-    env.reset()
-    restore_maze_from_grid_state(env, grid_state)
-    env.reset()
 
+    # Compute valid cells from the Phase 1 grid (already restored by caller) and
+    # pick a valid agent_start_pos — default (1,1) may be a wall in the Phase 1 maze.
     valid_cells = [
         (x, y)
         for x in range(1, env.width - 1)
@@ -936,6 +934,15 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     ]
     valid_set = set(valid_cells)
     maze_diagonal = (env.width - 2) + (env.height - 2)
+    if valid_cells:
+        env.agent_start_pos = random.choice(valid_cells)
+
+    env.randomgen = False
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.randomgen = True   # allow ResetMultiGoals on subsequent resets
+    env.firstgen = False   # maze already set — don't regenerate
+    env.reset()
 
     print(f"\n{'='*70}")
     print(f"INTERMEDIATE PHASE: Manager Wide Goal Pre-training")
@@ -987,8 +994,10 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
 
             covered = [b for b in active_balls if b in neighborhood]
             if covered:
-                reward = 1.0
-                active_balls.discard(covered[0])
+                closest = min(covered, key=lambda b: manhattan_distance(wide_goal, b))
+                dist_to_closest = manhattan_distance(wide_goal, closest)
+                reward = 1.0 + 2.0 * (r - dist_to_closest) / r  # +3 at center, +1 at edge
+                active_balls.discard(closest)
             else:
                 dist = min(manhattan_distance(wide_goal, b) for b in active_balls)
                 reward = -dist / maze_diagonal
@@ -1008,6 +1017,12 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
         avg_reward_history.append(sum(m_rewards) / len(m_rewards) if m_rewards else 0.0)
 
         if m_rewards:
+            # Normalize rewards to reduce gradient variance from the reward gradient (+1..+3 vs -dist)
+            if len(m_rewards) > 1:
+                r_mean = sum(m_rewards) / len(m_rewards)
+                r_std = (sum((x - r_mean) ** 2 for x in m_rewards) / len(m_rewards)) ** 0.5
+                if r_std > 1e-8:
+                    m_rewards = [(x - r_mean) / r_std for x in m_rewards]
             manager.update_policy(
                 m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
                 step_count=episode, wide_only=True
@@ -1579,9 +1594,9 @@ def main():
     #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
     #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    run_phase2_standalone('phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
+    #run_phase2_standalone('phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
 
 if __name__ == "__main__":

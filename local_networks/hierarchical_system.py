@@ -454,9 +454,13 @@ class HierarchicalWorker(nn.Module):
         # FSM state — reset to FINDING on each new manager goal
         self._worker_state: WorkerState = WorkerState.FINDING
         self._traversal_starts_this_episode: int = 0
-        self._narrow_goal_steps: int = 0        # steps spent in current NARROW_GOAL window
-        self._narrow_goal_dist_ref: int = 0    # distance to narrow_goal at start of window
-        self.narrow_goal_timeout: int = 50     # window size for spinning detection
+        self._narrow_goal_steps: int = 0        # steps spent in NARROW_GOAL since entry / last slide
+        self._narrow_goal_dist_ref: int = 0    # distance to narrow_goal at last window start
+        self._narrow_goal_total_steps: int = 0 # total steps in current NARROW_GOAL stint
+        self.narrow_goal_timeout: int = 25     # no-progress window → back to FINDING
+        self.narrow_goal_hard_timeout: int = 60  # hard cap regardless of progress
+        self._spinning_recovery: bool = False  # blocks priority override after spinning detection
+        self._last_local_goal = None           # set each MLP step; None for traversal steps
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -479,6 +483,8 @@ class HierarchicalWorker(nn.Module):
         self._worker_state = WorkerState.FINDING
         self._narrow_goal_steps = 0
         self._narrow_goal_dist_ref = 0
+        self._narrow_goal_total_steps = 0
+        self._spinning_recovery = False
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -569,15 +575,18 @@ class HierarchicalWorker(nn.Module):
     
     def get_action(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int], agent_dir: int):
         """Worker selects action via 3-state FSM: FINDING → TRAVERSAL → NARROW_GOAL."""
+        self._last_local_goal = None  # cleared every step; only set for MLP steps
 
         # ── FSM TRANSITIONS ────────────────────────────────────────────────────
         # Priority override: if narrow_goal is within Manhattan r from here, go straight to it.
-        # Also clears any in-progress traversal so was_traversing stays consistent.
-        if manhattan_distance(state, narrow_goal) <= self.neighborhood_size:
+        # Blocked during spinning recovery — agent must route via graph first.
+        if (not self._spinning_recovery and
+                manhattan_distance(state, narrow_goal) <= self.neighborhood_size):
             if self._worker_state != WorkerState.NARROW_GOAL:
                 self.current_traversal_path = []
                 self.current_edge_actions = []
                 self._narrow_goal_steps = 0
+                self._narrow_goal_total_steps = 0
                 self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
             self._worker_state = WorkerState.NARROW_GOAL
 
@@ -587,6 +596,7 @@ class HierarchicalWorker(nn.Module):
                 path = self.plan_traversal(state, wide_goal)
                 if path:
                     self._worker_state = WorkerState.TRAVERSAL
+                    self._spinning_recovery = False  # now routing via graph, recovery done
                     self.current_traversal_path = path
                     self.traversal_step = 0
                     self._traversal_starts_this_episode += 1
@@ -622,6 +632,7 @@ class HierarchicalWorker(nn.Module):
                     self.reset_worker_state()               # clears path/edge buffers + sets FINDING
                     self._worker_state = WorkerState.NARROW_GOAL
                     self._narrow_goal_steps = 0
+                    self._narrow_goal_total_steps = 0
                     self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
 
             if self.current_edge_actions and self.current_action_idx < len(self.current_edge_actions):
@@ -638,12 +649,23 @@ class HierarchicalWorker(nn.Module):
         # ── MLP NAVIGATION (FINDING or NARROW_GOAL) ────────────────────────────
         if self._worker_state == WorkerState.NARROW_GOAL:
             self._narrow_goal_steps += 1
-            if self._narrow_goal_steps >= self.narrow_goal_timeout:
-                current_dist = manhattan_distance(state, narrow_goal)
+            self._narrow_goal_total_steps += 1
+            current_dist = manhattan_distance(state, narrow_goal)
+
+            # Hard cap: too long overall → give up regardless of progress
+            if self._narrow_goal_total_steps >= self.narrow_goal_hard_timeout:
+                if diag: print(f"  [WORKER] NARROW_GOAL hard timeout ({self._narrow_goal_total_steps} steps) →FINDING")
+                self._worker_state = WorkerState.FINDING
+                self._spinning_recovery = True
+                self._narrow_goal_steps = 0
+                self._narrow_goal_total_steps = 0
+
+            # No-progress window: no improvement in last N steps → spinning
+            elif self._narrow_goal_steps >= self.narrow_goal_timeout:
                 if current_dist >= self._narrow_goal_dist_ref:
-                    # No progress in the last window → spinning → back to FINDING
                     if diag: print(f"  [WORKER] NARROW_GOAL spinning (dist {current_dist} >= ref {self._narrow_goal_dist_ref}) →FINDING")
                     self._worker_state = WorkerState.FINDING
+                    self._spinning_recovery = True
                     self._narrow_goal_steps = 0
                 else:
                     # Made progress → slide the window forward
@@ -657,6 +679,8 @@ class HierarchicalWorker(nn.Module):
                           if candidates else narrow_goal)
         else:   # NARROW_GOAL
             local_goal = narrow_goal
+
+        self._last_local_goal = local_goal  # expose for diagnostics
 
         action_logits, value = self.forward(state, agent_dir, local_goal)
         probs = F.softmax(action_logits, dim=0)
@@ -962,6 +986,7 @@ class HierarchicalTrainer:
             'manager_goal_diversity': [],
             'manager_entropy': [],
             'worker_goal_achievement': [],
+            'worker_local_goal_achievement': [],
             'balls_collected_per_episode': [],
             'manager_rewards_mean': [],
             'manager_rewards_std': [],
@@ -1032,6 +1057,8 @@ class HierarchicalTrainer:
         worker_values_list = []
         worker_goal_reached_count = 0
         total_horizons = 0
+        local_goal_steps_total = 0
+        local_goal_steps_hit   = 0
         
         # Manager experience accumulation
         manager_states = []
@@ -1139,7 +1166,13 @@ class HierarchicalTrainer:
                     next_state = state
                     terminated = False
                     truncated = False
-                
+
+                # Local goal achievement tracking (MLP steps only)
+                if self.worker._last_local_goal is not None:
+                    local_goal_steps_total += 1
+                    if next_state == self.worker._last_local_goal:
+                        local_goal_steps_hit += 1
+
                 if diag2:
                     if env_reward != 0:
                         print(f"[REWARD] Step {episode_steps}: env_reward={env_reward:.3f}, "
@@ -1307,6 +1340,7 @@ class HierarchicalTrainer:
         # NEW: Compute episode-level diagnostics
         balls_collected = self.env.total_balls - len(self.env.active_balls)
         worker_success_rate = worker_goal_reached_count / total_horizons if total_horizons > 0 else 0
+        local_goal_rate = local_goal_steps_hit / local_goal_steps_total if local_goal_steps_total > 0 else 0
         
         # Distance from Manager goals to balls
         avg_distance_to_balls = None
@@ -1325,6 +1359,7 @@ class HierarchicalTrainer:
         self.diagnostic_history['manager_goal_diversity'].append(diversity_ratio)
         self.diagnostic_history['manager_entropy'].append(np.mean(manager_entropies))
         self.diagnostic_history['worker_goal_achievement'].append(worker_success_rate)
+        self.diagnostic_history['worker_local_goal_achievement'].append(local_goal_rate)
         self.diagnostic_history['balls_collected_per_episode'].append(balls_collected)
         # Store diagnostics
         self.diagnostic_history['manager_rewards_mean'].append(
@@ -1363,6 +1398,7 @@ class HierarchicalTrainer:
                 print(f"  Avg distance to balls: {avg_distance_to_balls:.1f}")
             print(f"\nWorker Diagnostics:")
             print(f"  Goal achievement rate: {worker_success_rate*100:.1f}%")
+            print(f"  Local goal achievement rate: {local_goal_rate*100:.1f}%  ({local_goal_steps_hit}/{local_goal_steps_total} MLP steps)")
             print(f"  Avg value estimate: {np.mean(worker_values_list):.3f}")
             print(f"  Graph traversals initiated: {self.worker._traversal_starts_this_episode}")
             print(f"\nTraining Stats:")
