@@ -2,6 +2,7 @@ import random
 import math
 import time
 import torch
+import torch.nn.functional as F
 
 # minigrid imports
 from minigrid.core.world_object import Wall
@@ -287,10 +288,17 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph):
     env.phase = 2
     obs = env.reset()
     start_pos = tuple(env.agent_pos)
-    
+    valid_cells_diag = {
+        (x, y)
+        for x in range(env.width)
+        for y in range(env.height)
+        if env._is_traversable(env.grid.get(x, y))
+    }
+    worker.valid_cells = valid_cells_diag
+
     print(f"\nAgent starts at: {start_pos}")
     print(f"Balls at: {list(env.active_balls)[:5]}")
-    
+
     manager.reset_manager_state()
     worker.reset_worker_state()
     
@@ -303,7 +311,7 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph):
         print(f"Start position: {current_pos}")
         
         # Manager selects goals
-        wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(current_pos)
+        wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(current_pos, valid_cells=valid_cells_diag)
         print(f"Manager goals: wide={wide_goal}, narrow={narrow_goal}")
         
         # Check if wide goal is reachable
@@ -619,10 +627,11 @@ def compare_phase1_runs(runs_dict):
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 
-def run_worker_pretrain(env, worker, grid_state, config, device, curriculum_config=None):
+def run_worker_pretrain(env, worker, grid_state, config, device):
     """
     Curriculum pre-training of Worker/GCP on short-range navigation.
-    Curriculum is driven by worker_pretrain_curriculum_config (or the curriculum_config arg).
+    Curriculum keys (threshold_rN, repeat_rN, i/f/dropby_rN, substage_cap_rN)
+    are read directly from config.
     Within each r, max_steps compresses each time `repeat` consecutive eval windows all
     exceed the threshold. Sequence is i_steps → i_steps-dropby → ... → f_steps (clamped).
     """
@@ -642,6 +651,7 @@ def run_worker_pretrain(env, worker, grid_state, config, device, curriculum_conf
         if env._is_traversable(env.grid.get(x, y))
     ]
     valid_set = set(valid_cells)
+    worker.valid_cells = valid_set
 
     def _build_steps_seq(i_steps, dropby, f_steps):
         steps, cur = [], i_steps
@@ -652,8 +662,8 @@ def run_worker_pretrain(env, worker, grid_state, config, device, curriculum_conf
             cur = max(cur - dropby, f_steps)
         return steps
 
-    cc = curriculum_config if curriculum_config is not None else worker_pretrain_curriculum_config
-    default_cap = config.get('worker_pretrain_substage_cap', 5000)
+    cc = config
+    default_cap = 5000
     curriculum = [
         (
             r,
@@ -954,17 +964,25 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
             if not active_balls:
                 break
 
-            wide_goal, narrow_goal, log_prob, value, entropy = manager.get_manager_action(
-                state, step_count=episode * horizons_per_ep + h,
-                valid_cells=valid_set, active_balls=list(active_balls)
-            )
+            # Wide-only: forward + sample wide head, skip narrow selection entirely
+            wide_logits, _, value = manager.forward(state, list(active_balls))
+            wide_probs = F.softmax(wide_logits, dim=0)
+            wide_dist = torch.distributions.Categorical(wide_probs)
+            wide_idx = wide_dist.sample()
+            log_prob = wide_dist.log_prob(wide_idx)
+            entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum().detach()
+            wide_goal = manager.pivotal_states[wide_idx.item()]
+            manager.prev_wide_goal = wide_goal
+            narrow_goal = wide_goal  # dummy, unused in reward
+            value = value.squeeze()
             if manager.hidden_state is not None:
                 manager.hidden_state = tuple(hs.detach() for hs in manager.hidden_state)
 
             neighborhood = {
                 (wide_goal[0] + dx, wide_goal[1] + dy)
-                for dx in range(-r, r)
-                for dy in range(-r, r)
+                for dx in range(-r, r + 1)
+                for dy in range(-r, r + 1)
+                if 0 < abs(dx) + abs(dy) <= r
             }
 
             covered = [b for b in active_balls if b in neighborhood]
@@ -992,7 +1010,7 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
         if m_rewards:
             manager.update_policy(
                 m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
-                step_count=episode
+                step_count=episode, wide_only=True
             )
 
         if (episode + 1) % 50 == 0:
@@ -1024,28 +1042,28 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         lr=config['worker_lr'],
         goal_policy=policy,
         maze_size=config['maze_size'].value,
+        neighborhood_size=config['neighborhood_size'],
         device=config['device'],
     )
     manager.initialize_from_goal_policy(policy)
     worker.initialize_from_goal_policy(policy)
 
-    if config.get('worker_pretrain_substage_cap', 0) > 0:
-        run_worker_pretrain(env, worker, grid_state, config, config['device'],
-                            curriculum_config=worker_pretrain_curriculum_config)
+    run_worker_pretrain(env, worker, grid_state, config, config['device'])
     worker.goal_norm_div = 1.0  # keep consistent with pretrain (raw cell deltas, no normalization)
 
     if config.get('manager_wide_pretrain_episodes', 0) > 0:
         run_manager_wide_pretrain(env, manager, grid_state, config, config['device'])
 
-    # Pre-training phases modify env.agent_start_pos to random cells — restore correct Phase 2 spawn
+    # Pre-training phases modify env state — restore correct Phase 2 configuration
     env.agent_start_pos = agent_start
     env.agent_start_dir = 0
     env.phase = 2
+    env.fixed_ball_positions = first_balls   # manager pretrain cleared this; restore it
+    env.randomgen = True  # pretrain sets this to False; restore so env.reset() calls ResetMultiGoals
 
     print("\nDiagnosing Worker behavior BEFORE training:")
     diagnose_worker_behavior_single_episode(env, manager, worker, world_graph)
 
-    env.phase = 2
     trainer = HierarchicalTrainer(
         manager, worker, env,
         horizon=config['manager_horizon'],
@@ -1140,11 +1158,14 @@ def run_phase2_standalone(
     print(f"Valid start found after {attempt} attempt(s): {agent_start} ({len(reachables)} reachable cells)")
 
     env.firstgen = False
+    env.phase = 2
 
-    reachable = world_graph.get_reachable_nodes(agent_start)
-    print(f"Graph reachability from {agent_start}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
+    # Reachability diagnostic: check from nearest pivotal state to agent_start
+    nearest_pivotal = min(pivotal_states, key=lambda p: manhattan_distance(p, agent_start))
+    reachable = world_graph.get_reachable_nodes(nearest_pivotal)
+    print(f"Graph reachability from nearest pivotal {nearest_pivotal}: {len(reachable)}/{len(world_graph.nodes)} nodes reachable")
     unreachable = [n for n in pivotal_states if n not in reachable]
-    print(f"  Unreachable from start: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
+    print(f"  Unreachable: {unreachable[:10]}{'...' if len(unreachable) > 10 else ''}")
 
     if fixed_balls:
         first_balls = env.ResetMultiGoals(agent_start, goals=config.get('num_balls', 5))
@@ -1220,6 +1241,7 @@ def run_worker_pretrain_standalone(
         lr=config['worker_lr'],
         goal_policy=policy,
         maze_size=config['maze_size'].value,
+        neighborhood_size=config.get('neighborhood_size', 3),
         device=device,
     )
     worker.initialize_from_goal_policy(policy)
@@ -1310,70 +1332,60 @@ def run_manager_pretrain_standalone(
 
 
 # ACTUAL TRAINING CODE ----------------------------------------------------
-steps=2000
+max_steps = 2000
 
 externalconfig = {
-        'maze_size': EnvSizes.MEDIUM,
-        'phase1_iterations': 3,
-        'phase2_episodes': 50,
-        'num_balls': 5,
-        'max_steps_per_episode': steps,
-        'manager_horizon': steps//250,
-        'neighborhood_size': math.ceil(24/8),
-        'manager_lr': 5e-4,
-        'worker_lr': 1e-4,
-        'goal_policy_lr': 5e-3,
-        'vae_mu0': 9.0,
-        'diagnostic_interval': 10000,
-        'diagnostic_checkstart': False,
-        'full_breakdown_every': 10,
-        'goal_timeout': 15,             # max horizons before forcing a new Manager goal (horizon*timeout = max steps per goal)
-        'traversal_shaping_weight': 2.0, # reward manager when traversal completes at wide_goal, scaled by dist(wide_goal, nearest_ball)
-        'pivotal_spread_alpha': 0.02,   # Phase 1: spread incentive for pivotal state selection (0=off, ~0.05=strong)
-        'explore_top_fraction': 0.20,   # Phase 1: top % of pivotal states (by dist from spawn) used for trajectory collection
-        'diversity_walk_number': 30,    # Phase 1: biased random walks per iteration
-        'walk_length': 400,             # Phase 1: steps per diversity walk
-        'walk_bias': 0.70,              # Phase 1: probability of stepping away from spawn
-        'walk_episodes': 10,             # Phase 1: episodes collected per walk destination
-        'graph_walk_length': 50,         # Phase 1: max steps per random walk for edge discovery
-        'graph_num_attempts': 150,       # Phase 1: random walk attempts per pivotal state
-        'convergence_threshold': 0.01,   # Phase 1: early-stop when avg loss change drops below this
-        'worker_pretrain_substage_cap': 5000,      # Intermediate phase Worker: max episodes per sub-stage (0 = skip)
-        'worker_pretrain_max_steps': 10,           # Intermediate phase Worker: max steps per episode
-        'worker_pretrain_r': 1,                    # Neighborhood radius used only during worker pretrain (independent of neighborhood_size)
-        'manager_wide_pretrain_episodes': 600,    # Intermediate phase Manager Wide: episodes (0 = skip)
-        'manager_wide_horizons_per_episode': 20,  # Intermediate phase Manager Wide: goal selections per episode
-        'ppo_epochs': 4,                          # PPO: update epochs per batch
-        'ppo_clip_eps': 0.2,                      # PPO: clipping epsilon
-        'gae_lambda': 0.95,                       # PPO/GAE: lambda for advantage estimation
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
-    }
+    # --- env ---
+    'maze_size':             EnvSizes.SMALL,
+    'num_balls':             5,
+    'max_steps_per_episode': max_steps,
+    'device':                'cuda' if torch.cuda.is_available() else 'cpu',
 
-worker_pretrain_curriculum_config = {
-    # --- thresholds: rolling-window achievement rate required to advance ---
-    'threshold_r1': 0.95,   # r=1
-    'threshold_r2': 0.85,   # r=2
-    'threshold_r3': 0.85,   # r=3
-    # --- repeat: consecutive eval windows that must all be >= threshold ---
-    'repeat_r1': 3,
-    'repeat_r2': 2,
-    'repeat_r3': 2,
-    # --- initial max_steps per substage ---
-    'i_steps_r1': 30,
-    'i_steps_r2': 80,
-    'i_steps_r3': 200,
-    # --- drop: reduce max_steps by this amount each time threshold is met ---
-    'dropby_r1': 5,
-    'dropby_r2': 10,
-    'dropby_r3': 40,
-    # --- final (minimum) max_steps; sequence stops here ---
-    'f_steps_r1': 5,
-    'f_steps_r2': 10,
-    'f_steps_r3': 20,
-    # --- max episodes per sub-stage (safety cap, per r-stage) ---
-    'substage_cap_r1': 5000,
-    'substage_cap_r2': 3000,
-    'substage_cap_r3': 2000,
+    # --- phase 1 ---
+    'phase1_iterations':     3,
+    'goal_policy_lr':        5e-3,
+    'vae_mu0':               9.0,
+    'pivotal_spread_alpha':  0.02,
+    'explore_top_fraction':  0.20,
+    'diversity_walk_number': 30,
+    'walk_length':           400,
+    'walk_bias':             0.70,
+    'walk_episodes':         10,
+    'graph_walk_length':     50,
+    'graph_num_attempts':    150,
+    'convergence_threshold': 0.01,
+
+    # --- phase 2 ---
+    'phase2_episodes':          50,
+    'manager_horizon':          10,
+    'neighborhood_size':        math.ceil(EnvSizes.SMALL.value / 8),
+    'manager_lr':               5e-4,
+    'worker_lr':                1e-4,
+    'goal_timeout':             200,  # max steps on a goal before forcing replanning
+    'traversal_shaping_weight': 2.0,
+    'narrow_goal_timeout':      50,   # steps in NARROW_GOAL without progress → back to FINDING
+
+    # --- manager pretrain ---
+    'manager_wide_pretrain_episodes':    10000,  # 0 = skip
+    'manager_wide_horizons_per_episode': 20,
+
+    # --- PPO ---
+    'ppo_epochs':   4,
+    'ppo_clip_eps': 0.2,
+    'gae_lambda':   0.95,
+
+    # --- diagnostics ---
+    'diagnostic_interval':   100000,
+    'diagnostic_checkstart': False,
+    'full_breakdown_every':  10,
+
+    # --- worker pretrain curriculum ---
+    'threshold_r1': 0.95,  'threshold_r2': 0.85,  'threshold_r3': 0.85,
+    'repeat_r1':    3,      'repeat_r2':    2,      'repeat_r3':    2,
+    'i_steps_r1':   30,     'i_steps_r2':   80,     'i_steps_r3':   200,
+    'dropby_r1':    5,      'dropby_r2':    20,     'dropby_r3':    40,
+    'f_steps_r1':   5,      'f_steps_r2':   10,     'f_steps_r3':   20,
+    'substage_cap_r1': 5000, 'substage_cap_r2': 1000, 'substage_cap_r3': 1000,
 }
 
 def train_full_phase1_phase2(
@@ -1566,10 +1578,10 @@ def main():
     """
     #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
-    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
+    run_phase2_standalone('phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
 
 if __name__ == "__main__":

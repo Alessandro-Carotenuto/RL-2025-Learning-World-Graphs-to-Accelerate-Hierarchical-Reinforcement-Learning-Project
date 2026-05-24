@@ -308,7 +308,7 @@ class GoalConditionedPolicy(nn.Module):
                 
                 # Store episode data in format compatible with StatBuffer
                 episode_data = {
-                    'states': [state for state, goal in states],  # Extract just positions
+                    'states': [state for state, agent_dir, goal in states],  # Extract just positions
                     'actions': actions,
                     'rewards': rewards,
                     'goal_reached': goal_reached,
@@ -440,7 +440,7 @@ class GoalConditionedPolicy(nn.Module):
                 max_refinement_steps = len(raw_path) * 5 + 20
                 
                 for step in range(max_refinement_steps):
-                    action, log_prob, value = self.get_action(current_pos, end_state)
+                    action, log_prob, value = self.get_action(current_pos, env.agent_dir, end_state)
                     obs, reward, terminated, truncated, info = env.step(action)
                     
                     if hasattr(env, 'agent_pos') and env.agent_pos is not None:

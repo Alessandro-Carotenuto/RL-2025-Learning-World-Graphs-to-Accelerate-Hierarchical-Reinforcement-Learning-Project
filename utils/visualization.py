@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 from utils.graph_manager import GraphManager, GraphVisualizer
 from utils.checkpoint import load_phase1_checkpoint, restore_maze_from_grid_state
 from wrappers.minigrid_wrapper import MinigridWrapper, EnvModes
-from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker
+from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, WorkerState
 
 
 def print_grid_image(grid_text, name=''):
@@ -436,6 +436,7 @@ def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp
         lr=config['worker_lr'],
         goal_policy=policy,
         maze_size=config['maze_size'].value,
+        neighborhood_size=config.get('neighborhood_size', 3),
         device='cpu',
     )
     worker.load_state_dict(session['worker_state_dict'])
@@ -474,6 +475,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     }
     manager.reset_manager_state()
     worker.reset_worker_state()
+    worker.valid_cells = valid_cells
 
     overlay_enabled = world_graph is not None and pivotal_states is not None
     if overlay_enabled:
@@ -481,7 +483,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     else:
         print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
 
-    def apply_overlay(frame, wg, ng, traversal_path=None, active_balls=None, agent_state=None):
+    def apply_overlay(frame, wg, ng, traversal_path=None, active_balls=None, agent_state=None, local_goal=None):
         tile_size = frame.shape[1] // env.width
 
         def px(coord):
@@ -513,13 +515,20 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
         if wg is not None:
             cx, cy = px(wg)
             draw.ellipse([(cx - r * 2, cy - r * 2), (cx + r * 2, cy + r * 2)],
-                         fill=(0, 220, 80, 128))
+                         fill=(0, 220, 80, 178))  # 70% opacity
         if ng is not None:
             nx, ny = ng
             draw.rectangle(
                 [(nx * tile_size, ny * tile_size),
                  ((nx + 1) * tile_size - 1, (ny + 1) * tile_size - 1)],
                 fill=(0, 200, 255, 51)
+            )
+        if local_goal is not None:
+            lx, ly = local_goal
+            draw.rectangle(
+                [(lx * tile_size, ly * tile_size),
+                 ((lx + 1) * tile_size - 1, (ly + 1) * tile_size - 1)],
+                fill=(255, 200, 50, 120)  # yellow, FINDING local goal
             )
 
         if agent_state is not None and active_balls:
@@ -563,11 +572,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     or horizons_on_goal >= goal_timeout
                 )
                 if need_new_goal:
-                    # Flush traversal state, keep worker LSTM context
-                    worker.current_traversal_path = []
-                    worker.traversal_step = 0
-                    worker.current_edge_actions = None
-                    worker.current_action_idx = 0
+                    worker.reset_worker_state()
                     wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
                         state, step_count=999999, valid_cells=valid_cells,
                         active_balls=list(env.active_balls)
@@ -594,11 +599,20 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 goal_reached_this_horizon = True
                 horizon_step = horizon - 1  # force horizon end at next increment
 
+            # FINDING local goal: nearest pivotal state (excluding current pos)
+            if worker._worker_state == WorkerState.FINDING and worker.pivotal_states:
+                candidates = [p for p in worker.pivotal_states if p != state]
+                local_goal_vis = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
+                                  if candidates else None)
+            else:
+                local_goal_vis = None
+
             frame = env.render()
             if overlay_enabled:
                 frame = apply_overlay(frame, wide_goal, narrow_goal,
                                       traversal_path=worker.current_traversal_path or None,
-                                      active_balls=list(env.active_balls), agent_state=state)
+                                      active_balls=list(env.active_balls), agent_state=state,
+                                      local_goal=local_goal_vis)
             frames.append(frame)
             done = terminated or truncated
             step += 1

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from enum import Enum
 from typing import List, Tuple, Optional
 import numpy as np
 
@@ -76,7 +77,7 @@ class HierarchicalManager(nn.Module):
         self.hidden_state = None
         self.prev_wide_goal = (0, 0)
     
-    def get_neighborhood(self, wide_goal: Tuple[int, int]) -> List[Tuple[int, int]]:
+    def get_neighborhood(self, wide_goal: Tuple[int, int], valid_cells=None) -> List[Tuple[int, int]]:
         # Manhattan ball of radius r: all (dx,dy) with 0 < |dx|+|dy| <= r → 2r(r+1) cells
         gw_x, gw_y = wide_goal
         r = self.neighborhood_size
@@ -84,7 +85,9 @@ class HierarchicalManager(nn.Module):
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
                 if 0 < abs(dx) + abs(dy) <= r:
-                    neighborhood.append((gw_x + dx, gw_y + dy))
+                    cell = (gw_x + dx, gw_y + dy)
+                    if valid_cells is None or cell in valid_cells:
+                        neighborhood.append(cell)
         return neighborhood
     
     def forward(self, state: Tuple[int, int], active_balls=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -140,7 +143,7 @@ class HierarchicalManager(nn.Module):
         narrow_input = torch.cat([features, wide_goal_tensor])
         narrow_logits = self.narrow_head(narrow_input)
 
-        neighborhood = self.get_neighborhood(wide_goal)
+        neighborhood = self.get_neighborhood(wide_goal, valid_cells=valid_cells)
 
         if valid_cells is not None:
             valid_indices = [i for i, cell in enumerate(neighborhood) if cell in valid_cells]
@@ -263,7 +266,7 @@ class HierarchicalManager(nn.Module):
         print("Manager initialized from goal policy LSTM")
 
 
-    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None):
+    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None, wide_only=False):
         """Update Manager policy with wide + narrow entropy regularization."""
         if len(rewards) == 0:
             return
@@ -336,28 +339,29 @@ class HierarchicalManager(nn.Module):
             print(f"  Advantages (normalized): {advantages[:3].tolist()}")
             print(f"  Policy loss: {policy_loss.item():.4f}")
         
-        # Compute narrow entropy — save/restore hidden state so the loop
-        # does not corrupt the recurrent state used outside this update
-        saved_hidden = tuple(h.detach().clone() for h in self.hidden_state) if self.hidden_state else None
-        narrow_entropies = []
-        balls_iter = balls_snapshots if balls_snapshots is not None else [None] * len(states)
-        for state_i, wide_goal_i, balls_i in zip(states, wide_goals, balls_iter):
-            _, features_i, _ = self.forward(state_i, balls_i)
-            wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
-            narrow_input = torch.cat([features_i, wide_goal_tensor])
-            narrow_logits = self.narrow_head(narrow_input)
-            if self._valid_cells is not None:
-                neighborhood_i = self.get_neighborhood(wide_goal_i)
-                valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
-                if valid_idx:
-                    idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
-                    narrow_logits = narrow_logits[idx_t]
-            narrow_probs = F.softmax(narrow_logits, dim=0)
-            narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
-            narrow_entropies.append(narrow_entropy)
-        self.hidden_state = saved_hidden
-        
-        narrow_entropy_mean = torch.stack(narrow_entropies).mean()
+        # Compute narrow entropy — skipped in wide_only mode (e.g. manager wide pretrain)
+        if not wide_only:
+            saved_hidden = tuple(h.detach().clone() for h in self.hidden_state) if self.hidden_state else None
+            narrow_entropies = []
+            balls_iter = balls_snapshots if balls_snapshots is not None else [None] * len(states)
+            for state_i, wide_goal_i, balls_i in zip(states, wide_goals, balls_iter):
+                _, features_i, _ = self.forward(state_i, balls_i)
+                wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
+                narrow_input = torch.cat([features_i, wide_goal_tensor])
+                narrow_logits = self.narrow_head(narrow_input)
+                if self._valid_cells is not None:
+                    neighborhood_i = self.get_neighborhood(wide_goal_i, valid_cells=self._valid_cells)
+                    valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
+                    if valid_idx:
+                        idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
+                        narrow_logits = narrow_logits[idx_t]
+                narrow_probs = F.softmax(narrow_logits, dim=0)
+                narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
+                narrow_entropies.append(narrow_entropy)
+            self.hidden_state = saved_hidden
+            narrow_entropy_mean = torch.stack(narrow_entropies).mean()
+        else:
+            narrow_entropy_mean = torch.tensor(0.0, device=self.device)
         wide_entropy_mean = wide_entropies_tensor.mean()
         
         if verbose:
@@ -385,6 +389,13 @@ class HierarchicalManager(nn.Module):
         if verbose:
             print(f"{'='*70}\n")
 
+
+class WorkerState(Enum):
+    FINDING   = 1  # Navigating toward nearest pivotal state
+    TRAVERSAL = 2  # Executing deterministic graph traversal to wide_goal
+    NARROW_GOAL = 3  # MLP navigating from wide_goal to narrow_goal
+
+
 class HierarchicalWorker(nn.Module):
     """
     Phase 2: Hierarchical Worker that executes Manager's goals.
@@ -398,6 +409,7 @@ class HierarchicalWorker(nn.Module):
                  verbose: bool = False,
                  goal_policy=None,
                  maze_size: int = 24,
+                 neighborhood_size: int = 3,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -411,6 +423,7 @@ class HierarchicalWorker(nn.Module):
 
         self.device = device
         self.maze_size = maze_size
+        self.neighborhood_size = neighborhood_size
         self.world_graph = world_graph
         self.pivotal_states = set(pivotal_states)
 
@@ -420,37 +433,35 @@ class HierarchicalWorker(nn.Module):
         # double-counting in the optimizer and polluting worker.state_dict().
         object.__setattr__(self, 'goal_policy', goal_policy)
 
-        # A2C-MLP architecture (6 inputs: state_x, state_y, dir_sin, dir_cos, goal_dx, goal_dy)
+        # A2C-MLP architecture (9 inputs: state_x, state_y, dir_sin, dir_cos, goal_dx, goal_dy,
+        #                                   wall_fwd, wall_left, wall_right)
         self.net = nn.Sequential(
-            nn.Linear(6, 64), nn.Tanh(),
+            nn.Linear(9, 64), nn.Tanh(),
             nn.Linear(64, 64), nn.Tanh(),
         ).to(device)
 
         self.actor = nn.Linear(64, 3).to(device)
         self.critic = nn.Linear(64, 1).to(device)
-        
-        if self.goal_policy is not None:
-            # Fine-tune GCP at 1/10 the worker LR to preserve Phase 1 knowledge
-            self.optimizer = optim.Adam([
-                {'params': self.parameters(), 'lr': lr},
-                {'params': self.goal_policy.parameters(), 'lr': lr * 0.1},
-            ])
-        else:
-            self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        # Worker state
-        self.current_traversal_path = []
-        self.traversal_step = 0
-        self.current_edge_actions = None
-        self.current_action_idx = 0
+        self.optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        # --- NEW WORKER STATE VARIABLES ---
+        # Traversal state
         self.current_traversal_path = []  # Path of PIVOTAL states, e.g., [(A), (B), (C)]
         self.traversal_step = 0           # Index into self.current_traversal_path
-
         self.current_edge_actions = []    # Action sequence for ONE edge, e.g., [1, 1, 2, 2]
         self.current_action_idx = 0       # Index into self.current_edge_actions
-        
+
+        # FSM state — reset to FINDING on each new manager goal
+        self._worker_state: WorkerState = WorkerState.FINDING
+        self._traversal_starts_this_episode: int = 0
+        self._narrow_goal_steps: int = 0        # steps spent in current NARROW_GOAL window
+        self._narrow_goal_dist_ref: int = 0    # distance to narrow_goal at start of window
+        self.narrow_goal_timeout: int = 50     # window size for spinning detection
+
+        # Set of traversable (x,y) cells — used by forward() to compute wall flags.
+        # Must be populated before the first call to forward() (set by trainer/pretrain).
+        self.valid_cells: set = set()
+
         # Hyperparameters
         self.gamma = 0.99
         self.entropy_coef = 0.05
@@ -460,11 +471,14 @@ class HierarchicalWorker(nn.Module):
         self.goal_norm_div: float = 1.0
     
     def reset_worker_state(self):
-        """Reset traversal state."""
+        """Reset traversal state and FSM back to FINDING."""
         self.current_traversal_path = []
         self.traversal_step = 0
-        self.current_edge_actions = None
+        self.current_edge_actions = []
         self.current_action_idx = 0
+        self._worker_state = WorkerState.FINDING
+        self._narrow_goal_steps = 0
+        self._narrow_goal_dist_ref = 0
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -528,13 +542,23 @@ class HierarchicalWorker(nn.Module):
         # dir encoded as (sin, cos) — preserves circular adjacency (all neighbours equidistant).
         # Goal delta normalized by 24.0 (grid size) — matches GoalConditionedPolicy.forward()
         # so that initialize_from_goal_policy weight transfer is calibrated correctly.
+        # Wall flags: 1.0 = blocked, 0.0 = free. Direction vectors: right/down/left/up.
+        _dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+        fwd   = _dirs[agent_dir]
+        left  = _dirs[(agent_dir - 1) % 4]
+        right = _dirs[(agent_dir + 1) % 4]
+        vc = self.valid_cells
+        wall_f = 0.0 if (state[0] + fwd[0],   state[1] + fwd[1])   in vc else 1.0
+        wall_l = 0.0 if (state[0] + left[0],  state[1] + left[1])  in vc else 1.0
+        wall_r = 0.0 if (state[0] + right[0], state[1] + right[1]) in vc else 1.0
         net_input = torch.tensor([
             state[0] / self.maze_size, state[1] / self.maze_size,
             math.sin(agent_dir * math.pi / 2),
             math.cos(agent_dir * math.pi / 2),
             float(narrow_goal[0] - state[0]) / self.goal_norm_div,
             float(narrow_goal[1] - state[1]) / self.goal_norm_div,
-        ], dtype=torch.float32, device=self.device)  # [6]
+            wall_f, wall_l, wall_r,
+        ], dtype=torch.float32, device=self.device)  # [9]
         features = self.net(net_input)               # [64]
         
         # Action and value
@@ -544,98 +568,101 @@ class HierarchicalWorker(nn.Module):
         return action_logits, value
     
     def get_action(self, state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int], agent_dir: int):
-        """Worker selects action by executing pre-computed paths or using policy."""
+        """Worker selects action via 3-state FSM: FINDING → TRAVERSAL → NARROW_GOAL."""
 
-        # 1. CHECK IF WE SHOULD START A NEW TRAVERSAL
-        # This happens only if we are NOT currently in a traversal.
-        if not self.current_traversal_path and self.should_traverse(state, wide_goal):
-            path = self.plan_traversal(state, wide_goal)
-            if path:
-                self.current_traversal_path = path
-                self.traversal_step = 0
-                self._traversal_starts_this_episode = getattr(self, '_traversal_starts_this_episode', 0) + 1
-                if diag:
-                    print(f"\n[WORKER DIAGNOSTIC] Initiating Traversal at {state}")
-                    print(f"  - Target (gw): {wide_goal}")
-                    print(f"  - Pivotal Path: {self.current_traversal_path}")
-        
-        # 2. EXECUTE THE CURRENT TRAVERSAL (if active)
-        is_traversing = bool(self.current_traversal_path)
+        # ── FSM TRANSITIONS ────────────────────────────────────────────────────
+        # Priority override: if narrow_goal is within Manhattan r from here, go straight to it.
+        # Also clears any in-progress traversal so was_traversing stays consistent.
+        if manhattan_distance(state, narrow_goal) <= self.neighborhood_size:
+            if self._worker_state != WorkerState.NARROW_GOAL:
+                self.current_traversal_path = []
+                self.current_edge_actions = []
+                self._narrow_goal_steps = 0
+                self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
+            self._worker_state = WorkerState.NARROW_GOAL
 
-        if is_traversing:
-            # Check if we need to load actions for a new edge segment
+        elif self._worker_state == WorkerState.FINDING:
+            # Arrived at a usable pivotal state — try to start graph traversal
+            if state in self.pivotal_states and state != wide_goal:
+                path = self.plan_traversal(state, wide_goal)
+                if path:
+                    self._worker_state = WorkerState.TRAVERSAL
+                    self.current_traversal_path = path
+                    self.traversal_step = 0
+                    self._traversal_starts_this_episode += 1
+                    if diag:
+                        print(f"\n[WORKER] FINDING→TRAVERSAL at {state}, target gw={wide_goal}")
+                        print(f"  Path: {self.current_traversal_path}")
+
+        # ── STATE EXECUTION ─────────────────────────────────────────────────────
+        if self._worker_state == WorkerState.TRAVERSAL:
             if not self.current_edge_actions:
                 if self.traversal_step < len(self.current_traversal_path) - 1:
                     start_node = self.current_traversal_path[self.traversal_step]
-                    end_node = self.current_traversal_path[self.traversal_step + 1]
+                    end_node   = self.current_traversal_path[self.traversal_step + 1]
 
-                    # CRITICAL SYNC CHECK before starting a new edge
                     if state != start_node:
                         if diag:
-                            print(f"  - 🔴 DESYNC DETECTED! Agent at {state}, expected {start_node} to start edge.")
-                            print(f"  - Aborting traversal.")
-                        self.reset_worker_state()
+                            print(f"  [WORKER] DESYNC: at {state}, expected {start_node}. →FINDING")
+                        self.reset_worker_state()   # back to FINDING
                     else:
-                        # Fetch the coordinate path and generate actions for it
                         coord_path = self.world_graph.get_edge_path(start_node, end_node)
                         if coord_path:
                             self.current_edge_actions = self.generate_actions_from_path(coord_path, agent_dir)
                             self.current_action_idx = 0
                             if diag:
-                                print(f"  - Loading edge {start_node}->{end_node}. Generated {len(self.current_edge_actions)} actions.")
+                                print(f"  [WORKER] Loading edge {start_node}→{end_node} "
+                                      f"({len(self.current_edge_actions)} actions)")
                         else:
-                            # Path not found in graph, should not happen if plan is valid
-                            if diag: print(f"  - 🔴 ERROR: Edge path for {start_node}->{end_node} not found!")
-                            self.reset_worker_state()
+                            if diag: print(f"  [WORKER] Edge {start_node}→{end_node} missing. →FINDING")
+                            self.reset_worker_state()   # back to FINDING
                 else:
-                    # We have finished the last edge of the pivotal path
-                    if diag: print("  - ✅ Traversal Complete. Switching to policy.")
-                    self.reset_worker_state()
+                    # All edges done — switch to narrow-goal navigation
+                    if diag: print("  [WORKER] Traversal complete. →NARROW_GOAL")
+                    self.reset_worker_state()               # clears path/edge buffers + sets FINDING
+                    self._worker_state = WorkerState.NARROW_GOAL
+                    self._narrow_goal_steps = 0
+                    self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
 
-            # If we have actions to execute for the current edge, execute them
             if self.current_edge_actions and self.current_action_idx < len(self.current_edge_actions):
                 action = self.current_edge_actions[self.current_action_idx]
                 self.current_action_idx += 1
-
-                # Check if this edge segment is now complete
                 if self.current_action_idx >= len(self.current_edge_actions):
-                    self.current_edge_actions = [] # Clear actions to load next edge
-                    self.traversal_step += 1       # Move to next pivotal state in path
-                    if diag:
-                        print(f"  - Edge segment finished. Advancing to pivotal step {self.traversal_step}.")
-
-                # Return the action from the pre-computed plan
+                    self.current_edge_actions = []
+                    self.traversal_step += 1
+                    if diag: print(f"  [WORKER] Edge done. traversal_step={self.traversal_step}")
                 with torch.no_grad():
                     _, value = self.forward(state, agent_dir, narrow_goal)
-                log_prob = torch.tensor(-1.0, device=self.device) # Dummy log_prob for planned actions
-                return action, log_prob, value.squeeze()
+                return action, torch.tensor(-1.0, device=self.device), value.squeeze()
 
-        # 3. FALLBACK: fine-tune Phase 1 GCP if available, else use worker A2C.
-        if self.goal_policy is not None:
-            _, value = self.forward(state, agent_dir, narrow_goal)
+        # ── MLP NAVIGATION (FINDING or NARROW_GOAL) ────────────────────────────
+        if self._worker_state == WorkerState.NARROW_GOAL:
+            self._narrow_goal_steps += 1
+            if self._narrow_goal_steps >= self.narrow_goal_timeout:
+                current_dist = manhattan_distance(state, narrow_goal)
+                if current_dist >= self._narrow_goal_dist_ref:
+                    # No progress in the last window → spinning → back to FINDING
+                    if diag: print(f"  [WORKER] NARROW_GOAL spinning (dist {current_dist} >= ref {self._narrow_goal_dist_ref}) →FINDING")
+                    self._worker_state = WorkerState.FINDING
+                    self._narrow_goal_steps = 0
+                else:
+                    # Made progress → slide the window forward
+                    self._narrow_goal_steps = 0
+                    self._narrow_goal_dist_ref = current_dist
 
-            # GCP selects action toward narrow_goal — gradients flow for fine-tuning
-            state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
-            gn_t = torch.tensor(narrow_goal, dtype=torch.float32, device=self.device)
-            gp_logits, _ = self.goal_policy.forward(state_t, agent_dir, gn_t)
-            if gp_logits.dim() > 1:
-                gp_logits = gp_logits.squeeze(0)
-            masked = torch.full_like(gp_logits, float('-inf'))
-            masked[[0, 1, 2]] = gp_logits[[0, 1, 2]]  # navigation actions only
-            probs = F.softmax(masked, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            idx = dist.sample()
-            log_prob = dist.log_prob(idx)
-            action = idx.item()
-        else:
-            action_logits, value = self.forward(state, agent_dir, narrow_goal)
-            probs = F.softmax(action_logits, dim=0)
-            dist = torch.distributions.Categorical(probs)
-            idx = dist.sample()
-            log_prob = dist.log_prob(idx)
-            action = idx.item()
+        if self._worker_state == WorkerState.FINDING:
+            # Steer toward nearest pivotal state; exclude current pos to avoid self-loop
+            candidates = [p for p in self.pivotal_states if p != state]
+            local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
+                          if candidates else narrow_goal)
+        else:   # NARROW_GOAL
+            local_goal = narrow_goal
 
-        return action, log_prob, value.squeeze()
+        action_logits, value = self.forward(state, agent_dir, local_goal)
+        probs = F.softmax(action_logits, dim=0)
+        dist  = torch.distributions.Categorical(probs)
+        idx   = dist.sample()
+        return idx.item(), dist.log_prob(idx), value.squeeze()
 
     def _compute_required_direction(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> int:
         """
@@ -739,12 +766,20 @@ class HierarchicalWorker(nn.Module):
     # Actual working version:
     def initialize_from_goal_policy(self, goal_policy):
         with torch.no_grad():
-            # Both GCP and Worker share the same 5→64→64 MLP layout — direct copy.
             if hasattr(goal_policy, 'net'):
-                for name, param in goal_policy.net.named_parameters():
-                    worker_param = dict(self.net.named_parameters()).get(name)
-                    if worker_param is not None and param.shape == worker_param.shape:
-                        worker_param.copy_(param)
+                # First layer: GCP input_size=6, Worker input_size=9.
+                # Copy the 6 base columns; zero-init the 3 wall-flag columns so they
+                # start silent and the pre-trained navigation features are preserved.
+                src0 = goal_policy.net[0]
+                if hasattr(src0, 'weight') and src0.weight.shape[1] == 6:
+                    self.net[0].weight[:, :6].copy_(src0.weight)
+                    nn.init.zeros_(self.net[0].weight[:, 6:])
+                    self.net[0].bias.copy_(src0.bias)
+                # Second layer: [64,64] unchanged — direct copy
+                src2 = goal_policy.net[2]
+                if hasattr(src2, 'weight') and src2.weight.shape == self.net[2].weight.shape:
+                    self.net[2].weight.copy_(src2.weight)
+                    self.net[2].bias.copy_(src2.bias)
 
             # Copy actor (first 3 of GCP's 7 actions)
             if hasattr(goal_policy, 'actor'):
@@ -756,7 +791,7 @@ class HierarchicalWorker(nn.Module):
                 self.critic.weight.copy_(goal_policy.critic.weight)
                 self.critic.bias.copy_(goal_policy.critic.bias)
 
-        print("Worker initialized from goal policy (direct copy, 5-dim MLP: state+dir+goal)")
+        print("Worker initialized from goal policy (9-dim MLP: state+dir+goal+walls)")
 
 
     def update_policy(self, states: List, actions: List, rewards: List,
@@ -818,8 +853,7 @@ class HierarchicalWorker(nn.Module):
         if T > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        params = (list(self.parameters()) + list(self.goal_policy.parameters())
-                  if self.goal_policy is not None else list(self.parameters()))
+        params = list(self.parameters())
 
         last_metrics: dict = {}
         for _ in range(n_epochs):
@@ -947,12 +981,6 @@ class HierarchicalTrainer:
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1):
         """Train one episode with comprehensive diagnostics."""
 
-        # Episode tracking
-        episode_reward = 0
-        episode_steps = 0
-        manager_updates = 0
-        worker_updates = 0
-
         all_manager_rewards_this_episode = []  # Track all horizon rewards for diagnostics
 
         # Reset environment and networks
@@ -964,6 +992,7 @@ class HierarchicalTrainer:
             for y in range(self.env.height)
             if self.env._is_traversable(self.env.grid.get(x, y))
         }
+        self.worker.valid_cells = valid_cells
 
         if diag2:
             print(f"\n[EPISODE {self.global_episode_counter + 1} START]")
@@ -981,7 +1010,7 @@ class HierarchicalTrainer:
         active_log_prob = None
         active_value = None
         active_entropy = None
-        horizons_on_goal = 0
+        steps_on_goal = 0
         goal_reached_prev = False   # did the worker reach the goal last horizon?
         ball_collected_prev = False  # was a ball collected last horizon?
 
@@ -1022,16 +1051,12 @@ class HierarchicalTrainer:
                 active_wide_goal is None
                 or goal_reached_prev
                 or ball_collected_prev
-                or horizons_on_goal >= self.goal_timeout
+                or steps_on_goal >= self.goal_timeout
             )
 
             if need_new_goal:
                 if active_wide_goal is not None:
-                    # flush only traversal state — LSTM context stays valid across goals
-                    self.worker.current_traversal_path = []
-                    self.worker.traversal_step = 0
-                    self.worker.current_edge_actions = None
-                    self.worker.current_action_idx = 0
+                    self.worker.reset_worker_state()  # resets traversal buffers + FSM to FINDING
 
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
                     state, step_count=self.global_step_counter, valid_cells=valid_cells,
@@ -1045,7 +1070,7 @@ class HierarchicalTrainer:
                 active_log_prob = manager_log_prob
                 active_value = manager_value
                 active_entropy = entropy.detach()
-                horizons_on_goal = 0
+                steps_on_goal = 0
             else:
                 wide_goal = active_wide_goal
                 narrow_goal = active_narrow_goal
@@ -1169,10 +1194,10 @@ class HierarchicalTrainer:
                     break
             
             
-            #  ADD: Update Worker AFTER horizon ends with full batch
-            if len(worker_rewards) > 0:
+            # Update Worker only when goal was reached — preserves pretrained weights on failures
+            if len(worker_rewards) > 0 and goal_reached_this_horizon:
                 self.worker.update_policy(
-                    worker_states,   # Full horizon: 20-30 samples
+                    worker_states,
                     worker_actions,
                     worker_rewards,
                     worker_values,
@@ -1201,15 +1226,6 @@ class HierarchicalTrainer:
             if self.manager_reward_shaping:
                 # Bonus for ball collection
                 manager_reward += balls_collected_this_horizon * 5
-                
-                # Narrow-goal closeness shaping: prefer narrow goals nearer to balls
-                if len(starting_balls_snapshot) > 0:
-                    narrow_dist_to_ball = min(
-                        manhattan_distance(narrow_goal, ball)
-                        for ball in starting_balls_snapshot
-                    )
-                    narrow_bonus = self.narrow_shaping_weight / (1.0 + narrow_dist_to_ball)
-                    manager_reward += narrow_bonus
 
                 # Distance-based progress shaping (fixed)
                 if len(starting_balls_snapshot) > 0:
@@ -1225,18 +1241,16 @@ class HierarchicalTrainer:
                         dist_after = min(manhattan_distance(end_pos_horizon, ball) for ball in remaining_balls)
                         
                         progress = dist_before - dist_after
-                        progress_reward = progress * self.manager_shaping_weight
+                        maze_diagonal = (self.env.width - 2) + (self.env.height - 2)
+                        progress_reward = progress * self.manager_shaping_weight / maze_diagonal
                         manager_reward += progress_reward
 
-            # Bonus for choosing a reachable narrow goal close to a ball
-            if goal_reached_this_horizon:
-                narrow_bonus = 0.2
-                if len(starting_balls_snapshot) > 0:
-                    dist_narrow_to_ball = min(
-                        manhattan_distance(narrow_goal, ball) for ball in starting_balls_snapshot
-                    )
-                    narrow_bonus += 2.0 / (1.0 + dist_narrow_to_ball)
-                manager_reward += narrow_bonus
+            # Bonus for choosing a narrow goal close to a ball (only proximity, no base)
+            if goal_reached_this_horizon and len(starting_balls_snapshot) > 0:
+                dist_narrow_to_ball = min(
+                    manhattan_distance(narrow_goal, ball) for ball in starting_balls_snapshot
+                )
+                manager_reward += 0.5 / (1.0 + dist_narrow_to_ball) ** 2.5
 
             # Traversal completion bonus: reward manager for arriving at wide_goal via graph,
             # scaled by proximity of wide_goal to nearest ball. Fires reliably (traversal is
@@ -1245,7 +1259,8 @@ class HierarchicalTrainer:
                 dist_wide_to_ball = min(
                     manhattan_distance(wide_goal, ball) for ball in starting_balls_snapshot
                 )
-                manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball)
+                if dist_wide_to_ball <= 3:
+                    manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball) ** 2
 
             # Push manager experience every horizon
             manager_states.append(starting_state_snapshot)
@@ -1257,7 +1272,7 @@ class HierarchicalTrainer:
             manager_entropies_for_update.append(active_entropy)
             manager_balls_snapshots.append(starting_balls_snapshot)
 
-            horizons_on_goal += 1
+            steps_on_goal += self.horizon
             horizon_counter += 1
             goal_reached_prev = goal_reached_this_horizon
             ball_collected_prev = balls_collected_this_horizon > 0
