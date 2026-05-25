@@ -50,7 +50,9 @@ def load_phase1_checkpoint(path):
     vae_system.to(config['device'])
 
     policy = GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=config['device'])
-    policy.load_state_dict(checkpoint['policy_state_dict'])
+    result = policy.load_state_dict(checkpoint['policy_state_dict'], strict=False)
+    if result.missing_keys or result.unexpected_keys:
+        print(f"  [checkpoint] GCP architecture mismatch (checkpoint={list(checkpoint['policy_state_dict'].keys())[:2]}…) — loaded with strict=False")
 
     print(f"Phase 1 checkpoint loaded from '{path}'")
     print(f"  Pivotal states: {len(checkpoint['pivotal_states'])}")

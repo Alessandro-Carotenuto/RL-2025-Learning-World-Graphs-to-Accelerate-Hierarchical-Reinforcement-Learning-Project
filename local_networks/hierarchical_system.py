@@ -48,8 +48,13 @@ class HierarchicalManager(nn.Module):
     # WIDE POLICY OUTPUT LAYER
         self.wide_head = nn.Linear(64, len(pivotal_states)).to(device)
         
-    # NARROW POLICY OUTPUT LAYER
-        self.narrow_head = nn.Linear(64 + 2, 2 * neighborhood_size * (neighborhood_size + 1)).to(device)  # +2 for gw coords; Manhattan ball: 2r(r+1) cells
+    # NARROW POLICY OUTPUT LAYER — stateless MLP, input = [dx, dy] nearest ball rel. to wide_goal
+        narrow_out = 2 * neighborhood_size * (neighborhood_size + 1) + 1
+        self.narrow_head = nn.Sequential(
+            nn.Linear(2, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, narrow_out),
+        ).to(device)
         
     # VALUE FUNCTION OUTPUT LAYER
         self.critic = nn.Linear(64, 1).to(device)
@@ -63,8 +68,8 @@ class HierarchicalManager(nn.Module):
         
     # HYPERPARAMETERS
         self.gamma = 0.99
-        self.entropy_coef = 5e-4
-        self.value_coef = 0.05
+        self.entropy_coef = 0.001
+        self.value_coef = 0.2
 
     # DIAGNOSTIC PARAMETERS
         self.diagnostic_interval = diagnostic_interval
@@ -78,13 +83,13 @@ class HierarchicalManager(nn.Module):
         self.prev_wide_goal = (0, 0)
     
     def get_neighborhood(self, wide_goal: Tuple[int, int], valid_cells=None) -> List[Tuple[int, int]]:
-        # Manhattan ball of radius r: all (dx,dy) with 0 < |dx|+|dy| <= r → 2r(r+1) cells
+        # Manhattan diamond incl. center: all (dx,dy) with |dx|+|dy| <= r → 2r(r+1)+1 cells
         gw_x, gw_y = wide_goal
         r = self.neighborhood_size
         neighborhood = []
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
-                if 0 < abs(dx) + abs(dy) <= r:
+                if abs(dx) + abs(dy) <= r:
                     cell = (gw_x + dx, gw_y + dy)
                     if valid_cells is None or cell in valid_cells:
                         neighborhood.append(cell)
@@ -138,10 +143,12 @@ class HierarchicalManager(nn.Module):
         return min(valid_cells, key=lambda c: abs(c[0] - center[0]) + abs(c[1] - center[1]))
 
     def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None, active_balls=None) -> Tuple[Tuple[int, int], torch.Tensor]:
-        _, features, _ = self.forward(state, active_balls)
-        wide_goal_tensor = torch.tensor(wide_goal, dtype=torch.float32, device=self.device)
-        narrow_input = torch.cat([features, wide_goal_tensor])
-        narrow_logits = self.narrow_head(narrow_input)
+        if active_balls:
+            nearest = min(active_balls, key=lambda b: abs(b[0] - wide_goal[0]) + abs(b[1] - wide_goal[1]))
+            dx, dy = float(nearest[0] - wide_goal[0]), float(nearest[1] - wide_goal[1])
+        else:
+            dx, dy = 0.0, 0.0
+        narrow_logits = self.narrow_head(torch.tensor([dx, dy], dtype=torch.float32, device=self.device))
 
         neighborhood = self.get_neighborhood(wide_goal, valid_cells=valid_cells)
 
@@ -260,13 +267,13 @@ class HierarchicalManager(nn.Module):
             # Initialize manager heads with small weights
             nn.init.xavier_uniform_(self.wide_head.weight, gain=0.5)
             nn.init.zeros_(self.wide_head.bias)
-            nn.init.xavier_uniform_(self.narrow_head.weight, gain=0.5)
-            nn.init.zeros_(self.narrow_head.bias)
+            nn.init.xavier_uniform_(self.narrow_head[-1].weight, gain=0.5)
+            nn.init.zeros_(self.narrow_head[-1].bias)
         
         print("Manager initialized from goal policy LSTM")
 
 
-    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None, wide_only=False):
+    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None, wide_only=False, narrow_only=False, wide_idxs=None, ppo_epochs=1, clip_eps=0.2):
         """Update Manager policy with wide + narrow entropy regularization."""
         if len(rewards) == 0:
             return
@@ -330,61 +337,143 @@ class HierarchicalManager(nn.Module):
             advantages = advantages - advantages.mean()
         advantages = advantages.clamp(-3.0, 3.0)
 
-        # Policy and value losses
-        policy_loss = -(advantages.detach() * log_probs_tensor).mean()
-        value_loss = F.mse_loss(values_tensor, returns)
+        old_log_probs_t = log_probs_tensor.detach()  # frozen reference for PPO ratio
 
-        if verbose:
-            print(f"  Advantages (raw): {raw_advantages[:3].tolist()}")
-            print(f"  Advantages (normalized): {advantages[:3].tolist()}")
-            print(f"  Policy loss: {policy_loss.item():.4f}")
-        
-        # Compute narrow entropy — skipped in wide_only mode (e.g. manager wide pretrain)
-        if not wide_only:
-            saved_hidden = tuple(h.detach().clone() for h in self.hidden_state) if self.hidden_state else None
-            narrow_entropies = []
-            balls_iter = balls_snapshots if balls_snapshots is not None else [None] * len(states)
-            for state_i, wide_goal_i, balls_i in zip(states, wide_goals, balls_iter):
-                _, features_i, _ = self.forward(state_i, balls_i)
-                wide_goal_tensor = torch.tensor(wide_goal_i, dtype=torch.float32, device=self.device)
-                narrow_input = torch.cat([features_i, wide_goal_tensor])
-                narrow_logits = self.narrow_head(narrow_input)
-                if self._valid_cells is not None:
-                    neighborhood_i = self.get_neighborhood(wide_goal_i, valid_cells=self._valid_cells)
-                    valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
-                    if valid_idx:
-                        idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
-                        narrow_logits = narrow_logits[idx_t]
-                narrow_probs = F.softmax(narrow_logits, dim=0)
-                narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
-                narrow_entropies.append(narrow_entropy)
-            self.hidden_state = saved_hidden
-            narrow_entropy_mean = torch.stack(narrow_entropies).mean()
+        if ppo_epochs <= 1:
+            # ── A2C: single gradient step (original behaviour) ──
+            policy_loss = -(advantages.detach() * log_probs_tensor).mean()
+            value_loss  = F.mse_loss(values_tensor, returns)
+
+            if verbose:
+                print(f"  Advantages (raw): {raw_advantages[:3].tolist()}")
+                print(f"  Advantages (normalized): {advantages[:3].tolist()}")
+                print(f"  Policy loss: {policy_loss.item():.4f}")
+
+            passed_entropies_tensor = torch.stack(entropies)
+            if narrow_only:
+                narrow_entropy_mean = passed_entropies_tensor.mean()
+                wide_entropy_mean   = torch.tensor(0.0, device=self.device)
+            elif wide_only:
+                wide_entropy_mean   = passed_entropies_tensor.mean()
+                narrow_entropy_mean = torch.tensor(0.0, device=self.device)
+            else:
+                wide_entropy_mean = passed_entropies_tensor.mean()
+                narrow_entropies = []
+                balls_iter = balls_snapshots if balls_snapshots is not None else [None] * len(states)
+                for wide_goal_i, balls_i in zip(wide_goals, balls_iter):
+                    if balls_i:
+                        nearest = min(balls_i, key=lambda b: abs(b[0]-wide_goal_i[0]) + abs(b[1]-wide_goal_i[1]))
+                        dx_i = float(nearest[0] - wide_goal_i[0])
+                        dy_i = float(nearest[1] - wide_goal_i[1])
+                    else:
+                        dx_i, dy_i = 0.0, 0.0
+                    narrow_logits = self.narrow_head(torch.tensor([dx_i, dy_i], dtype=torch.float32, device=self.device))
+                    if self._valid_cells is not None:
+                        neighborhood_i = self.get_neighborhood(wide_goal_i, valid_cells=self._valid_cells)
+                        valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
+                        if valid_idx:
+                            idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
+                            narrow_logits = narrow_logits[idx_t]
+                    narrow_probs = F.softmax(narrow_logits, dim=0)
+                    narrow_entropy = -(narrow_probs * torch.log(narrow_probs + 1e-8)).sum()
+                    narrow_entropies.append(narrow_entropy)
+                narrow_entropy_mean = torch.stack(narrow_entropies).mean()
+
+            if verbose:
+                print(f"\nLoss components:")
+                print(f"  Policy loss: {policy_loss.item():.6f}")
+                print(f"  Value loss: {value_loss.item():.6f}")
+                print(f"  Wide entropy: {wide_entropy_mean.item():.6f}")
+                print(f"  Narrow entropy: {narrow_entropy_mean.item():.6f}")
+                print(f"  Entropy coef: {self.entropy_coef}")
+
+            total_loss = (policy_loss +
+                          self.value_coef * value_loss -
+                          self.entropy_coef * (wide_entropy_mean + narrow_entropy_mean))
+
+            if verbose:
+                print(f"  Total loss: {total_loss.item():.6f}")
+
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+            self.optimizer.step()
+
         else:
-            narrow_entropy_mean = torch.tensor(0.0, device=self.device)
-        wide_entropy_mean = wide_entropies_tensor.mean()
-        
-        if verbose:
-            print(f"\nLoss components:")
-            print(f"  Policy loss: {policy_loss.item():.6f}")
-            print(f"  Value loss: {value_loss.item():.6f}")
-            print(f"  Wide entropy: {wide_entropy_mean.item():.6f}")
-            print(f"  Narrow entropy: {narrow_entropy_mean.item():.6f}")
-            print(f"  Entropy coef: {self.entropy_coef}")
-        
-        # Combined loss with both entropies (paper: H(π^ω) + H(π^n|gw))
-        total_loss = (policy_loss + 
-                    self.value_coef * value_loss - 
-                    self.entropy_coef * (wide_entropy_mean + narrow_entropy_mean))
-        
-        if verbose:
-            print(f"  Total loss: {total_loss.item():.6f}")
-        
-        # Optimization
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
-        self.optimizer.step()
+            # ── PPO: K epochs, each replays the full LSTM sequence from scratch ──
+            saved_hidden  = self.hidden_state
+            saved_prev_gw = self.prev_wide_goal
+            balls_iter    = balls_snapshots if balls_snapshots is not None else [None] * len(states)
+
+            for _epoch in range(ppo_epochs):
+                self.hidden_state   = None
+                self.prev_wide_goal = (0, 0)
+
+                new_lp, new_vals, new_ents = [], [], []
+                for t, (s_t, gw_t, balls_t) in enumerate(zip(states, wide_goals, balls_iter)):
+                    if t > 0:
+                        self.prev_wide_goal = wide_goals[t - 1]
+
+                    if narrow_only:
+                        _, _, val_t = self.forward(s_t, balls_t)
+                        if self.hidden_state:
+                            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+                        if balls_t:
+                            nearest = min(balls_t, key=lambda b: abs(b[0]-gw_t[0]) + abs(b[1]-gw_t[1]))
+                            dx_t = float(nearest[0] - gw_t[0])
+                            dy_t = float(nearest[1] - gw_t[1])
+                        else:
+                            dx_t, dy_t = 0.0, 0.0
+                        narrow_logits_t  = self.narrow_head(torch.tensor([dx_t, dy_t], dtype=torch.float32, device=self.device))
+                        neighborhood_t   = self.get_neighborhood(gw_t, valid_cells=self._valid_cells)
+                        valid_idx_t      = [i for i, c in enumerate(neighborhood_t)
+                                            if self._valid_cells is None or c in self._valid_cells]
+                        if valid_idx_t:
+                            idx_tensor    = torch.tensor(valid_idx_t, dtype=torch.long, device=self.device)
+                            valid_probs_t = F.softmax(narrow_logits_t[idx_tensor], dim=0)
+                            ng_t          = narrow_goals[t]
+                            global_i      = neighborhood_t.index(ng_t) if ng_t in neighborhood_t else None
+                            local_i       = valid_idx_t.index(global_i) if global_i in valid_idx_t else None
+                            lp_t  = torch.log(valid_probs_t[local_i] + 1e-8) if local_i is not None \
+                                    else torch.tensor(-10.0, device=self.device)
+                            ent_t = -(valid_probs_t * torch.log(valid_probs_t + 1e-8)).sum()
+                        else:
+                            lp_t  = torch.tensor(-10.0, device=self.device)
+                            ent_t = torch.tensor(0.0,   device=self.device)
+                    else:
+                        wide_logits_t, _, val_t = self.forward(s_t, balls_t)
+                        if self.hidden_state:
+                            self.hidden_state = tuple(h.detach() for h in self.hidden_state)
+                        probs_t = F.softmax(wide_logits_t, dim=0)
+                        idx_t   = wide_idxs[t] if wide_idxs is not None else 0
+                        lp_t    = torch.log(probs_t[idx_t] + 1e-8)
+                        ent_t   = -(probs_t * torch.log(probs_t + 1e-8)).sum()
+
+                    new_lp.append(lp_t)
+                    new_vals.append(val_t.squeeze())
+                    new_ents.append(ent_t.detach())
+
+                new_lp_t   = torch.stack(new_lp)
+                new_vals_t = torch.stack(new_vals)
+
+                ratios     = torch.exp(new_lp_t - old_log_probs_t)
+                surr1      = ratios * advantages.detach()
+                surr2      = ratios.clamp(1 - clip_eps, 1 + clip_eps) * advantages.detach()
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss  = F.mse_loss(new_vals_t, returns)
+                entropy_mean = torch.stack(new_ents).mean()
+
+                total_loss = (policy_loss +
+                              self.value_coef * value_loss -
+                              self.entropy_coef * entropy_mean)
+
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+                self.optimizer.step()
+
+            self.hidden_state   = saved_hidden
+            self.prev_wide_goal = saved_prev_gw
         
         if verbose:
             print(f"{'='*70}\n")
@@ -470,8 +559,8 @@ class HierarchicalWorker(nn.Module):
         self.gamma = 0.99
         self.entropy_coef = 0.05
         self.value_coef = 0.5
-        # Goal-delta normalization divisor — set per curriculum r-stage by run_worker_pretrain,
-        # then fixed to neighborhood_size for Phase 2.  Default 1.0 = raw (r=1 pretrain scale).
+        # Goal-delta normalization divisor — kept at 1.0 (raw cell deltas) throughout pretrain
+        # and Phase 2.  GCP also uses raw deltas (aligned).  Default 1.0.
         self.goal_norm_div: float = 1.0
     
     def reset_worker_state(self):
@@ -546,8 +635,7 @@ class HierarchicalWorker(nn.Module):
             value: State value estimate
         """
         # dir encoded as (sin, cos) — preserves circular adjacency (all neighbours equidistant).
-        # Goal delta normalized by 24.0 (grid size) — matches GoalConditionedPolicy.forward()
-        # so that initialize_from_goal_policy weight transfer is calibrated correctly.
+        # Goal delta raw (goal_norm_div=1.0) — matches GCP and worker pretrain convention.
         # Wall flags: 1.0 = blocked, 0.0 = free. Direction vectors: right/down/left/up.
         _dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
         fwd   = _dirs[agent_dir]
@@ -741,15 +829,16 @@ class HierarchicalWorker(nn.Module):
             # Target is 1 turn left away (or 3 turns right)
             return 0  # turn_left
 
-    def compute_reward(self, current_state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> float:
+    def compute_reward(self, prev_state: Tuple[int, int], current_state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> float:
         """
         Compute Worker's reward.
         Paper: "Worker receives rewards from Manager by reaching subgoals"
         """
         if current_state == narrow_goal:
-            return 1.0  # Success
-        else:
-            return -0.001  # Step penalty
+            return 1.0
+        prev_dist = abs(prev_state[0] - narrow_goal[0]) + abs(prev_state[1] - narrow_goal[1])
+        curr_dist = abs(current_state[0] - narrow_goal[0]) + abs(current_state[1] - narrow_goal[1])
+        return (prev_dist - curr_dist) * 0.1 - 0.01
     
     # Transfer learning initialization (broken? just copying heads i guess)
     # def initialize_from_goal_policy(self, goal_policy):
@@ -1188,7 +1277,7 @@ class HierarchicalTrainer:
                 progress_bonus = max(progress_narrow, progress_wide)  # Reward best progress
 
                 # Worker reward (internal)
-                worker_reward = self.worker.compute_reward(next_state, wide_goal, narrow_goal)
+                worker_reward = self.worker.compute_reward(state, next_state, wide_goal, narrow_goal)
                 # Add Manhattan Shaping
 
                 if self.manhattan_distance_rew_shaping:

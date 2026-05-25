@@ -1,8 +1,10 @@
 import random
 import math
 import time
+import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 # minigrid imports
 from minigrid.core.world_object import Wall
@@ -18,7 +20,8 @@ from utils.visualization import (plot_training_diagnostics, save_graph_visualiza
                                   create_phase1_gif, render_phase2_episode_gif,
                                   _run_and_save_episode, print_grid_image, _plot_phase1_run,
                                   plot_worker_pretrain_diagnostics,
-                                  plot_manager_wide_pretrain_diagnostics)
+                                  plot_manager_wide_pretrain_diagnostics,
+                                  plot_manager_narrow_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 
 
@@ -913,26 +916,34 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
 def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     """
     Intermediate phase: pre-train Manager wide head on ball-proximity goal selection.
-    No Worker, no traversal. Per episode: N goal selections, agent teleports to wide_goal after each.
-    Reward: +1.0 if ball in neighborhood(wide_goal), else -dist_to_nearest / maze_diagonal.
-    Balls are simulated as collected when covered, so Manager learns to sequence across all balls.
+    curriculum_manager_pretrain=True  → multi-phase curriculum via 'manager_wide_pretrain_phases'
+    curriculum_manager_pretrain=False → single flat phase via 'manager_wide_pretrain_episodes'
     """
-    episodes = config.get('manager_wide_pretrain_episodes', 0)
     horizons_per_ep = config.get('manager_wide_horizons_per_episode', 20)
-    r = config.get('neighborhood_size', 3)
+    r               = config.get('neighborhood_size', 3)
+    base_lr         = config.get('manager_lr', 5e-4)
+    ppo_epochs      = config.get('manager_wide_ppo_epochs', 4)
+
+    if config.get('curriculum_manager_pretrain', True):
+        phases = config['manager_wide_pretrain_phases']
+    else:
+        episodes = config.get('manager_wide_pretrain_episodes', 0)
+        phases = [{'episodes': episodes,
+                   'r_offset': config.get('manager_wide_pretrain_r_offset', 0),
+                   'lr_start_factor': 1.0, 'lr_end_factor': 1.0,
+                   'entropy_coef': manager.entropy_coef,
+                   'entropy_warmup_eps': 0, 'entropy_warmup_coef': manager.entropy_coef}]
 
     env.phase = 2
-    env.fixed_ball_positions = None  # random balls each episode
+    env.fixed_ball_positions = None
 
-    # Compute valid cells from the Phase 1 grid (already restored by caller) and
-    # pick a valid agent_start_pos — default (1,1) may be a wall in the Phase 1 maze.
     valid_cells = [
         (x, y)
         for x in range(1, env.width - 1)
         for y in range(1, env.height - 1)
         if env._is_traversable(env.grid.get(x, y))
     ]
-    valid_set = set(valid_cells)
+    valid_set     = set(valid_cells)
     maze_diagonal = (env.width - 2) + (env.height - 2)
     if valid_cells:
         env.agent_start_pos = random.choice(valid_cells)
@@ -940,16 +951,235 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     env.randomgen = False
     env.reset()
     restore_maze_from_grid_state(env, grid_state)
-    env.randomgen = True   # allow ResetMultiGoals on subsequent resets
-    env.firstgen = False   # maze already set — don't regenerate
+    env.randomgen = True
+    env.firstgen  = False
     env.reset()
 
+    total_episodes = sum(p['episodes'] for p in phases)
     print(f"\n{'='*70}")
     print(f"INTERMEDIATE PHASE: Manager Wide Goal Pre-training")
-    print(f"  {episodes} episodes | {horizons_per_ep} horizons/ep | r={r} | diagonal={maze_diagonal}")
+    print(f"  {len(phases)} curriculum phase(s) | {total_episodes} total ep | "
+          f"{horizons_per_ep} horizons/ep | r={r} | diagonal={maze_diagonal}")
     print(f"{'='*70}")
 
     ball_coverage_history = []
+    avg_reward_history    = []
+    avg_dist_history      = []
+    global_episode        = 0
+
+    for phase_idx, phase in enumerate(phases):
+        phase_episodes      = phase['episodes']
+        pretrain_r          = r + phase.get('r_offset', 0)
+        lr_start            = base_lr * phase.get('lr_start_factor', 1.0)
+        lr_end              = base_lr * phase.get('lr_end_factor',   0.1)
+        base_entropy        = phase.get('entropy_coef',         manager.entropy_coef)
+        warmup_eps          = phase.get('entropy_warmup_eps',   0)
+        warmup_entropy      = phase.get('entropy_warmup_coef',  base_entropy)
+
+        # Reset optimizer state at each phase transition
+        manager.optimizer = torch.optim.Adam(manager.parameters(), lr=lr_start)
+
+        print(f"\n  [Phase {phase_idx+1}/{len(phases)}] "
+              f"pretrain_r={pretrain_r} | ep={phase_episodes} | "
+              f"LR {lr_start:.1e}→{lr_end:.1e} cosine | "
+              f"entropy {warmup_entropy if warmup_eps > 0 else base_entropy:.4f}"
+              f"{'→'+str(base_entropy) if warmup_eps > 0 else ''}")
+
+        for ep_in_phase in range(phase_episodes):
+            # ── Cosine LR annealing ──────────────────────────────────────────
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * ep_in_phase / max(1, phase_episodes)))
+            current_lr    = lr_end + (lr_start - lr_end) * cosine_factor
+            for pg in manager.optimizer.param_groups:
+                pg['lr'] = current_lr
+
+            # ── Entropy coef: warmup then base ──────────────────────────────
+            manager.entropy_coef = warmup_entropy if ep_in_phase < warmup_eps else base_entropy
+
+            # ── Episode rollout ──────────────────────────────────────────────
+            spawn = random.choice(valid_cells)
+            env.agent_start_pos = spawn
+            env.agent_start_dir = random.randint(0, 3)
+            env.reset()
+            state = tuple(env.agent_pos)
+
+            active_balls       = set(env.active_balls)
+            initial_ball_count = len(active_balls)
+
+            manager.reset_manager_state()
+
+            m_states, m_wide, m_narrow = [], [], []
+            m_rewards, m_values, m_log_probs, m_entropies = [], [], [], []
+            m_dists     = []
+            m_balls     = []
+            m_wide_idxs = []
+
+            for h in range(horizons_per_ep):
+                if not active_balls:
+                    break
+
+                m_balls.append(list(active_balls))
+
+                wide_logits, _, value = manager.forward(state, list(active_balls))
+                wide_probs = F.softmax(wide_logits, dim=0)
+                wide_dist  = torch.distributions.Categorical(wide_probs)
+                wide_idx   = wide_dist.sample()
+                log_prob   = wide_dist.log_prob(wide_idx)
+                entropy    = -(wide_probs * torch.log(wide_probs + 1e-8)).sum().detach()
+                wide_goal  = manager.pivotal_states[wide_idx.item()]
+                manager.prev_wide_goal = wide_goal
+                narrow_goal = wide_goal
+                value = value.squeeze()
+                if manager.hidden_state is not None:
+                    manager.hidden_state = tuple(hs.detach() for hs in manager.hidden_state)
+
+                m_wide_idxs.append(wide_idx.item())
+
+                covered = [b for b in active_balls if manhattan_distance(wide_goal, b) <= pretrain_r]
+                if covered:
+                    closest       = min(covered, key=lambda b: manhattan_distance(wide_goal, b))
+                    dist_to_closest = manhattan_distance(wide_goal, closest)
+                    reward        = 1.0 + 2.0 * (pretrain_r - dist_to_closest) / pretrain_r
+                    active_balls.discard(closest)
+                else:
+                    dist_to_closest = min(manhattan_distance(wide_goal, b) for b in active_balls)
+                    reward          = -dist_to_closest / maze_diagonal
+
+                m_dists.append(dist_to_closest)
+                m_states.append(state)
+                m_wide.append(wide_goal)
+                m_narrow.append(narrow_goal)
+                m_rewards.append(reward)
+                m_values.append(value)
+                m_log_probs.append(log_prob)
+                m_entropies.append(entropy.detach())
+
+                state = wide_goal
+
+            covered_count = initial_ball_count - len(active_balls)
+            ball_coverage_history.append(covered_count / max(1, initial_ball_count))
+            avg_reward_history.append(sum(m_rewards) / len(m_rewards) if m_rewards else 0.0)
+            avg_dist_history.append(sum(m_dists)    / len(m_dists)    if m_dists    else 0.0)
+
+            if len(m_rewards) > 1:
+                manager.update_policy(
+                    m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
+                    step_count=global_episode, balls_snapshots=m_balls, wide_idxs=m_wide_idxs,
+                    wide_only=False, ppo_epochs=ppo_epochs,
+                )
+
+            global_episode += 1
+
+            if (global_episode) % 50 == 0:
+                recent      = ball_coverage_history[-50:]
+                recent_dist = avg_dist_history[-50:]
+                recent_rew  = avg_reward_history[-50:]
+                avg_entropy = sum(m_entropies).item() / len(m_entropies) if m_entropies else 0.0
+                num_pivots  = len(manager.pivotal_states)
+                max_entropy = math.log(num_pivots) if num_pivots > 1 else 1.0
+                print(f"  Ep {global_episode:>6}/{total_episodes} "
+                      f"[Ph{phase_idx+1} r={pretrain_r} lr={current_lr:.1e}] | "
+                      f"Coverage: {sum(recent)/len(recent)*100:.1f}% | "
+                      f"AvgDist: {sum(recent_dist)/len(recent_dist):.2f} | "
+                      f"AvgRew: {sum(recent_rew)/len(recent_rew):+.3f} | "
+                      f"Entropy: {avg_entropy:.3f}/{max_entropy:.3f} "
+                      f"({100*avg_entropy/max_entropy:.0f}%)")
+
+    final_cov  = sum(ball_coverage_history[-100:]) / min(100, len(ball_coverage_history)) * 100
+    final_dist = sum(avg_dist_history[-100:])      / min(100, len(avg_dist_history))
+    print(f"\nManager Wide Pre-training complete. "
+          f"Final coverage: {final_cov:.1f}% | AvgDist: {final_dist:.2f} (last 100 ep)")
+    plot_manager_wide_pretrain_diagnostics(ball_coverage_history, avg_reward_history, avg_dist_history)
+    return ball_coverage_history
+
+
+class NarrowReplayBuffer:
+    """PER buffer for narrow pretrain. Samples are i.i.d. (stateless MLP, no LSTM)."""
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha    = alpha
+        self._buf     = []
+        self._prios   = np.zeros(capacity, dtype=np.float32)
+        self._pos     = 0
+
+    def add(self, dx, dy, wide_goal, narrow_goal, reward):
+        p = (abs(reward) + 1e-6) ** self.alpha
+        if len(self._buf) < self.capacity:
+            self._buf.append((dx, dy, wide_goal, narrow_goal, reward))
+        else:
+            self._buf[self._pos] = (dx, dy, wide_goal, narrow_goal, reward)
+        self._prios[self._pos] = p
+        self._pos = (self._pos + 1) % self.capacity
+
+    def sample(self, batch_size, beta):
+        n       = len(self._buf)
+        prios   = self._prios[:n]
+        probs   = prios / prios.sum()
+        replace = n < batch_size
+        idxs    = np.random.choice(n, size=batch_size, replace=replace, p=probs)
+        weights = (n * probs[idxs]) ** (-beta)
+        weights /= weights.max()
+        return [self._buf[i] for i in idxs], weights.astype(np.float32)
+
+    def __len__(self):
+        return len(self._buf)
+
+
+def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
+    """
+    Intermediate phase: pre-train Manager narrow head on precise ball targeting.
+    No Worker, no traversal. Oracle wide_goal = closest pivotal state to a random ball,
+    guaranteeing a ball is reachable from the neighborhood. Narrow head learns to select
+    the neighborhood cell closest to the ball.
+    Reward: +2 on ball (dist=0), +0.1 adjacent (dist=1), -1 otherwise.
+    """
+    episodes       = config.get('manager_narrow_pretrain_episodes', 0)
+    horizons_per_ep = config.get('manager_narrow_horizons_per_episode', 20)
+    r              = config.get('neighborhood_size', 3)
+
+    env.phase = 2
+    env.fixed_ball_positions = None
+
+    # Restore Phase 1 maze first so valid_cells is computed from clean grid (no balls)
+    env.randomgen = False
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+
+    valid_cells = [
+        (x, y)
+        for x in range(1, env.width - 1)
+        for y in range(1, env.height - 1)
+        if env._is_traversable(env.grid.get(x, y))
+    ]
+    valid_set = set(valid_cells)
+    manager._valid_cells = valid_set
+
+    if valid_cells:
+        env.agent_start_pos = random.choice(valid_cells)
+    env.randomgen = True
+    env.firstgen = False
+    env.reset()
+
+    print(f"\n{'='*70}")
+    print(f"INTERMEDIATE PHASE: Manager Narrow Goal Pre-training")
+    print(f"  {episodes} episodes | {horizons_per_ep} horizons/ep | r={r}")
+    print(f"{'='*70}")
+
+    ppo_epochs = config.get('manager_narrow_ppo_epochs', 4)
+
+    use_per             = config.get('manager_narrow_use_per', False)
+    per_warmup          = config.get('manager_narrow_per_warmup', 1000)
+    per_replay_freq     = config.get('manager_narrow_per_replay_freq', 250)
+    per_buffer_size     = config.get('manager_narrow_per_buffer_size', 5000)
+    per_batch_size      = config.get('manager_narrow_per_batch_size', 32)
+    per_alpha           = config.get('manager_narrow_per_alpha', 0.6)
+    per_beta_start      = config.get('manager_narrow_per_beta_start', 0.4)
+    per_lr_factor       = config.get('manager_narrow_per_lr_factor', 0.1)
+    per_entropy_coef    = config.get('manager_narrow_per_entropy_coef', 0.05)
+    if use_per:
+        replay_buffer = NarrowReplayBuffer(per_buffer_size, alpha=per_alpha)
+
+    hit_history        = []   # fraction of horizons with narrow_goal on ball (dist=0)
+    near_history       = []   # fraction of horizons with dist<=1
     avg_reward_history = []
 
     for episode in range(episodes):
@@ -957,50 +1187,69 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
         env.agent_start_pos = spawn
         env.agent_start_dir = random.randint(0, 3)
         env.reset()
-        state = tuple(env.agent_pos)
 
-        active_balls = set(env.active_balls)
-        initial_ball_count = len(active_balls)
+        active_balls = list(env.active_balls)
+        if not active_balls:
+            hit_history.append(0.0)
+            near_history.append(0.0)
+            avg_reward_history.append(0.0)
+            continue
 
         manager.reset_manager_state()
 
         m_states, m_wide, m_narrow = [], [], []
-        m_rewards, m_values, m_log_probs, m_entropies = [], [], [], []
+        m_rewards, m_values, m_log_probs, m_entropies, m_balls = [], [], [], [], []
+        m_dx, m_dy = [], []
+        hits  = 0
+        nears = 0
 
         for h in range(horizons_per_ep):
-            if not active_balls:
-                break
+            # Oracle: random ball → closest pivotal state as wide_goal
+            target_ball = random.choice(active_balls)
+            wide_goal   = min(manager.pivotal_states,
+                              key=lambda p: manhattan_distance(p, target_ball))
+            state = wide_goal  # agent is at oracle wide_goal
 
-            # Wide-only: forward + sample wide head, skip narrow selection entirely
-            wide_logits, _, value = manager.forward(state, list(active_balls))
-            wide_probs = F.softmax(wide_logits, dim=0)
-            wide_dist = torch.distributions.Categorical(wide_probs)
-            wide_idx = wide_dist.sample()
-            log_prob = wide_dist.log_prob(wide_idx)
-            entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum().detach()
-            wide_goal = manager.pivotal_states[wide_idx.item()]
-            manager.prev_wide_goal = wide_goal
-            narrow_goal = wide_goal  # dummy, unused in reward
+            # Skip irresolvable samples: ball outside neighborhood → hit impossible
+            if manhattan_distance(wide_goal, target_ball) > r:
+                continue
+
+            # Value from LSTM (fresh per horizon — no accumulated sequence noise)
+            manager.hidden_state = None
+            _, _, value = manager.forward(state, active_balls)
             value = value.squeeze()
-            if manager.hidden_state is not None:
-                manager.hidden_state = tuple(hs.detach() for hs in manager.hidden_state)
 
-            neighborhood = {
-                (wide_goal[0] + dx, wide_goal[1] + dy)
-                for dx in range(-r, r + 1)
-                for dy in range(-r, r + 1)
-                if 0 < abs(dx) + abs(dy) <= r
-            }
+            # Narrow policy: purely geometric [dx, dy] relative to wide_goal
+            dx = float(target_ball[0] - wide_goal[0])
+            dy = float(target_ball[1] - wide_goal[1])
+            narrow_logits = manager.narrow_head(torch.tensor([dx, dy], dtype=torch.float32, device=device))
 
-            covered = [b for b in active_balls if b in neighborhood]
-            if covered:
-                closest = min(covered, key=lambda b: manhattan_distance(wide_goal, b))
-                dist_to_closest = manhattan_distance(wide_goal, closest)
-                reward = 1.0 + 2.0 * (r - dist_to_closest) / r  # +3 at center, +1 at edge
-                active_balls.discard(closest)
+            neighborhood  = manager.get_neighborhood(wide_goal, valid_cells=valid_set)
+            valid_indices = [i for i, cell in enumerate(neighborhood) if cell in valid_set]
+            if not valid_indices:
+                continue
+
+            idx_t        = torch.tensor(valid_indices, dtype=torch.long, device=device)
+            valid_logits = narrow_logits[idx_t]
+            valid_probs  = F.softmax(valid_logits, dim=0)
+            valid_dist   = torch.distributions.Categorical(valid_probs)
+            local_idx    = valid_dist.sample()
+            log_prob     = valid_dist.log_prob(local_idx)
+            entropy      = -(valid_probs * torch.log(valid_probs + 1e-8)).sum().detach()
+            narrow_goal  = neighborhood[valid_indices[local_idx.item()]]
+
+            dist_to_ball = manhattan_distance(narrow_goal, target_ball)
+            if dist_to_ball == 0:
+                reward = 3.0
+                hits  += 1
+                nears += 1
+            elif dist_to_ball == 1:
+                reward = 0.5
+                nears += 1
+            elif dist_to_ball == 2:
+                reward = -1.0
             else:
-                dist = min(manhattan_distance(wide_goal, b) for b in active_balls)
-                reward = -dist / maze_diagonal
+                reward = -3.0
 
             m_states.append(state)
             m_wide.append(wide_goal)
@@ -1008,34 +1257,81 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
             m_rewards.append(reward)
             m_values.append(value)
             m_log_probs.append(log_prob)
-            m_entropies.append(entropy.detach())
+            m_entropies.append(entropy)
+            m_balls.append(list(active_balls))
+            m_dx.append(dx)
+            m_dy.append(dy)
 
-            state = wide_goal  # teleport for next selection
+        total_h = max(1, len(m_rewards))
+        hit_history.append(hits  / total_h)
+        near_history.append(nears / total_h)
+        avg_reward_history.append(sum(m_rewards) / total_h)
 
-        covered_count = initial_ball_count - len(active_balls)
-        ball_coverage_history.append(covered_count / max(1, initial_ball_count))
-        avg_reward_history.append(sum(m_rewards) / len(m_rewards) if m_rewards else 0.0)
-
-        if m_rewards:
-            # Normalize rewards to reduce gradient variance from the reward gradient (+1..+3 vs -dist)
-            if len(m_rewards) > 1:
-                r_mean = sum(m_rewards) / len(m_rewards)
-                r_std = (sum((x - r_mean) ** 2 for x in m_rewards) / len(m_rewards)) ** 0.5
-                if r_std > 1e-8:
-                    m_rewards = [(x - r_mean) / r_std for x in m_rewards]
+        if len(m_rewards) > 1:
             manager.update_policy(
                 m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
-                step_count=episode, wide_only=True
+                step_count=episode, balls_snapshots=m_balls,
+                narrow_only=True, ppo_epochs=ppo_epochs,
             )
 
-        if (episode + 1) % 50 == 0:
-            recent = ball_coverage_history[-50:]
-            print(f"  Ep {episode+1:>5}/{episodes} | Ball coverage: {sum(recent)/len(recent)*100:.1f}%")
+        if use_per:
+            for dx_s, dy_s, wg_s, ng_s, rew_s in zip(m_dx, m_dy, m_wide, m_narrow, m_rewards):
+                replay_buffer.add(dx_s, dy_s, wg_s, ng_s, rew_s)
 
-    final_cov = sum(ball_coverage_history[-100:]) / min(100, len(ball_coverage_history)) * 100
-    print(f"\nManager Wide Pre-training complete. Final ball coverage (last 100 ep): {final_cov:.1f}%")
-    plot_manager_wide_pretrain_diagnostics(ball_coverage_history, avg_reward_history)
-    return ball_coverage_history
+            ep1 = episode + 1
+            if (ep1 >= per_warmup and (ep1 - per_warmup) % per_replay_freq == 0
+                    and len(replay_buffer) >= per_batch_size):
+                beta    = per_beta_start + (1.0 - per_beta_start) * min(1.0, ep1 / max(1, episodes))
+                n_steps = len(replay_buffer) // per_batch_size
+
+                # lower lr for replay only
+                for pg in manager.optimizer.param_groups:
+                    pg['_saved_lr'] = pg['lr']
+                    pg['lr']        = pg['lr'] * per_lr_factor
+
+                pbar = tqdm(range(n_steps), desc=f"[PER ep {ep1}]", leave=False)
+                for _ in pbar:
+                    samples, weights = replay_buffer.sample(per_batch_size, beta)
+                    log_probs_r, rw_weights, entropies_r = [], [], []
+                    for (dx_r, dy_r, wg_r, ng_r, rew_r), w in zip(samples, weights):
+                        nl = manager.narrow_head(torch.tensor([dx_r, dy_r], dtype=torch.float32, device=device))
+                        nb = manager.get_neighborhood(wg_r, valid_cells=valid_set)
+                        vi = [i for i, c in enumerate(nb) if c in valid_set]
+                        gi = nb.index(ng_r) if ng_r in nb else None
+                        li = vi.index(gi) if gi in vi else None
+                        if li is not None and vi:
+                            vp = F.softmax(nl[torch.tensor(vi, dtype=torch.long, device=device)], dim=0)
+                            log_probs_r.append(torch.log(vp[li] + 1e-8))
+                            rw_weights.append(float(w) * float(rew_r))
+                            entropies_r.append(-(vp * torch.log(vp + 1e-8)).sum())
+                    if log_probs_r:
+                        lp_t  = torch.stack(log_probs_r)
+                        rw_t  = torch.tensor(rw_weights, dtype=torch.float32, device=device)
+                        ent_t = torch.stack(entropies_r).mean()
+                        loss  = -(rw_t * lp_t).mean() - per_entropy_coef * ent_t
+                        manager.optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(manager.narrow_head.parameters(), max_norm=0.5)
+                        manager.optimizer.step()
+                        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'ent': f'{ent_t.item():.3f}'})
+
+                # restore lr
+                for pg in manager.optimizer.param_groups:
+                    pg['lr'] = pg['_saved_lr']
+
+        if (episode + 1) % 50 == 0:
+            recent_hit  = hit_history[-50:]
+            recent_near = near_history[-50:]
+            avg_entropy = sum(m_entropies).item() / len(m_entropies) if m_entropies else 0.0
+            print(f"  Ep {episode+1:>5}/{episodes} | "
+                  f"Hit(dist=0): {sum(recent_hit)/len(recent_hit)*100:.1f}% | "
+                  f"Near(dist≤1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
+                  f"Entropy: {avg_entropy:.3f}")
+
+    final_hit = sum(hit_history[-100:]) / min(100, len(hit_history)) * 100
+    print(f"\nManager Narrow Pre-training complete. Final hit rate (last 100 ep): {final_hit:.1f}%")
+    plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
+    return hit_history
 
 
 def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
@@ -1066,8 +1362,14 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     run_worker_pretrain(env, worker, grid_state, config, config['device'])
     worker.goal_norm_div = 1.0  # keep consistent with pretrain (raw cell deltas, no normalization)
 
-    if config.get('manager_wide_pretrain_episodes', 0) > 0:
+    _wide_ep = (sum(p['episodes'] for p in config['manager_wide_pretrain_phases'])
+                if config.get('curriculum_manager_pretrain', True)
+                else config.get('manager_wide_pretrain_episodes', 0))
+    if _wide_ep > 0:
         run_manager_wide_pretrain(env, manager, grid_state, config, config['device'])
+
+    if config.get('manager_narrow_pretrain_episodes', 0) > 0:
+        run_manager_narrow_pretrain(env, manager, grid_state, config, config['device'])
 
     # Pre-training phases modify env state — restore correct Phase 2 configuration
     env.agent_start_pos = agent_start
@@ -1339,6 +1641,69 @@ def run_manager_pretrain_standalone(
 
     run_manager_wide_pretrain(env, manager, grid_state, config, device)
 
+    if config.get('manager_narrow_pretrain_episodes', 0) > 0:
+        run_manager_narrow_pretrain(env, manager, grid_state, config, device)
+
+    if save_path:
+        torch.save({'manager': manager.state_dict()}, save_path)
+        print(f"Manager weights saved to {save_path}")
+
+    return manager
+
+
+def run_manager_wide_narrow_pretrain_standalone(
+        use_checkpoint=True,
+        checkpoint_path='phase1_checkpoint_MEDIUM.pt',
+        config_overrides=None,
+        save_path=None):
+    """Run Manager wide pretrain then narrow pretrain back to back."""
+    config = dict(externalconfig)
+    if config_overrides:
+        config.update(config_overrides)
+    resolve_device(config)
+    device = config['device']
+
+    if use_checkpoint:
+        pivotal_states, _, _, _, _, grid_state = load_phase1_checkpoint(checkpoint_path)
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.reset()
+        restore_maze_from_grid_state(env, grid_state)
+        env.reset()
+        print(f"Loaded maze + {len(pivotal_states)} pivotal states from: {checkpoint_path}")
+    else:
+        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
+                              max_steps=config['max_steps_per_episode'])
+        env.phase = 1
+        env.randomgen = True
+        env.reset()
+        grid_state = env.getGridState()
+        valid_cells = [
+            (x, y)
+            for x in range(1, env.width - 1)
+            for y in range(1, env.height - 1)
+            if env._is_traversable(env.grid.get(x, y))
+        ]
+        n = config.get('num_fake_pivotal_states', 30)
+        pivotal_states = random.sample(valid_cells, min(n, len(valid_cells)))
+        print(f"Fresh maze ({config['maze_size'].name}), {len(pivotal_states)} random pivotal states.")
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        action_verbose=False,
+        device=device,
+    )
+    manager.initialize_from_goal_policy(GoalConditionedPolicy(
+        lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=device))
+
+    run_manager_wide_pretrain(env, manager, grid_state, config, device)
+    run_manager_narrow_pretrain(env, manager, grid_state, config, device)
+
     if save_path:
         torch.save({'manager': manager.state_dict()}, save_path)
         print(f"Manager weights saved to {save_path}")
@@ -1351,7 +1716,7 @@ max_steps = 2000
 
 externalconfig = {
     # --- env ---
-    'maze_size':             EnvSizes.SMALL,
+    'maze_size':             EnvSizes.MEDIUM,
     'num_balls':             5,
     'max_steps_per_episode': max_steps,
     'device':                'cuda' if torch.cuda.is_available() else 'cpu',
@@ -1373,7 +1738,7 @@ externalconfig = {
     # --- phase 2 ---
     'phase2_episodes':          50,
     'manager_horizon':          10,
-    'neighborhood_size':        math.ceil(EnvSizes.SMALL.value / 8),
+    'neighborhood_size':        math.ceil(EnvSizes.MEDIUM.value / 8),
     'manager_lr':               5e-4,
     'worker_lr':                1e-4,
     'goal_timeout':             200,  # max steps on a goal before forcing replanning
@@ -1381,8 +1746,38 @@ externalconfig = {
     'narrow_goal_timeout':      50,   # steps in NARROW_GOAL without progress → back to FINDING
 
     # --- manager pretrain ---
-    'manager_wide_pretrain_episodes':    10000,  # 0 = skip
-    'manager_wide_horizons_per_episode': 20,
+    'manager_wide_horizons_per_episode':   20,
+    'manager_wide_ppo_epochs':             4,
+    'manager_narrow_pretrain_episodes':    5000,  # 0 = skip
+    'manager_narrow_horizons_per_episode': 20,
+    'manager_narrow_ppo_epochs':           1,
+    'manager_narrow_use_per':              False,
+    'manager_narrow_per_warmup':           1000,
+    'manager_narrow_per_replay_freq':      200,
+    'manager_narrow_per_buffer_size':      5000,
+    'manager_narrow_per_batch_size':       32,
+    'manager_narrow_per_alpha':            0.6,
+    'manager_narrow_per_beta_start':       0.4,
+    'manager_narrow_per_lr_factor':        0.2,
+    'manager_narrow_per_entropy_coef':     0.05,
+
+    # curriculum_manager_pretrain=True  → use phases below
+    # curriculum_manager_pretrain=False → single flat phase with manager_wide_pretrain_episodes
+    'curriculum_manager_pretrain':       False,
+    'manager_wide_pretrain_episodes':    100,  # used only when curriculum_manager_pretrain=False
+    'manager_wide_pretrain_r_offset':    2,      # r_offset for non-curriculum mode
+
+    # curriculum phases (r_offset added to neighborhood_size)
+    # each phase: {episodes, r_offset, lr_start_factor, lr_end_factor,
+    #              entropy_coef, entropy_warmup_eps, entropy_warmup_coef}
+    'manager_wide_pretrain_phases': [
+        {'episodes': 30000, 'r_offset': 2, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
+         'entropy_coef': 0.001, 'entropy_warmup_eps': 0,   'entropy_warmup_coef': 0.001},
+        {'episodes': 20000, 'r_offset': 1, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
+         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
+        {'episodes': 10000, 'r_offset': 0, 'lr_start_factor': 1.2, 'lr_end_factor': 0.1,
+         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
+    ],
 
     # --- PPO ---
     'ppo_epochs':   4,
@@ -1594,9 +1989,10 @@ def main():
     #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
     #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    #run_phase2_standalone('phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=True)
+    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=True, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=False)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
 
 if __name__ == "__main__":

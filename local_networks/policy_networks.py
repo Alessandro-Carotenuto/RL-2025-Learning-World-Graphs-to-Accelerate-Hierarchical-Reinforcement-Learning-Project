@@ -154,7 +154,7 @@ class GoalConditionedPolicy(nn.Module):
         # Scalar dir/3 makes dir=3 (1.0) and dir=0 (0.0) appear maximally different even though
         # they are 1 turn apart, causing gradient conflicts in learning turning behavior.
         state_norm = state / self.maze_size
-        goal_rel   = (goal - state) / self.maze_size
+        goal_rel   = (goal - state)
         dir_sin = torch.full((batch_size, 1), math.sin(agent_dir * math.pi / 2), dtype=torch.float32, device=self.device)
         dir_cos = torch.full((batch_size, 1), math.cos(agent_dir * math.pi / 2), dtype=torch.float32, device=self.device)
 

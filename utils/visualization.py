@@ -315,9 +315,9 @@ def plot_worker_pretrain_diagnostics(achievement_history, reward_history,
     plt.close(fig)
 
 
-def plot_manager_wide_pretrain_diagnostics(coverage_history, reward_history,
+def plot_manager_wide_pretrain_diagnostics(coverage_history, reward_history, dist_history=None,
                                            save_path='pretrain_manager_wide_diagnostics.png'):
-    """1×2: ball coverage (%) and avg reward per horizon over Manager Wide pre-training."""
+    """1×3: ball coverage (%), avg reward, avg dist to nearest ball over Manager Wide pre-training."""
     if not coverage_history:
         return
 
@@ -330,7 +330,8 @@ def plot_manager_wide_pretrain_diagnostics(coverage_history, reward_history,
     episodes = list(range(1, n + 1))
     ma_w = 20
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    ncols = 3 if dist_history else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4))
     fig.suptitle('Intermediate Phase: Manager Wide Goal Pre-training', fontsize=14, fontweight='bold')
 
     def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
@@ -354,9 +355,63 @@ def plot_manager_wide_pretrain_diagnostics(coverage_history, reward_history,
                  'orange', 'Reward', 'Avg Reward / Horizon',
                  'Avg Reward per Horizon\n(↑ = wide goals closer to balls)')
 
+    if dist_history:
+        plot_with_ma(axes[2], dist_history,
+                     'steelblue', 'AvgDist', 'Avg Manhattan Dist to Nearest Ball',
+                     'Avg Dist Wide Goal → Nearest Ball\n(↓ = Manager closer to balls)')
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     print(f"Manager Wide pre-training diagnostics saved to {save_path}")
+    plt.close(fig)
+
+
+def plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, reward_history,
+                                             save_path='pretrain_manager_narrow_diagnostics.png'):
+    """1×3: hit rate (dist=0), near rate (dist≤1), avg reward over Manager Narrow pre-training."""
+    if not hit_history:
+        return
+
+    def moving_average(data, window=20):
+        if len(data) < window:
+            return np.array([])
+        return np.convolve(data, np.ones(window) / window, mode='valid')
+
+    n        = len(hit_history)
+    episodes = list(range(1, n + 1))
+    ma_w     = 20
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    fig.suptitle('Intermediate Phase: Manager Narrow Goal Pre-training', fontsize=14, fontweight='bold')
+
+    def plot_with_ma(ax, data, color, label, ylabel, title, ylim=None):
+        ax.plot(episodes, data, color=color, linewidth=1.0, alpha=0.5, label=label)
+        ma = moving_average(data)
+        if len(ma) > 0:
+            ax.plot(range(ma_w, ma_w + len(ma)), ma, 'k-', linewidth=2, label=f'MA({ma_w})')
+        ax.set_title(title)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel(ylabel)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plot_with_ma(axes[0], [x * 100 for x in hit_history],
+                 'green', 'Hit rate', 'On Ball (%)',
+                 'Hit Rate (dist=0)\n(↑ = narrow goal on ball)', ylim=[0, 101])
+
+    plot_with_ma(axes[1], [x * 100 for x in near_history],
+                 'blue', 'Near rate', 'Within dist≤1 (%)',
+                 'Near Rate (dist≤1)\n(↑ = narrow goal adjacent to ball)', ylim=[0, 101])
+
+    plot_with_ma(axes[2], reward_history,
+                 'orange', 'Reward', 'Avg Reward / Horizon',
+                 'Avg Reward per Horizon\n(↑ = narrower goals closer to balls)')
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"Manager Narrow pre-training diagnostics saved to {save_path}")
     plt.close(fig)
 
 
