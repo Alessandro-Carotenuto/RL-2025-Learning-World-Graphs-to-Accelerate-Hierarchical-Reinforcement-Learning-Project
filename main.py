@@ -16,6 +16,7 @@ from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance, resolve_device, _walk_away_from_spawn
 from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state
+from utils.graph_manager import GraphManager
 from utils.visualization import (plot_training_diagnostics, save_graph_visualization,
                                   create_phase1_gif, render_phase2_episode_gif,
                                   _run_and_save_episode, print_grid_image, _plot_phase1_run,
@@ -33,7 +34,8 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                               walk_episodes: int = 4,
                               graph_walk_length: int = 20,
                               graph_num_attempts: int = 70,
-                              spread_alpha: float = 0.0):
+                              spread_alpha: float = 0.0,
+                              skip_graph_discovery: bool = False):
     """
     Main alternating training loop with persistent KL annealing.
     explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
@@ -192,9 +194,13 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"[Phase 1] Spawn {spawn} not in pivotal states — added (total: {len(pivotal_states)})")
 
     # Construct world graph
-    world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
-                                                         graph_walk_length=graph_walk_length,
-                                                         graph_num_attempts=graph_num_attempts)
+    if skip_graph_discovery:
+        world_graph = GraphManager()
+        print("[Phase 1] Graph discovery skipped — will rebuild after Worker pretrain.")
+    else:
+        world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
+                                                             graph_walk_length=graph_walk_length,
+                                                             graph_num_attempts=graph_num_attempts)
     
     # Final summary
     print(f"\nAlternating Training Complete!")
@@ -969,6 +975,70 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
     return goal_reached_history
 
 
+def discover_edges_with_worker(env, worker, pivotal_states, config, device):
+    """
+    Rebuild world graph edges using the pre-trained Worker for navigation.
+    Called after run_worker_pretrain so the Worker is already competent.
+    More reliable than Phase 1 GCP random walks.
+    """
+    graph_attempts  = config.get('worker_graph_attempts', 50)
+    graph_max_steps = config.get('worker_graph_max_steps', 100)
+
+    graph       = GraphManager()
+    for p in pivotal_states:
+        graph.add_node(tuple(p))
+    pivotal_set = set(tuple(p) for p in pivotal_states)
+    found_edges = {}  # (start, end) -> shortest path found so far
+
+    print(f"\n{'='*70}")
+    print(f"POST-PRETRAIN EDGE DISCOVERY (Worker) | {len(pivotal_states)} pivots | "
+          f"{graph_attempts} attempts/pivot | max {graph_max_steps} steps/attempt")
+
+    env.phase     = 1
+    env.randomgen = False
+
+    for start in pivotal_states:
+        candidates = [p for p in pivotal_states if p != start]
+        if not candidates:
+            continue
+        for _ in range(graph_attempts):
+            target = random.choice(candidates)
+            env.agent_start_pos = start
+            env.agent_start_dir = random.randint(0, 3)
+            env.reset()
+            state = tuple(env.agent_pos)
+            path  = [state]
+            worker.reset_worker_state()
+
+            for _ in range(graph_max_steps):
+                agent_dir = env.agent_dir
+                with torch.no_grad():
+                    action_logits, _ = worker.forward(state, agent_dir, target)
+                action = torch.argmax(F.softmax(action_logits, dim=0)).item()
+                try:
+                    _, _, terminated, truncated, _ = env.step(action)
+                    next_state = tuple(env.agent_pos)
+                except (AssertionError, IndexError):
+                    break
+                path.append(next_state)
+                if next_state in pivotal_set and next_state != tuple(start):
+                    key = (tuple(start), next_state)
+                    if key not in found_edges or len(path) < len(found_edges[key]):
+                        found_edges[key] = list(path)
+                state = next_state
+                if terminated or truncated:
+                    break
+
+    for (src, dst), path in found_edges.items():
+        graph.add_edge(src, dst, len(path) - 1, path)
+
+    avg_reach = (sum(len(graph.get_reachable_nodes(p)) for p in pivotal_states)
+                 / max(1, len(pivotal_states)))
+    print(f"  Edges found: {len(found_edges)} | Avg reachable: {avg_reach:.1f}/{len(pivotal_states)}")
+    print(f"{'='*70}")
+    return graph
+
+
 def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     """
     Intermediate phase: pre-train Manager wide head on ball-proximity goal selection.
@@ -1469,6 +1539,12 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     run_worker_pretrain(env, worker, grid_state, config, config['device'])
     worker.goal_norm_div = 1.0  # keep consistent with pretrain (raw cell deltas, no normalization)
 
+    if config.get('worker_edge_discovery', True):
+        world_graph = discover_edges_with_worker(
+            env, worker, pivotal_states, config, config['device'])
+        worker.world_graph     = world_graph
+        worker.pivotal_states  = set(tuple(p) for p in pivotal_states)
+
     _wide_ep = (sum(p['episodes'] for p in config['manager_wide_pretrain_phases'])
                 if config.get('curriculum_manager_pretrain', True)
                 else config.get('manager_wide_pretrain_episodes', 0))
@@ -1907,6 +1983,11 @@ externalconfig = {
     'f_steps_r1':   5,      'f_steps_r2':   10,     'f_steps_r3':   20,
     'substage_cap_r1': 5000, 'substage_cap_r2': 1000, 'substage_cap_r3': 1000,
 
+    # --- post-pretrain edge discovery ---
+    'worker_edge_discovery':   True,
+    'worker_graph_attempts':   50,   # attempts per pivot
+    'worker_graph_max_steps':  100,  # steps per attempt
+
     # --- worker pretrain PER ---
     'worker_per_use':            False,
     'worker_per_buffer_size':    500,
@@ -1957,7 +2038,8 @@ def train_full_phase1_phase2(
         walk_episodes=config.get('walk_episodes', 4),
         graph_walk_length=config.get('graph_walk_length', 20),
         graph_num_attempts=config.get('graph_num_attempts', 70),
-        spread_alpha=config.get('pivotal_spread_alpha', 0.0)
+        spread_alpha=config.get('pivotal_spread_alpha', 0.0),
+        skip_graph_discovery=config.get('worker_edge_discovery', True),
     )
     
     phase1_time = time.time() - start_time
