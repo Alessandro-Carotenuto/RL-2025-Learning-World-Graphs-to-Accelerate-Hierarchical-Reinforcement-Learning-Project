@@ -1101,12 +1101,12 @@ class NarrowReplayBuffer:
         self._prios   = np.zeros(capacity, dtype=np.float32)
         self._pos     = 0
 
-    def add(self, dx, dy, wide_goal, narrow_goal, reward):
+    def add(self, dx, dy, wide_goal, narrow_goal, reward, log_prob):
         p = (abs(reward) + 1e-6) ** self.alpha
         if len(self._buf) < self.capacity:
-            self._buf.append((dx, dy, wide_goal, narrow_goal, reward))
+            self._buf.append((dx, dy, wide_goal, narrow_goal, reward, log_prob))
         else:
-            self._buf[self._pos] = (dx, dy, wide_goal, narrow_goal, reward)
+            self._buf[self._pos] = (dx, dy, wide_goal, narrow_goal, reward, log_prob)
         self._prios[self._pos] = p
         self._pos = (self._pos + 1) % self.capacity
 
@@ -1166,6 +1166,10 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
 
     ppo_epochs = config.get('manager_narrow_ppo_epochs', 4)
 
+    entropy_start = config.get('manager_narrow_entropy_start', 0.3)
+    entropy_end   = config.get('manager_narrow_entropy_end', 0.001)
+    _original_entropy_coef = manager.entropy_coef
+
     use_per             = config.get('manager_narrow_use_per', False)
     per_warmup          = config.get('manager_narrow_per_warmup', 1000)
     per_replay_freq     = config.get('manager_narrow_per_replay_freq', 250)
@@ -1183,6 +1187,10 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     avg_reward_history = []
 
     for episode in range(episodes):
+        # Cosine entropy annealing: high → low to prevent early collapse
+        t = episode / max(1, episodes - 1)
+        manager.entropy_coef = entropy_end + 0.5 * (entropy_start - entropy_end) * (1 + math.cos(math.pi * t))
+
         spawn = random.choice(valid_cells)
         env.agent_start_pos = spawn
         env.agent_start_dir = random.randint(0, 3)
@@ -1275,8 +1283,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
             )
 
         if use_per:
-            for dx_s, dy_s, wg_s, ng_s, rew_s in zip(m_dx, m_dy, m_wide, m_narrow, m_rewards):
-                replay_buffer.add(dx_s, dy_s, wg_s, ng_s, rew_s)
+            for dx_s, dy_s, wg_s, ng_s, rew_s, lp_s in zip(m_dx, m_dy, m_wide, m_narrow, m_rewards, m_log_probs):
+                replay_buffer.add(dx_s, dy_s, wg_s, ng_s, rew_s, lp_s.item())
 
             ep1 = episode + 1
             if (ep1 >= per_warmup and (ep1 - per_warmup) % per_replay_freq == 0
@@ -1292,8 +1300,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                 pbar = tqdm(range(n_steps), desc=f"[PER ep {ep1}]", leave=False)
                 for _ in pbar:
                     samples, weights = replay_buffer.sample(per_batch_size, beta)
-                    log_probs_r, rw_weights, entropies_r = [], [], []
-                    for (dx_r, dy_r, wg_r, ng_r, rew_r), w in zip(samples, weights):
+                    new_lps, old_lps, advantages, entropies_r = [], [], [], []
+                    for (dx_r, dy_r, wg_r, ng_r, rew_r, old_lp_r), w in zip(samples, weights):
                         nl = manager.narrow_head(torch.tensor([dx_r, dy_r], dtype=torch.float32, device=device))
                         nb = manager.get_neighborhood(wg_r, valid_cells=valid_set)
                         vi = [i for i, c in enumerate(nb) if c in valid_set]
@@ -1301,14 +1309,19 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                         li = vi.index(gi) if gi in vi else None
                         if li is not None and vi:
                             vp = F.softmax(nl[torch.tensor(vi, dtype=torch.long, device=device)], dim=0)
-                            log_probs_r.append(torch.log(vp[li] + 1e-8))
-                            rw_weights.append(float(w) * float(rew_r))
+                            new_lps.append(torch.log(vp[li] + 1e-8))
+                            old_lps.append(float(old_lp_r))
+                            advantages.append(float(w) * float(rew_r))
                             entropies_r.append(-(vp * torch.log(vp + 1e-8)).sum())
-                    if log_probs_r:
-                        lp_t  = torch.stack(log_probs_r)
-                        rw_t  = torch.tensor(rw_weights, dtype=torch.float32, device=device)
-                        ent_t = torch.stack(entropies_r).mean()
-                        loss  = -(rw_t * lp_t).mean() - per_entropy_coef * ent_t
+                    if new_lps:
+                        new_lp_t = torch.stack(new_lps)
+                        old_lp_t = torch.tensor(old_lps, dtype=torch.float32, device=device)
+                        adv_t    = torch.tensor(advantages, dtype=torch.float32, device=device)
+                        ent_t    = torch.stack(entropies_r).mean()
+                        ratios   = torch.exp(new_lp_t - old_lp_t)
+                        surr1    = ratios * adv_t
+                        surr2    = ratios.clamp(1 - 0.2, 1 + 0.2) * adv_t
+                        loss     = -torch.min(surr1, surr2).mean() - per_entropy_coef * ent_t
                         manager.optimizer.zero_grad()
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(manager.narrow_head.parameters(), max_norm=0.5)
@@ -1327,6 +1340,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                   f"Hit(dist=0): {sum(recent_hit)/len(recent_hit)*100:.1f}% | "
                   f"Near(dist≤1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
                   f"Entropy: {avg_entropy:.3f}")
+
+    manager.entropy_coef = _original_entropy_coef
 
     final_hit = sum(hit_history[-100:]) / min(100, len(hit_history)) * 100
     print(f"\nManager Narrow Pre-training complete. Final hit rate (last 100 ep): {final_hit:.1f}%")
@@ -1752,20 +1767,22 @@ externalconfig = {
     'manager_narrow_pretrain_episodes':    5000,  # 0 = skip
     'manager_narrow_horizons_per_episode': 20,
     'manager_narrow_ppo_epochs':           1,
-    'manager_narrow_use_per':              False,
-    'manager_narrow_per_warmup':           1000,
-    'manager_narrow_per_replay_freq':      200,
+    'manager_narrow_use_per':              True,
+    'manager_narrow_per_warmup':           250,
+    'manager_narrow_per_replay_freq':      50,
     'manager_narrow_per_buffer_size':      5000,
     'manager_narrow_per_batch_size':       32,
     'manager_narrow_per_alpha':            0.6,
     'manager_narrow_per_beta_start':       0.4,
-    'manager_narrow_per_lr_factor':        0.2,
+    'manager_narrow_per_lr_factor':        1,
     'manager_narrow_per_entropy_coef':     0.05,
+    'manager_narrow_entropy_start':        0.3,   # entropy_coef at ep 0 (prevents early collapse)
+    'manager_narrow_entropy_end':          0.001, # entropy_coef at final ep
 
     # curriculum_manager_pretrain=True  → use phases below
     # curriculum_manager_pretrain=False → single flat phase with manager_wide_pretrain_episodes
     'curriculum_manager_pretrain':       False,
-    'manager_wide_pretrain_episodes':    100,  # used only when curriculum_manager_pretrain=False
+    'manager_wide_pretrain_episodes':    1,  # used only when curriculum_manager_pretrain=False
     'manager_wide_pretrain_r_offset':    2,      # r_offset for non-curriculum mode
 
     # curriculum phases (r_offset added to neighborhood_size)
@@ -1992,7 +2009,7 @@ def main():
     #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=True, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=False)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
 
