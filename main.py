@@ -710,6 +710,17 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
     clip_eps   = config.get('ppo_clip_eps', 0.2)
     gae_lambda = config.get('gae_lambda', 0.95)
 
+    use_per         = config.get('worker_per_use', False)
+    per_buffer_size = config.get('worker_per_buffer_size', 500)
+    per_warmup      = config.get('worker_per_warmup', 250)
+    per_replay_freq = config.get('worker_per_replay_freq', 250)
+    per_batch_eps   = config.get('worker_per_batch_episodes', 50)
+    per_alpha       = config.get('worker_per_alpha', 0.6)
+    per_beta_start  = config.get('worker_per_beta_start', 0.4)
+    per_lr_factor   = config.get('worker_per_lr_factor', 0.5)
+    if use_per:
+        per_replay_buffer = WorkerEpisodeReplayBuffer(per_buffer_size, alpha=per_alpha)
+
     for r, threshold, repeat, steps_seq, substage_cap in curriculum:
         # Reset Adam momentum accumulated from previous r-stage distribution
         worker.optimizer.state.clear()
@@ -718,6 +729,8 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
         base_lr           = worker.optimizer.param_groups[0]['lr']
         lr_ramp_ep        = 3 * eval_window   # 150 ep up → peak 1.5x, 150 ep down → base
         r_stage_ep = 0  # tracks episodes within this r-stage for entropy/LR decay
+        if use_per:
+            per_replay_buffer.clear()
 
         for max_steps in steps_seq:
             # Reset Adam momentum at every step-stage: when max_steps shrinks the return
@@ -873,6 +886,13 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
                     batch_dones_acc.extend(worker_dones)
                     episodes_in_batch += 1
 
+                if use_per and worker_rewards:
+                    per_replay_buffer.add(
+                        (worker_states, worker_actions, worker_rewards,
+                         worker_log_probs, worker_next_states, worker_dones),
+                        total_reward=sum(worker_rewards),
+                    )
+
                 if total_episode % 50 == 0:
                     recent     = goal_reached_history[-eval_window:]
                     recent_ach = sum(recent) / len(recent)
@@ -899,6 +919,42 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
                 # Fire PPO update when batch is full or we are about to advance stage
                 if (episodes_in_batch >= batch_eps or should_advance) and batch_states_acc:
                     _flush_batch()
+
+                if (use_per
+                        and r_stage_ep >= per_warmup
+                        and (r_stage_ep - per_warmup) % per_replay_freq == 0
+                        and len(per_replay_buffer) >= per_batch_eps):
+                    beta = per_beta_start + (1.0 - per_beta_start) * min(
+                        1.0, r_stage_ep / max(1, per_warmup + per_replay_freq * 10))
+                    rep_episodes, _ = per_replay_buffer.sample(per_batch_eps, beta)
+                    for pg in worker.optimizer.param_groups:
+                        pg['_saved_lr'] = pg['lr']
+                        pg['lr'] *= per_lr_factor
+                    rep_states, rep_actions, rep_rewards = [], [], []
+                    rep_log_probs, rep_next_states, rep_dones, rep_values = [], [], [], []
+                    with torch.no_grad():
+                        for ep_data in rep_episodes:
+                            s_list, a_list, r_list, lp_list, ns_list, d_list = ep_data
+                            for (s, ad, ng) in s_list:
+                                _, v = worker.forward(s, ad, ng)
+                                rep_values.append(v.squeeze())
+                            rep_states.extend(s_list)
+                            rep_actions.extend(a_list)
+                            rep_rewards.extend(r_list)
+                            rep_log_probs.extend(lp_list)
+                            rep_next_states.extend(ns_list)
+                            rep_dones.extend(d_list)
+                    if rep_rewards:
+                        worker.update_policy(
+                            rep_states, rep_actions, rep_rewards,
+                            rep_values, rep_log_probs,
+                            next_states=rep_next_states, dones=rep_dones,
+                            ppo_epochs=ppo_epochs, clip_eps=clip_eps, gae_lambda=gae_lambda,
+                        )
+                        print(f"    [PER] r_stage_ep={r_stage_ep} | "
+                              f"replayed {len(rep_episodes)} eps / {len(rep_rewards)} steps")
+                    for pg in worker.optimizer.param_groups:
+                        pg['lr'] = pg['_saved_lr']
 
                 if should_advance:
                     print(f"    -> Threshold met {repeat}x. Advancing.")
@@ -1119,6 +1175,42 @@ class NarrowReplayBuffer:
         weights = (n * probs[idxs]) ** (-beta)
         weights /= weights.max()
         return [self._buf[i] for i in idxs], weights.astype(np.float32)
+
+    def __len__(self):
+        return len(self._buf)
+
+
+class WorkerEpisodeReplayBuffer:
+    """PER buffer for Worker pretrain. Stores full episodes (GAE requires complete sequences)."""
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha    = alpha
+        self._buf     = []
+        self._prios   = np.zeros(capacity, dtype=np.float32)
+        self._pos     = 0
+
+    def add(self, episode, total_reward):
+        p = (max(total_reward, 0.0) + 1e-6) ** self.alpha
+        if len(self._buf) < self.capacity:
+            self._buf.append(episode)
+        else:
+            self._buf[self._pos] = episode
+        self._prios[self._pos] = p
+        self._pos = (self._pos + 1) % self.capacity
+
+    def sample(self, n, beta):
+        sz    = len(self._buf)
+        prios = self._prios[:sz]
+        probs = prios / prios.sum()
+        idxs  = np.random.choice(sz, size=n, replace=(sz < n), p=probs)
+        weights = (sz * probs[idxs]) ** (-beta)
+        weights /= weights.max()
+        return [self._buf[i] for i in idxs], weights.astype(np.float32)
+
+    def clear(self):
+        self._buf   = []
+        self._prios = np.zeros(self.capacity, dtype=np.float32)
+        self._pos   = 0
 
     def __len__(self):
         return len(self._buf)
@@ -1814,6 +1906,16 @@ externalconfig = {
     'dropby_r1':    5,      'dropby_r2':    20,     'dropby_r3':    40,
     'f_steps_r1':   5,      'f_steps_r2':   10,     'f_steps_r3':   20,
     'substage_cap_r1': 5000, 'substage_cap_r2': 1000, 'substage_cap_r3': 1000,
+
+    # --- worker pretrain PER ---
+    'worker_per_use':            False,
+    'worker_per_buffer_size':    500,
+    'worker_per_warmup':         250,
+    'worker_per_replay_freq':    250,
+    'worker_per_batch_episodes': 50,
+    'worker_per_alpha':          0.6,
+    'worker_per_beta_start':     0.4,
+    'worker_per_lr_factor':      0.5,
 }
 
 def train_full_phase1_phase2(
@@ -2006,10 +2108,10 @@ def main():
     """
     #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
-    #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=False)
     #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
 
