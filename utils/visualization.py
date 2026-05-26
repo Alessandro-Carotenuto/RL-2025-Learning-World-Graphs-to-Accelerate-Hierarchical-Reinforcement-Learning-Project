@@ -153,7 +153,7 @@ def plot_training_diagnostics(trainer, config, save_path=None):
 
     fig.tight_layout()
     if save_path is None:
-        save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase2_episodes']}.png"
+        save_path = f"diagnostics_size{config['maze_size'].name}_h{config['manager_horizon']}_n{config['neighborhood_size']}_ep{config['phase3_episodes']}.png"
     fig.savefig(save_path, dpi=150)
     print(f"\nDiagnostic plots saved to {save_path}")
     plt.close(fig)
@@ -467,11 +467,11 @@ def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_e
     print(f"Phase 1 evolution GIF saved to '{filename}' ({len(frames)} frames)")
 
 
-def render_phase2_episode_gif(checkpoint_path, filename='phase2_final_episode.mp4', fps=15, max_steps=500):
+def render_phase3_episode_gif(checkpoint_path, filename='phase3_final_episode.mp4', fps=15, max_steps=500):
     """
     Standalone: load checkpoint + session file, run one greedy episode, save as MP4.
     Call this after training from anywhere — no training objects needed.
-    Requires: checkpoint .pt  +  checkpoint _session.pt (saved automatically at end of Phase 2).
+    Requires: checkpoint .pt  +  checkpoint _session.pt (saved automatically at end of Phase 3).
     """
     pivotal_states, world_graph, policy, vae_system, config, grid_state = load_phase1_checkpoint(checkpoint_path)
 
@@ -693,4 +693,4 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     with imageio.get_writer(filename, fps=fps, format='ffmpeg') as writer:
         for frame in frames:
             writer.append_data(frame)
-    print(f"Phase 2 video saved to '{filename}' ({len(frames)} frames, {len(frames)/fps:.1f}s)")
+    print(f"Phase 3 video saved to '{filename}' ({len(frames)} frames, {len(frames)/fps:.1f}s)")

@@ -15,15 +15,16 @@ from utils.statistics_buffer import StatBuffer
 from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance, resolve_device, _walk_away_from_spawn
-from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state
+from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state, save_phase3_checkpoint, load_phase3_checkpoint
 from utils.graph_manager import GraphManager
 from utils.visualization import (plot_training_diagnostics, save_graph_visualization,
-                                  create_phase1_gif, render_phase2_episode_gif,
+                                  create_phase1_gif, render_phase3_episode_gif,
                                   _run_and_save_episode, print_grid_image, _plot_phase1_run,
                                   plot_worker_pretrain_diagnostics,
                                   plot_manager_wide_pretrain_diagnostics,
                                   plot_manager_narrow_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
+from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
 
 
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, convergence_threshold: float = 0.01,
@@ -106,7 +107,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         all_pivotal_states.append(pivotal_states.copy())
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
-        # Phase 2: Collect trajectories from pivotal states
+        # Step 2: Collect trajectories from pivotal states
         # Sort by distance from spawn descending — farthest states first — to break the
         # self-reinforcing clustering loop that keeps all pivotal states near spawn.
         COVERAGE_THRESHOLD = 50
@@ -187,7 +188,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                 break
     
 
-    # Ensure spawn point is a pivotal state so Phase 2 always starts on the graph
+    # Ensure spawn point is a pivotal state so Phase 3 always starts on the graph
     spawn = tuple(env.agent_start_pos)
     if spawn not in pivotal_states:
         pivotal_states.append(spawn)
@@ -892,7 +893,8 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
                 if use_per and worker_rewards:
                     per_replay_buffer.add(
                         (worker_states, worker_actions, worker_rewards,
-                         worker_log_probs, worker_next_states, worker_dones),
+                         [lp.detach() for lp in worker_log_probs],
+                         worker_next_states, worker_dones),
                         total_reward=sum(worker_rewards),
                     )
 
@@ -971,7 +973,6 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
                                      episode_length_history, training_metrics)
     return goal_reached_history
 
-
 def refine_edges_with_worker(env, worker, world_graph, pivotal_states, config, device):
     """
     Refine world graph edges using the pre-trained Worker for navigation.
@@ -1041,7 +1042,6 @@ def refine_edges_with_worker(env, worker, world_graph, pivotal_states, config, d
           f"Total: {len(world_graph.edges)} | Avg reachable: {avg_reach:.1f}/{len(pivotal_states)}")
     print(f"{'='*70}")
     return world_graph
-
 
 def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     """
@@ -1220,75 +1220,6 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
           f"Final coverage: {final_cov:.1f}% | AvgDist: {final_dist:.2f} (last 100 ep)")
     plot_manager_wide_pretrain_diagnostics(ball_coverage_history, avg_reward_history, avg_dist_history)
     return ball_coverage_history
-
-
-class NarrowReplayBuffer:
-    """PER buffer for narrow pretrain. Samples are i.i.d. (stateless MLP, no LSTM)."""
-    def __init__(self, capacity, alpha=0.6):
-        self.capacity = capacity
-        self.alpha    = alpha
-        self._buf     = []
-        self._prios   = np.zeros(capacity, dtype=np.float32)
-        self._pos     = 0
-
-    def add(self, dx, dy, wide_goal, narrow_goal, reward, log_prob):
-        p = (abs(reward) + 1e-6) ** self.alpha
-        if len(self._buf) < self.capacity:
-            self._buf.append((dx, dy, wide_goal, narrow_goal, reward, log_prob))
-        else:
-            self._buf[self._pos] = (dx, dy, wide_goal, narrow_goal, reward, log_prob)
-        self._prios[self._pos] = p
-        self._pos = (self._pos + 1) % self.capacity
-
-    def sample(self, batch_size, beta):
-        n       = len(self._buf)
-        prios   = self._prios[:n]
-        probs   = prios / prios.sum()
-        replace = n < batch_size
-        idxs    = np.random.choice(n, size=batch_size, replace=replace, p=probs)
-        weights = (n * probs[idxs]) ** (-beta)
-        weights /= weights.max()
-        return [self._buf[i] for i in idxs], weights.astype(np.float32)
-
-    def __len__(self):
-        return len(self._buf)
-
-
-class WorkerEpisodeReplayBuffer:
-    """PER buffer for Worker pretrain. Stores full episodes (GAE requires complete sequences)."""
-    def __init__(self, capacity, alpha=0.6):
-        self.capacity = capacity
-        self.alpha    = alpha
-        self._buf     = []
-        self._prios   = np.zeros(capacity, dtype=np.float32)
-        self._pos     = 0
-
-    def add(self, episode, total_reward):
-        p = (max(total_reward, 0.0) + 1e-6) ** self.alpha
-        if len(self._buf) < self.capacity:
-            self._buf.append(episode)
-        else:
-            self._buf[self._pos] = episode
-        self._prios[self._pos] = p
-        self._pos = (self._pos + 1) % self.capacity
-
-    def sample(self, n, beta):
-        sz    = len(self._buf)
-        prios = self._prios[:sz]
-        probs = prios / prios.sum()
-        idxs  = np.random.choice(sz, size=n, replace=(sz < n), p=probs)
-        weights = (sz * probs[idxs]) ** (-beta)
-        weights /= weights.max()
-        return [self._buf[i] for i in idxs], weights.astype(np.float32)
-
-    def clear(self):
-        self._buf   = []
-        self._prios = np.zeros(self.capacity, dtype=np.float32)
-        self._pos   = 0
-
-    def __len__(self):
-        return len(self._buf)
-
 
 def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     """
@@ -1514,10 +1445,9 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
     return hit_history
 
-
-def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
+def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
                          agent_start, first_balls, session_path, grid_state,
-                         phase2_animation=True):
+                         phase3_animation=True):
     
     manager = HierarchicalManager(
         pivotal_states,
@@ -1558,7 +1488,7 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     if config.get('manager_narrow_pretrain_episodes', 0) > 0:
         run_manager_narrow_pretrain(env, manager, grid_state, config, config['device'])
 
-    # Pre-training phases modify env state — restore correct Phase 2 configuration
+    # Pre-training phases modify env state — restore correct Phase 3 configuration
     env.agent_start_pos = agent_start
     env.agent_start_dir = 0
     env.phase = 2
@@ -1577,14 +1507,14 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         traversal_shaping_weight=config.get('traversal_shaping_weight', 2.0),
     )
 
-    print("\nPHASE 2: Hierarchical Training")
+    print("\nPHASE 3: Hierarchical Training")
     metrics = {
         'rewards': [], 'steps': [], 'manager_updates': [],
         'worker_updates': [], 'times': [],
     }
 
-    debug_interval = max(1, config['phase2_episodes'] // 20)
-    for episode in range(config['phase2_episodes']):
+    debug_interval = max(1, config['phase3_episodes'] // 20)
+    for episode in range(config['phase3_episodes']):
         ep_start = time.time()
         stats = trainer.train_episode(
             max_steps=config['max_steps_per_episode'],
@@ -1596,10 +1526,10 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
         metrics['worker_updates'].append(stats['worker_updates'])
         metrics['times'].append(time.time() - ep_start)
         if episode % debug_interval == 0 and episode > 0:
-            print(f"\n--- Episode {episode+1}/{config['phase2_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
+            print(f"\n--- Episode {episode+1}/{config['phase3_episodes']} | reward={stats['episode_reward']:.2f} | entropy={stats['manager_entropy']:.3f} | balls={stats['balls_collected']}/{trainer.env.total_balls} ---")
 
     print("\n" + "="*70)
-    print("PHASE 2 COMPLETE")
+    print("PHASE 3 COMPLETE")
     print("="*70)
     plot_training_diagnostics(trainer, config)
 
@@ -1612,23 +1542,23 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     }, session_path)
     print(f"Session updated with trained weights: '{session_path}'")
 
-    if phase2_animation:
+    if phase3_animation:
         for _ep_i in range(5):
             _run_and_save_episode(
                 manager, worker, config, grid_state, agent_start, first_balls,
-                f'phase2_final_episode_{_ep_i + 1}.mp4', fps=15, max_steps=500,
+                f'phase3_final_episode_{_ep_i + 1}.mp4', fps=15, max_steps=500,
                 world_graph=world_graph, pivotal_states=pivotal_states,
             )
 
     return metrics
 
-def run_phase2_standalone(
+def run_phase3_standalone(
         checkpoint_path='phase1_checkpoint.pt',
         config_overrides=None,
         fixed_balls=True,
-        phase2_animation=True):
+        phase3_animation=True):
     
-    """Run Phase 2 training using a saved Phase 1 checkpoint.
+    """Run Phase 3 training using a saved Phase 1 checkpoint.
     fixed_balls=True : same ball positions every episode (manager can learn spatial strategy)
     fixed_balls=False: random ball positions every episode
     """
@@ -1681,15 +1611,14 @@ def run_phase2_standalone(
         print("Ball positions: random each episode")
 
     session_path = checkpoint_path.replace('.pt', '_session.pt')
-    metrics = _run_phase2_training(
+    metrics = _run_phase3_training(
         config, pivotal_states, world_graph, policy, env,
-        agent_start, first_balls, session_path, grid_state, phase2_animation,
+        agent_start, first_balls, session_path, grid_state, phase3_animation,
     )
 
     print(f"Best reward: {max(metrics['rewards']):.2f}")
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:]) / 10:.2f}")
     return metrics
-
 
 def run_worker_pretrain_standalone(
         use_checkpoint=True,
@@ -1758,7 +1687,6 @@ def run_worker_pretrain_standalone(
         print(f"GCP weights saved to {save_path}")
 
     return policy
-
 
 def run_manager_pretrain_standalone(
         use_checkpoint=True,
@@ -1837,7 +1765,6 @@ def run_manager_pretrain_standalone(
         print(f"Manager weights saved to {save_path}")
 
     return manager
-
 
 def run_manager_wide_narrow_pretrain_standalone(
         use_checkpoint=True,
@@ -1924,7 +1851,7 @@ externalconfig = {
     'convergence_threshold': 0.01,
 
     # --- phase 2 ---
-    'phase2_episodes':          50,
+    'phase3_episodes':          50,
     'manager_horizon':          10,
     'neighborhood_size':        math.ceil(EnvSizes.MEDIUM.value / 8),
     'manager_lr':               5e-4,
@@ -2003,10 +1930,10 @@ externalconfig = {
     'worker_per_lr_factor':      0.5,
 }
 
-def train_full_phase1_phase2(
+def train_full_phase1_to_phase3(
         config=externalconfig,
         phase1_animation=True,
-        phase2_animation=True):
+        phase3_animation=True):
     
     """Complete training with comprehensive diagnostics."""
     # Hyperparameters setted up in externalconfig
@@ -2066,20 +1993,20 @@ def train_full_phase1_phase2(
 
     if len(pivotal_states) < 2:
         print(f"\nERROR: Phase 1 produced only {len(pivotal_states)} pivotal state(s). "
-              f"Phase 2 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
+              f"Phase 3 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
         return
 
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
 
     session_path = checkpoint_path.replace('.pt', '_session.pt')
-    metrics = _run_phase2_training(
+    metrics = _run_phase3_training(
         config, pivotal_states, world_graph, policy, env,
-        env.agent_start_pos, None, session_path, GRIDSTATE, phase2_animation,
+        env.agent_start_pos, None, session_path, GRIDSTATE, phase3_animation,
     )
 
     print(f"Phase 1 time: {phase1_time:.1f}s")
-    print(f"Phase 2 time: {sum(metrics['times']):.1f}s")
+    print(f"Phase 3 time: {sum(metrics['times']):.1f}s")
     print(f"Best reward: {max(metrics['rewards']):.2f}")
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:])/10:.2f}")
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
@@ -2192,14 +2119,14 @@ def main():
         'device': externalconfig['device'],
     })
     """
-    #train_full_phase1_phase2()       # Phase 1 + Phase 2 together (saves checkpoint automatically)
+    #train_full_phase1_to_phase3()       # Phase 1 + Phase 3 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
     run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
-    #run_phase2_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase2_animation=False)
-    #render_phase2_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase2_final_episode.mp4', fps=15, max_steps=500)
+    #run_phase3_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase3_animation=False)
+    #render_phase3_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase3_final_episode.mp4', fps=15, max_steps=500)
 
 if __name__ == "__main__":
     main()

@@ -68,8 +68,8 @@ def load_phase1_checkpoint(path):
     )
 
 
-def save_phase2_checkpoint(path, trainer, agent_start, ball_positions, phase1_checkpoint_path):
-    """Save Phase 2 training state for resumption."""
+def save_phase3_checkpoint(path, trainer, agent_start, ball_positions, phase1_checkpoint_path):
+    """Save Phase 3 training state for resumption."""
     torch.save({
         'manager_state_dict': trainer.manager.state_dict(),
         'worker_state_dict': trainer.worker.state_dict(),
@@ -81,11 +81,11 @@ def save_phase2_checkpoint(path, trainer, agent_start, ball_positions, phase1_ch
         'ball_positions': ball_positions,
         'phase1_checkpoint_path': str(phase1_checkpoint_path),
     }, path)
-    print(f"Phase 2 checkpoint saved to '{path}' (episode {trainer.global_episode_counter})")
+    print(f"Phase 3 checkpoint saved to '{path}' (episode {trainer.global_episode_counter})")
 
 
-def load_phase2_checkpoint(path, trainer):
-    """Load Phase 2 checkpoint into an already-constructed trainer. Returns (agent_start, ball_positions, phase1_checkpoint_path)."""
+def load_phase3_checkpoint(path, trainer):
+    """Load Phase 3 checkpoint into an already-constructed trainer. Returns (agent_start, ball_positions, phase1_checkpoint_path)."""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     trainer.manager.load_state_dict(ckpt['manager_state_dict'])
     trainer.worker.load_state_dict(ckpt['worker_state_dict'])
@@ -94,7 +94,7 @@ def load_phase2_checkpoint(path, trainer):
     trainer.global_episode_counter = ckpt['global_episode_counter']
     trainer.global_step_counter = ckpt['global_step_counter']
     trainer.diagnostic_history = ckpt['diagnostic_history']
-    print(f"Phase 2 checkpoint loaded from '{path}' (resuming from episode {trainer.global_episode_counter})")
+    print(f"Phase 3 checkpoint loaded from '{path}' (resuming from episode {trainer.global_episode_counter})")
     return ckpt['agent_start'], ckpt['ball_positions'], ckpt['phase1_checkpoint_path']
 
 

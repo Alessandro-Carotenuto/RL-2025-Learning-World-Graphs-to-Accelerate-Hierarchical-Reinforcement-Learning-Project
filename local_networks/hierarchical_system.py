@@ -487,7 +487,7 @@ class WorkerState(Enum):
 
 class HierarchicalWorker(nn.Module):
     """
-    Phase 2: Hierarchical Worker that executes Manager's goals.
+    Phase 3: Hierarchical Worker that executes Manager's goals.
     Paper: "Worker can leverage the graph to easily traverse to pivotal states"
     """
     
@@ -516,7 +516,7 @@ class HierarchicalWorker(nn.Module):
         self.world_graph = world_graph
         self.pivotal_states = set(pivotal_states)
 
-        # Phase 1 navigator — fine-tuned during Phase 2.
+        # Phase 1 navigator — fine-tuned during Phase 3.
         # Stored via object.__setattr__ to prevent PyTorch from registering it as a
         # submodule: otherwise self.parameters() would include GCP params, causing
         # double-counting in the optimizer and polluting worker.state_dict().
@@ -565,7 +565,7 @@ class HierarchicalWorker(nn.Module):
         self.entropy_coef = 0.05
         self.value_coef = 0.5
         # Goal-delta normalization divisor — kept at 1.0 (raw cell deltas) throughout pretrain
-        # and Phase 2.  GCP also uses raw deltas (aligned).  Default 1.0.
+        # and Phase 3.  GCP also uses raw deltas (aligned).  Default 1.0.
         self.goal_norm_div: float = 1.0
     
     def reset_worker_state(self):
@@ -964,7 +964,7 @@ class HierarchicalWorker(nn.Module):
         """
         Update Worker policy with PPO (when next_states provided) or MC A2C (fallback).
         PPO: GAE advantages + clipped surrogate + K epochs.
-        A2C fallback: MC returns, single epoch — used by Phase 2 HierarchicalTrainer.
+        A2C fallback: MC returns, single epoch — used by Phase 3 HierarchicalTrainer.
         """
         if len(rewards) == 0:
             return {}
@@ -1000,7 +1000,7 @@ class HierarchicalWorker(nn.Module):
             returns = advantages + values_t.detach()
             n_epochs = ppo_epochs
         else:
-            # MC fallback for Phase 2 (no next_states tracked)
+            # MC fallback for Phase 3 (no next_states tracked)
             mc = []
             R = 0.0
             for r in reversed(rewards):
