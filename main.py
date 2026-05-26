@@ -1426,11 +1426,12 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     print(f"Session updated with trained weights: '{session_path}'")
 
     if phase2_animation:
-        _run_and_save_episode(
-            manager, worker, config, grid_state, agent_start, first_balls,
-            'phase2_final_episode.mp4', fps=15, max_steps=500,
-            world_graph=world_graph, pivotal_states=pivotal_states,
-        )
+        for _ep_i in range(5):
+            _run_and_save_episode(
+                manager, worker, config, grid_state, agent_start, first_balls,
+                f'phase2_final_episode_{_ep_i + 1}.mp4', fps=15, max_steps=500,
+                world_graph=world_graph, pivotal_states=pivotal_states,
+            )
 
     return metrics
 

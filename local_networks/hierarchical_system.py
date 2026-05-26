@@ -550,6 +550,10 @@ class HierarchicalWorker(nn.Module):
         self.narrow_goal_hard_timeout: int = 60  # hard cap regardless of progress
         self._spinning_recovery: bool = False  # blocks priority override after spinning detection
         self._last_local_goal = None           # set each MLP step; None for traversal steps
+        self._finding_local_goal = None        # current local goal being chased in FINDING
+        self._finding_steps: int = 0           # steps spent chasing _finding_local_goal
+        self._finding_blacklist: set = set()   # pivots that timed out this goal period
+        self.finding_local_timeout: int = 30   # max steps per local goal in FINDING before skip
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -574,6 +578,9 @@ class HierarchicalWorker(nn.Module):
         self._narrow_goal_dist_ref = 0
         self._narrow_goal_total_steps = 0
         self._spinning_recovery = False
+        self._finding_local_goal = None
+        self._finding_steps = 0
+        self._finding_blacklist = set()
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -678,7 +685,7 @@ class HierarchicalWorker(nn.Module):
                 self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
             self._worker_state = WorkerState.NARROW_GOAL
 
-        elif self._worker_state == WorkerState.FINDING:
+        elif self._worker_state == WorkerState.FINDING and not self._spinning_recovery:
             # Arrived at a usable pivotal state — try to start graph traversal
             if state in self.pivotal_states and state != wide_goal:
                 path = self.plan_traversal(state, wide_goal)
@@ -761,10 +768,27 @@ class HierarchicalWorker(nn.Module):
                     self._narrow_goal_dist_ref = current_dist
 
         if self._worker_state == WorkerState.FINDING:
-            # Steer toward nearest pivotal state; exclude current pos to avoid self-loop
-            candidates = [p for p in self.pivotal_states if p != state]
+            # Steer toward nearest pivotal state; exclude current pos and timed-out pivots
+            candidates = [p for p in self.pivotal_states
+                          if p != state and p not in self._finding_blacklist]
             local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
                           if candidates else narrow_goal)
+            # Timer: if same target, tick; on timeout blacklist it and pick next
+            if local_goal == self._finding_local_goal:
+                self._finding_steps += 1
+                if self._finding_steps >= self.finding_local_timeout:
+                    if diag: print(f"  [WORKER] FINDING local timeout on {local_goal} → blacklist")
+                    self._finding_blacklist.add(local_goal)
+                    self._finding_steps = 0
+                    self._finding_local_goal = None
+                    candidates = [p for p in self.pivotal_states
+                                  if p != state and p not in self._finding_blacklist]
+                    local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
+                                  if candidates else narrow_goal)
+                    self._finding_local_goal = local_goal
+            else:
+                self._finding_local_goal = local_goal
+                self._finding_steps = 0
         else:   # NARROW_GOAL
             local_goal = narrow_goal
 
