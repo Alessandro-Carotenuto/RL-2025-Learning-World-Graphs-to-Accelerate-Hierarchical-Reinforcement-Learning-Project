@@ -504,29 +504,35 @@ class GoalConditionedPolicy(nn.Module):
    
     def complete_world_graph_discovery(self, env, pivotal_states: List[Tuple[int, int]],
                                        graph_walk_length: int = 20,
-                                       graph_num_attempts: int = 70) -> GraphManager:
+                                       graph_num_attempts: int = 70,
+                                       skip_gcp_refine: bool = False) -> GraphManager:
         """
         Complete Phase 1 by discovering edges and constructing world graph.
-        
+
         Args:
             env: Environment
             pivotal_states: Discovered pivotal states from VAE
-            
+            skip_gcp_refine: If True, skip GCP path refinement (Worker will refine later)
+
         Returns:
             GraphManager: Complete world graph
         """
         print("\n" + "="*60)
         print("COMPLETING WORLD GRAPH DISCOVERY (Phase 1)")
         print("="*60)
-        
+
         # Step 1: Discover edges through random walks
         raw_edges = self.discover_edges_between_pivotal_states(env, pivotal_states,
                                                                 max_walk_length=graph_walk_length,
                                                                 num_attempts=graph_num_attempts)
-        
-        # Step 2: Refine paths using goal-conditioned policy
-        refined_edges = self.refine_paths_with_goal_policy(env, raw_edges)
-        
+
+        # Step 2: Optionally refine paths using goal-conditioned policy
+        if skip_gcp_refine:
+            print("  [GCP refine skipped — Worker will refine after pretrain]")
+            refined_edges = {k: (v, len(v) - 1) for k, v in raw_edges.items()}
+        else:
+            refined_edges = self.refine_paths_with_goal_policy(env, raw_edges)
+
         # Step 3: Construct final world graph
         world_graph = self.construct_world_graph(pivotal_states, refined_edges)
         

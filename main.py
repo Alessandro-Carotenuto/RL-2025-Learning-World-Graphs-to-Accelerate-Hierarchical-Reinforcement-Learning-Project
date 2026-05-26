@@ -35,7 +35,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
                               graph_walk_length: int = 20,
                               graph_num_attempts: int = 70,
                               spread_alpha: float = 0.0,
-                              skip_graph_discovery: bool = False):
+                              skip_gcp_refine: bool = False):
     """
     Main alternating training loop with persistent KL annealing.
     explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
@@ -194,13 +194,10 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
         print(f"[Phase 1] Spawn {spawn} not in pivotal states — added (total: {len(pivotal_states)})")
 
     # Construct world graph
-    if skip_graph_discovery:
-        world_graph = GraphManager()
-        print("[Phase 1] Graph discovery skipped — will rebuild after Worker pretrain.")
-    else:
-        world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
-                                                             graph_walk_length=graph_walk_length,
-                                                             graph_num_attempts=graph_num_attempts)
+    world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
+                                                         graph_walk_length=graph_walk_length,
+                                                         graph_num_attempts=graph_num_attempts,
+                                                         skip_gcp_refine=skip_gcp_refine)
     
     # Final summary
     print(f"\nAlternating Training Complete!")
@@ -975,23 +972,20 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
     return goal_reached_history
 
 
-def discover_edges_with_worker(env, worker, pivotal_states, config, device):
+def refine_edges_with_worker(env, worker, world_graph, pivotal_states, config, device):
     """
-    Rebuild world graph edges using the pre-trained Worker for navigation.
-    Called after run_worker_pretrain so the Worker is already competent.
-    More reliable than Phase 1 GCP random walks.
+    Refine world graph edges using the pre-trained Worker for navigation.
+    Called after run_worker_pretrain. Adds new edges and replaces existing ones
+    with shorter paths found by the Worker (replaces GCP refine_paths_with_goal_policy).
     """
     graph_attempts  = config.get('worker_graph_attempts', 50)
     graph_max_steps = config.get('worker_graph_max_steps', 100)
 
-    graph       = GraphManager()
-    for p in pivotal_states:
-        graph.add_node(tuple(p))
     pivotal_set = set(tuple(p) for p in pivotal_states)
     found_edges = {}  # (start, end) -> shortest path found so far
 
     print(f"\n{'='*70}")
-    print(f"POST-PRETRAIN EDGE DISCOVERY (Worker) | {len(pivotal_states)} pivots | "
+    print(f"POST-PRETRAIN EDGE REFINE (Worker) | {len(pivotal_states)} pivots | "
           f"{graph_attempts} attempts/pivot | max {graph_max_steps} steps/attempt")
 
     env.phase     = 1
@@ -1029,14 +1023,24 @@ def discover_edges_with_worker(env, worker, pivotal_states, config, device):
                 if terminated or truncated:
                     break
 
+    edges_added   = 0
+    edges_improved = 0
     for (src, dst), path in found_edges.items():
-        graph.add_edge(src, dst, len(path) - 1, path)
+        new_weight = len(path) - 1
+        existing   = world_graph.edges.get((src, dst))
+        if existing is None:
+            world_graph.add_edge(src, dst, new_weight, path)
+            edges_added += 1
+        elif new_weight < existing['weight']:
+            world_graph.add_edge(src, dst, new_weight, path)
+            edges_improved += 1
 
-    avg_reach = (sum(len(graph.get_reachable_nodes(p)) for p in pivotal_states)
+    avg_reach = (sum(len(world_graph.get_reachable_nodes(p)) for p in pivotal_states)
                  / max(1, len(pivotal_states)))
-    print(f"  Edges found: {len(found_edges)} | Avg reachable: {avg_reach:.1f}/{len(pivotal_states)}")
+    print(f"  New edges: {edges_added} | Improved: {edges_improved} | "
+          f"Total: {len(world_graph.edges)} | Avg reachable: {avg_reach:.1f}/{len(pivotal_states)}")
     print(f"{'='*70}")
-    return graph
+    return world_graph
 
 
 def run_manager_wide_pretrain(env, manager, grid_state, config, device):
@@ -1539,11 +1543,11 @@ def _run_phase2_training(config, pivotal_states, world_graph, policy, env,
     run_worker_pretrain(env, worker, grid_state, config, config['device'])
     worker.goal_norm_div = 1.0  # keep consistent with pretrain (raw cell deltas, no normalization)
 
-    if config.get('worker_edge_discovery', True):
-        world_graph = discover_edges_with_worker(
-            env, worker, pivotal_states, config, config['device'])
-        worker.world_graph     = world_graph
-        worker.pivotal_states  = set(tuple(p) for p in pivotal_states)
+    if config.get('worker_edge_refine', True):
+        world_graph = refine_edges_with_worker(
+            env, worker, world_graph, pivotal_states, config, config['device'])
+        worker.world_graph    = world_graph
+        worker.pivotal_states = set(tuple(p) for p in pivotal_states)
 
     _wide_ep = (sum(p['episodes'] for p in config['manager_wide_pretrain_phases'])
                 if config.get('curriculum_manager_pretrain', True)
@@ -1983,8 +1987,8 @@ externalconfig = {
     'f_steps_r1':   5,      'f_steps_r2':   10,     'f_steps_r3':   20,
     'substage_cap_r1': 5000, 'substage_cap_r2': 1000, 'substage_cap_r3': 1000,
 
-    # --- post-pretrain edge discovery ---
-    'worker_edge_discovery':   True,
+    # --- post-pretrain Worker edge refining (replaces GCP refine_paths_with_goal_policy) ---
+    'worker_edge_refine':      True,
     'worker_graph_attempts':   50,   # attempts per pivot
     'worker_graph_max_steps':  100,  # steps per attempt
 
@@ -2039,7 +2043,7 @@ def train_full_phase1_phase2(
         graph_walk_length=config.get('graph_walk_length', 20),
         graph_num_attempts=config.get('graph_num_attempts', 70),
         spread_alpha=config.get('pivotal_spread_alpha', 0.0),
-        skip_graph_discovery=config.get('worker_edge_discovery', True),
+        skip_gcp_refine=config.get('worker_edge_refine', True),
     )
     
     phase1_time = time.time() - start_time
