@@ -434,39 +434,6 @@ def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
     print(f"Saved graph visualization to '{filename}'")
 
 
-def create_phase1_gif(all_pivotal_states_history, grid_state, filename='phase1_evolution.gif', fps=2):
-    """One frame per Phase 1 iteration — same style as the final graph visualization."""
-    if not all_pivotal_states_history:
-        print("No Phase 1 history to animate.")
-        return
-
-    frames = []
-    total = len(all_pivotal_states_history)
-
-    for iteration, pivotal_states in enumerate(all_pivotal_states_history):
-        temp_graph = GraphManager()
-        for ps in pivotal_states:
-            temp_graph.add_node(ps)
-
-        viz = GraphVisualizer(temp_graph, figsize=(10, 10))
-        fig, ax = viz.visualize(
-            show_weights=False,
-            show_labels=True,
-            node_size=250,
-            edge_width=1.5,
-            title=f'Phase 1 — Iteration {iteration + 1}/{total}  |  {len(pivotal_states)} pivotal states',
-            grid_state=grid_state,
-        )
-
-        fig.canvas.draw()
-        frame = np.array(fig.canvas.buffer_rgba())[..., :3]
-        frames.append(frame)
-        plt.close(fig)
-
-    imageio.mimsave(filename, frames, fps=fps)
-    print(f"Phase 1 evolution GIF saved to '{filename}' ({len(frames)} frames)")
-
-
 def render_phase3_episode_gif(checkpoint_path, filename='phase3_final_episode.mp4', fps=15, max_steps=500):
     """
     Standalone: load checkpoint + session file, run one greedy episode, save as MP4.

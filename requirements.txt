@@ -1,0 +1,17 @@
+# Core
+torch
+torchvision
+numpy
+
+# Environment
+minigrid
+gymnasium
+
+# Visualization
+matplotlib
+imageio
+imageio-ffmpeg
+Pillow
+
+# Utilities
+tqdm

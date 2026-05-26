@@ -18,195 +18,14 @@ from utils.misc import manhattan_distance, resolve_device, _walk_away_from_spawn
 from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state, save_phase3_checkpoint, load_phase3_checkpoint
 from utils.graph_manager import GraphManager
 from utils.visualization import (plot_training_diagnostics, save_graph_visualization,
-                                  create_phase1_gif, render_phase3_episode_gif,
+                                  render_phase3_episode_gif,
                                   _run_and_save_episode, print_grid_image, _plot_phase1_run,
                                   plot_worker_pretrain_diagnostics,
                                   plot_manager_wide_pretrain_diagnostics,
                                   plot_manager_narrow_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
-
-
-def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, convergence_threshold: float = 0.01,
-                              explore_top_fraction: float = 0.20,
-                              diversity_walk_number: int = 10,
-                              walk_length: int = 250,
-                              walk_bias: float = 0.65,
-                              walk_episodes: int = 4,
-                              graph_walk_length: int = 20,
-                              graph_num_attempts: int = 70,
-                              spread_alpha: float = 0.0,
-                              skip_gcp_refine: bool = False):
-    """
-    Main alternating training loop with persistent KL annealing.
-    explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
-                          used for trajectory collection once COVERAGE_THRESHOLD is reached.
-    diversity_walk_number: number of biased random walks per iteration for geographic diversity.
-    walk_length: steps per diversity walk.
-    walk_bias: probability of moving away from spawn at each walk step.
-    walk_episodes: episodes collected from each walk destination.
-    """
-    print("Starting Alternating Training Loop:")
-    print("=" * 50)
-
-    reconstruction_losses = []
-    all_pivotal_states = []
-    pivotal_states = []
-    metrics = {
-        'num_pivotal_states_per_iteration': [],
-        'policy_success_rates': [],
-    }
-
-    persistent_kl_weight = 1.0
-
-    # Compute spawn position once (it's fixed throughout Phase 1)
-    env.reset()
-    spawn_pos = tuple(env.agent_pos)
-    print(f"Spawn position: {spawn_pos}")
-
-    for iteration in range(max_iterations):
-        print(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
-        print(f"Current KL weight: {persistent_kl_weight:.3f}")
-        
-        # Collect initial data if needed
-        if buffer.episodes_in_buffer < 3:
-            print("Not enough episodes for VAE training, collecting initial data...")
-            for _ in range(5):
-                env.reset()
-                start_pos = tuple(env.agent_pos)
-                episodes = policy.collect_episodes_from_position(
-                    env, start_pos, num_episodes=6, max_episode_length=100, vae_system=vae_system
-                )
-                if episodes:
-                    buffer.add_episodes(episodes)
-            continue
-        
-        # Train VAE with persistent KL weight
-        print(f"First Half: Training VAE on {buffer.episodes_in_buffer} episodes...")
-        try:
-            pivotal_states = vae_system.train_vae(
-                buffer,
-                num_epochs=25,
-                batch_size=8,
-                initial_kl_weight=persistent_kl_weight,
-                annealing_rate=0.0,  # No annealing within iteration
-                spread_alpha=spread_alpha
-            )
-        except Exception as e:
-            print(f"VAE training failed: {e}")
-            continue
-        
-        # Track metrics
-        if vae_system.training_history:
-            current_loss = vae_system.training_history[-1]['reconstruction_loss']
-            reconstruction_losses.append(current_loss)
-            print(f"Current reconstruction loss: {current_loss:.4f}")
-        
-        metrics['num_pivotal_states_per_iteration'].append(len(pivotal_states))
-
-        all_pivotal_states.append(pivotal_states.copy())
-        print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
-        
-        # Step 2: Collect trajectories from pivotal states
-        # Sort by distance from spawn descending — farthest states first — to break the
-        # self-reinforcing clustering loop that keeps all pivotal states near spawn.
-        COVERAGE_THRESHOLD = 50
-        sorted_by_dist = sorted(pivotal_states, key=lambda s: manhattan_distance(s, spawn_pos), reverse=True)
-        if len(pivotal_states) < COVERAGE_THRESHOLD:
-            states_to_explore = sorted_by_dist
-            print(f"Second Half: Collecting from ALL {len(pivotal_states)} pivotal states sorted farthest-first from spawn {spawn_pos}...")
-        else:
-            top_n = max(1, int(len(pivotal_states) * explore_top_fraction))
-            states_to_explore = sorted_by_dist[:top_n]
-            pct = int(explore_top_fraction * 100)
-            print(f"Second Half: top {pct}% farthest from spawn ({top_n}/{len(pivotal_states)}) pivotal states...")
-
-        episodes_collected = 0
-        success_count = 0
-        for i, start_state in enumerate(states_to_explore):
-            print(f"  Collecting from pivotal state {i+1}/{len(states_to_explore)}: {start_state}")
-            
-            curiosity_weight = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
-            
-            try:
-                episodes = policy.collect_episodes_from_position(
-                    env, start_state,
-                    num_episodes=10,
-                    max_episode_length=100,
-                    vae_system=vae_system,
-                    curiosity_weight=curiosity_weight
-                )
-                
-                if episodes:
-                    buffer.add_episodes(episodes)
-                    episodes_collected += len(episodes)
-                    success_count += sum(1 for ep in episodes if ep.get('goal_reached', False))
-            except Exception as e:
-                print(f"  Failed to collect from {start_state}: {e}")
-                continue
-            
-        # Track success rate
-        if episodes_collected > 0:
-            success_rate = success_count / episodes_collected
-            metrics['policy_success_rates'].append(success_rate)
-        else:
-            metrics['policy_success_rates'].append(0.0)
-
-
-        print(f"  Collected {episodes_collected} new episodes")
-        print(f"  Total episodes in buffer: {buffer.episodes_in_buffer}")
-        
-        # Diversity collection: biased random walks away from spawn to break clustering.
-        # Each walk physically navigates to a distant region (no map knowledge used).
-        _cw = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
-        print(f"Spatial diversity: {diversity_walk_number} biased walks from spawn {spawn_pos}...")
-        for _wi in range(diversity_walk_number):
-            _dst = _walk_away_from_spawn(env, spawn_pos, walk_length=walk_length, bias=walk_bias)
-            dist_from_spawn = manhattan_distance(_dst, spawn_pos)
-            print(f"  Walk {_wi+1}: reached {_dst} (dist={dist_from_spawn})")
-            try:
-                _eps = policy.collect_episodes_from_position(
-                    env, _dst, num_episodes=walk_episodes, max_episode_length=100,
-                    vae_system=vae_system, curiosity_weight=_cw
-                )
-                if _eps:
-                    buffer.add_episodes(_eps)
-            except Exception as e:
-                print(f"  Walk {_wi+1} collection failed: {e}")
-
-        # Check for convergence (not before min_iterations to ensure coverage)
-        MIN_ITERATIONS = 5
-        if len(reconstruction_losses) >= 3 and iteration + 1 >= MIN_ITERATIONS:
-            recent_losses = reconstruction_losses[-3:]
-            loss_changes = [abs(recent_losses[i] - recent_losses[i-1]) for i in range(1, len(recent_losses))]
-            avg_change = sum(loss_changes) / len(loss_changes)
-
-            print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
-
-            if avg_change < convergence_threshold:
-                print("Reconstruction loss has plateaued - training converged!")
-                break
-    
-
-    # Ensure spawn point is a pivotal state so Phase 3 always starts on the graph
-    spawn = tuple(env.agent_start_pos)
-    if spawn not in pivotal_states:
-        pivotal_states.append(spawn)
-        print(f"[Phase 1] Spawn {spawn} not in pivotal states — added (total: {len(pivotal_states)})")
-
-    # Construct world graph
-    world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
-                                                         graph_walk_length=graph_walk_length,
-                                                         graph_num_attempts=graph_num_attempts,
-                                                         skip_gcp_refine=skip_gcp_refine)
-    
-    # Final summary
-    print(f"\nAlternating Training Complete!")
-    print(f"Total iterations: {len(reconstruction_losses)}")
-    print(f"Final episodes in buffer: {buffer.episodes_in_buffer}")
-    print(f"Final pivotal states ({len(pivotal_states)}): {pivotal_states}")
-    
-    return pivotal_states, world_graph, metrics, all_pivotal_states
+from config import externalconfig
 
 # DIAGNOSTIC FUNCTIONS ----------------------------------------------------
 
@@ -430,7 +249,7 @@ def test_phase1_with_diagnostics(config=None):
     buffer = StatBuffer()
     
     # Run alternating training (now with persistent KL)
-    pivotal_states, world_graph, loop_metrics, all_pivotal_states_history = alternating_training_loop(
+    pivotal_states, world_graph, loop_metrics = alternating_training_loop(
         env, policy, vae_system, buffer,
         max_iterations=config['phase1_iterations'],
         explore_top_fraction=config.get('explore_top_fraction', 0.20),
@@ -488,7 +307,6 @@ def test_phase1_with_diagnostics(config=None):
                      f'phase1_diagnostics_mu{config["vae_mu0"]:.1f}.png')
 
     save_graph_visualization(world_graph, pivotal_states, config['vae_mu0'], grid_state=GRIDSTATE)
-    create_phase1_gif(all_pivotal_states_history, GRIDSTATE)
 
     checkpoint_path = f"phase1_checkpoint_{config['maze_size'].name}.pt"
     save_phase1_checkpoint(checkpoint_path, pivotal_states, world_graph, policy, vae_system, config, GRIDSTATE)
@@ -518,7 +336,7 @@ def test_phase1_with_diagnostics(config=None):
 
 def analyze_phase1_metrics(results):
     """Extract key metrics and diagnose Phase 1 issues.
-    Expects results from test_phase1_with_diagnostics() — not from run_phase1_comparison()."""
+    Expects results from test_phase1_with_diagnostics() — not from run_phase1_mu0_sweep()."""
     
     metrics = results['metrics']
     graph_stats = results['graph_stats']
@@ -607,10 +425,10 @@ def analyze_phase1_metrics(results):
         'warnings': warnings
     }
 
-def compare_phase1_runs(runs_dict):
+def print_phase1_results_table(runs_dict):
     """Print a comparison table across multiple Phase 1 runs.
     Expects {name: results} where each results comes from test_phase1_with_diagnostics().
-    Do NOT pass the output of run_phase1_comparison() — it uses a different metrics structure."""
+    Do NOT pass the output of run_phase1_mu0_sweep() — it uses a different metrics structure."""
     
     print("\n" + "="*70)
     print("PHASE 1 COMPARISON")
@@ -633,6 +451,291 @@ def compare_phase1_runs(runs_dict):
         succ = m['policy_success_rate'][-1]*100 if m['policy_success_rate'] else 0
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
+
+# PHASE 1 ----------------------------------------------------------
+
+def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, convergence_threshold: float = 0.01,
+                              explore_top_fraction: float = 0.20,
+                              diversity_walk_number: int = 10,
+                              walk_length: int = 250,
+                              walk_bias: float = 0.65,
+                              walk_episodes: int = 4,
+                              graph_walk_length: int = 20,
+                              graph_num_attempts: int = 70,
+                              spread_alpha: float = 0.0,
+                              skip_gcp_refine: bool = False):
+    """
+    Main alternating training loop with persistent KL annealing.
+    explore_top_fraction: fraction of pivotal states (sorted farthest-from-spawn first)
+                          used for trajectory collection once COVERAGE_THRESHOLD is reached.
+    diversity_walk_number: number of biased random walks per iteration for geographic diversity.
+    walk_length: steps per diversity walk.
+    walk_bias: probability of moving away from spawn at each walk step.
+    walk_episodes: episodes collected from each walk destination.
+    """
+    print("Starting Alternating Training Loop:")
+    print("=" * 50)
+
+    reconstruction_losses = []
+
+    pivotal_states = []
+    metrics = {
+        'num_pivotal_states_per_iteration': [],
+        'policy_success_rates': [],
+    }
+
+    persistent_kl_weight = 1.0
+
+    # Compute spawn position once (it's fixed throughout Phase 1)
+    env.reset()
+    spawn_pos = tuple(env.agent_pos)
+    print(f"Spawn position: {spawn_pos}")
+
+    # Bootstrap buffer before the training loop so no iteration is wasted
+    if buffer.episodes_in_buffer < 3:
+        print("Bootstrapping buffer before training...")
+        for _ in range(5):
+            env.reset()
+            start_pos = tuple(env.agent_pos)
+            episodes = policy.collect_episodes_from_position(
+                env, start_pos, num_episodes=6, max_episode_length=100, vae_system=vae_system
+            )
+            if episodes:
+                buffer.add_episodes(episodes)
+
+
+    for iteration in range(max_iterations):
+        print(f"\n--- Iteration {iteration + 1}/{max_iterations} ---")
+        print(f"Current KL weight: {persistent_kl_weight:.3f}")
+
+        # Train VAE with persistent KL weight
+        print(f"First Half: Training VAE on {buffer.episodes_in_buffer} episodes...")
+        try:
+            pivotal_states = vae_system.train_vae(
+                buffer,
+                num_epochs=25,
+                batch_size=8,
+                initial_kl_weight=persistent_kl_weight,
+                annealing_rate=0.0,  # No annealing within iteration
+                spread_alpha=spread_alpha
+            )
+        except Exception as e:
+            print(f"VAE training failed: {e}")
+            continue
+        
+        # Track metrics
+        if vae_system.training_history:
+            current_recon_loss = vae_system.training_history[-1]['reconstruction_loss']
+            reconstruction_losses.append(current_recon_loss)
+            print(f"Current reconstruction loss: {current_recon_loss:.4f}")
+        
+        metrics['num_pivotal_states_per_iteration'].append(len(pivotal_states))
+
+        print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
+        
+        # Step 2: Collect trajectories from pivotal states
+        # Sort by distance from spawn descending — farthest states first — to break the
+        # self-reinforcing clustering loop that keeps all pivotal states near spawn.
+
+        coverage_threshold = 50
+        sorted_by_dist = sorted(pivotal_states, key=lambda s: manhattan_distance(s, spawn_pos), reverse=True)
+
+        if len(pivotal_states) < coverage_threshold:
+            states_to_explore = sorted_by_dist
+            print(f"Second Half: Collecting from ALL {len(pivotal_states)} pivotal states sorted farthest-first from spawn {spawn_pos}...")
+        else:
+            top_n = max(1, int(len(pivotal_states) * explore_top_fraction))
+            states_to_explore = sorted_by_dist[:top_n]
+            pct = int(explore_top_fraction * 100)
+            print(f"Second Half: top {pct}% farthest from spawn ({top_n}/{len(pivotal_states)}) pivotal states...")
+
+        episodes_collected = 0
+        success_count = 0
+        for i, start_state in enumerate(states_to_explore):
+            print(f"  Collecting from pivotal state {i+1}/{len(states_to_explore)}: {start_state}")
+            
+            #Curiosity Weight Scheduling
+            curiosity_weight = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
+            
+            try:
+                episodes = policy.collect_episodes_from_position(
+                    env, start_state,
+                    num_episodes=10,
+                    max_episode_length=100,
+                    vae_system=vae_system,
+                    curiosity_weight=curiosity_weight
+                )
+                
+                if episodes:
+                    buffer.add_episodes(episodes)
+                    episodes_collected += len(episodes)
+                    success_count += sum(1 for ep in episodes if ep.get('goal_reached', False))
+
+            except Exception as e:
+                print(f"  Failed to collect from {start_state}: {e}")
+                continue
+            
+        # Track success rate
+        if episodes_collected > 0:
+            success_rate = success_count / episodes_collected
+            metrics['policy_success_rates'].append(success_rate)
+        else:
+            metrics['policy_success_rates'].append(0.0)
+
+
+        print(f"  Collected {episodes_collected} new episodes")
+        print(f"  Total episodes in buffer: {buffer.episodes_in_buffer}")
+        
+        # Diversity collection: biased random walks away from spawn to break clustering.
+        # Each walk physically navigates to a distant region (no map knowledge used).
+        curiosity_weight_for_diversity_walk = 0.0 if iteration == 0 else max(0.15, 0.5 - (iteration * 0.05))
+        print(f"Spatial diversity: {diversity_walk_number} biased walks from spawn {spawn_pos}...")
+        for _wi in range(diversity_walk_number):
+            _dst = _walk_away_from_spawn(env, spawn_pos, walk_length=walk_length, bias=walk_bias)
+            dist_from_spawn = manhattan_distance(_dst, spawn_pos)
+            print(f"  Walk {_wi+1}: reached {_dst} (dist={dist_from_spawn})")
+            try:
+                _eps = policy.collect_episodes_from_position(
+                    env, _dst, num_episodes=walk_episodes, max_episode_length=100,
+                    vae_system=vae_system, curiosity_weight=curiosity_weight_for_diversity_walk
+                )
+                if _eps:
+                    buffer.add_episodes(_eps)
+            except Exception as e:
+                print(f"  Walk {_wi+1} collection failed: {e}")
+
+        # Check for convergence (not before min_iterations to ensure coverage)
+        min_iterations_before_convergence = 5
+        if len(reconstruction_losses) >= 3 and iteration + 1 >= min_iterations_before_convergence:
+            recent_losses = reconstruction_losses[-3:]
+            loss_changes = [abs(recent_losses[i] - recent_losses[i-1]) for i in range(1, len(recent_losses))]
+            avg_change = sum(loss_changes) / len(loss_changes)
+
+            print(f"Average loss change over last 3 iterations: {avg_change:.5f}")
+
+            if avg_change < convergence_threshold:
+                print("Reconstruction loss has plateaued - training converged!")
+                break
+    
+
+    # Ensure spawn point is a pivotal state so Phase 3 always starts on the graph
+    spawn = tuple(env.agent_start_pos)
+    if spawn not in pivotal_states:
+        pivotal_states.append(spawn)
+        print(f"[Phase 1] Spawn {spawn} not in pivotal states — added (total: {len(pivotal_states)})")
+
+    # Construct world graph
+    world_graph = policy.complete_world_graph_discovery(env, pivotal_states,
+                                                         graph_walk_length=graph_walk_length,
+                                                         graph_num_attempts=graph_num_attempts,
+                                                         skip_gcp_refine=skip_gcp_refine)
+    
+    # Final summary
+    print(f"\nAlternating Training Complete!")
+    print(f"Total iterations: {len(reconstruction_losses)}")
+    print(f"Final episodes in buffer: {buffer.episodes_in_buffer}")
+    print(f"Final pivotal states ({len(pivotal_states)}): {pivotal_states}")
+    
+    return pivotal_states, world_graph, metrics
+
+def run_phase1_mu0_sweep(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations=50):
+    """Run Phase 1 training on the same map with different mu0 values."""
+    if mu0_values is None:
+        mu0_values = [3.0, 6.0, 9.0]
+
+    device = resolve_device()
+
+    base_env = MinigridWrapper(size=maze_size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
+    base_env.phase = 1
+    base_env.randomgen = True
+    base_env.reset()
+    print_grid_image(base_env.getGridState(), name='base_map')
+    base_env.randomgen = False
+    base_env.firstgen = False
+
+    results = {}
+
+    for mu0 in mu0_values:
+        print(f"\n{'='*70}\nRunning Phase 1 with mu0={mu0}\n{'='*70}")
+
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
+        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=base_env.size, device=device)
+        buffer = StatBuffer()
+        base_env.phase = 1
+
+        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
+            base_env, policy, vae_system, buffer, max_iterations=iterations
+        )
+
+        final_loss = vae_system.training_history[-1]['total_loss']
+        results[mu0] = {
+            'pivotal_states': pivotal_states,
+            'world_graph': world_graph,
+            'metrics': metrics,
+            'final_loss': final_loss,
+        }
+
+        _plot_phase1_run(vae_system, metrics, mu0, f'mu0={mu0}', f'phase1_comparison_mu{mu0:.1f}.png')
+        save_graph_visualization(world_graph, pivotal_states, mu0)
+        print(f"Completed mu0={mu0} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
+
+    print(f"\n{'='*70}\nCOMPARISON SUMMARY\n{'='*70}")
+    print(f"{'mu0':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
+    print("-" * 70)
+    for mu0, res in results.items():
+        print(f"{mu0:<8.1f} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
+
+    return results
+
+def run_phase1_size_sweep(sizes=None, mu0=9.0, iterations=50):
+    """Run Phase 1 training on different environment sizes."""
+    if sizes is None:
+        sizes = [EnvSizes.SMALL, EnvSizes.MEDIUM]
+
+    device = resolve_device()
+
+    results = {}
+
+    for size in sizes:
+        print(f"\n{'='*70}\nRunning Phase 1 with size={size.name} (grid={size.value}x{size.value})\n{'='*70}")
+
+        env = MinigridWrapper(size=size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
+        env.phase = 1
+        env.randomgen = True
+        env.reset()
+        print_grid_image(env.getGridState(), name=f'map_{size.name}')
+
+        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
+        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=env.size, device=device)
+        buffer = StatBuffer()
+
+        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
+            env, policy, vae_system, buffer, max_iterations=iterations
+        )
+
+        final_loss = vae_system.training_history[-1]['total_loss']
+        results[size.name] = {
+            'pivotal_states': pivotal_states,
+            'world_graph': world_graph,
+            'metrics': metrics,
+            'final_loss': final_loss,
+            'grid_size': size.value,
+        }
+
+        _plot_phase1_run(vae_system, metrics, mu0, size.name, f'phase1_size_{size.name}.png')
+        save_graph_visualization(world_graph, pivotal_states, mu0)
+        print(f"Completed {size.name} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
+
+    print(f"\n{'='*70}\nSIZE COMPARISON SUMMARY (mu0={mu0})\n{'='*70}")
+    print(f"{'Size':<10} {'Grid':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
+    print("-" * 70)
+    for name, res in results.items():
+        g = res['grid_size']
+        print(f"{name:<10} {g}x{g:<6} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
+
+    return results
+
+# PHASE 2: PRETRAIN  ------------------------------------------------
 
 def run_worker_pretrain(env, worker, grid_state, config, device):
     """
@@ -1445,6 +1548,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
     return hit_history
 
+# PHASE 3: HIERARCHICAL TRAINING ----------------------------
+
 def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
                          agent_start, first_balls, session_path, grid_state,
                          phase3_animation=True):
@@ -1465,6 +1570,7 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
         goal_policy=policy,
         maze_size=config['maze_size'].value,
         neighborhood_size=config['neighborhood_size'],
+        narrow_goal_timeout=config.get('narrow_goal_timeout', 25),
         device=config['device'],
     )
     manager.initialize_from_goal_policy(policy)
@@ -1676,6 +1782,7 @@ def run_worker_pretrain_standalone(
         goal_policy=policy,
         maze_size=config['maze_size'].value,
         neighborhood_size=config.get('neighborhood_size', 3),
+        narrow_goal_timeout=config.get('narrow_goal_timeout', 25),
         device=device,
     )
     worker.initialize_from_goal_policy(policy)
@@ -1687,84 +1794,6 @@ def run_worker_pretrain_standalone(
         print(f"GCP weights saved to {save_path}")
 
     return policy
-
-def run_manager_pretrain_standalone(
-        use_checkpoint=True,
-        checkpoint_path='phase1_checkpoint_MEDIUM.pt',
-        config_overrides=None,
-        save_path=None):
-    """
-    Train the Manager Wide pre-training phase in isolation.
-
-    use_checkpoint=True : load maze layout + pivotal states from a Phase 1 checkpoint.
-    use_checkpoint=False: generate a fresh random maze and sample random valid cells as
-                          placeholder pivotal states — useful for testing the loop logic
-                          without running Phase 1.
-
-    No Worker, no traversal, no GCP needed.
-
-    Args:
-        use_checkpoint: whether to load maze + pivotal states from checkpoint_path.
-        checkpoint_path: Phase 1 .pt file (ignored when use_checkpoint=False).
-        config_overrides: dict of keys to override in externalconfig.
-        save_path: if given, saves manager state dict here after training.
-
-    Returns:
-        manager after pre-training.
-    """
-    config = dict(externalconfig)
-    if config_overrides:
-        config.update(config_overrides)
-    resolve_device(config)
-    device = config['device']
-
-    if use_checkpoint:
-        pivotal_states, _, _, _, _, grid_state = load_phase1_checkpoint(checkpoint_path)
-        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
-                              max_steps=config['max_steps_per_episode'])
-        env.reset()
-        restore_maze_from_grid_state(env, grid_state)
-        env.reset()
-        print(f"Loaded maze + {len(pivotal_states)} pivotal states from: {checkpoint_path}")
-    else:
-        env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL,
-                              max_steps=config['max_steps_per_episode'])
-        env.phase = 1
-        env.randomgen = True
-        env.reset()
-        grid_state = env.getGridState()
-        valid_cells = [
-            (x, y)
-            for x in range(1, env.width - 1)
-            for y in range(1, env.height - 1)
-            if env._is_traversable(env.grid.get(x, y))
-        ]
-        n = config.get('num_fake_pivotal_states', 30)
-        pivotal_states = random.sample(valid_cells, min(n, len(valid_cells)))
-        print(f"Fresh maze ({config['maze_size'].name}), {len(pivotal_states)} random pivotal states.")
-
-    manager = HierarchicalManager(
-        pivotal_states,
-        neighborhood_size=config['neighborhood_size'],
-        lr=config['manager_lr'],
-        horizon=config['manager_horizon'],
-        diagnostic_interval=config['diagnostic_interval'],
-        diagnostic_checkstart=config['diagnostic_checkstart'],
-        action_verbose=False,
-        device=device,
-    )
-    manager.initialize_from_goal_policy(GoalConditionedPolicy(lr=config['goal_policy_lr'], maze_size=config['maze_size'].value, device=device))
-
-    run_manager_wide_pretrain(env, manager, grid_state, config, device)
-
-    if config.get('manager_narrow_pretrain_episodes', 0) > 0:
-        run_manager_narrow_pretrain(env, manager, grid_state, config, device)
-
-    if save_path:
-        torch.save({'manager': manager.state_dict()}, save_path)
-        print(f"Manager weights saved to {save_path}")
-
-    return manager
 
 def run_manager_wide_narrow_pretrain_standalone(
         use_checkpoint=True,
@@ -1825,114 +1854,10 @@ def run_manager_wide_narrow_pretrain_standalone(
 
     return manager
 
-
 # ACTUAL TRAINING CODE ----------------------------------------------------
-max_steps = 2000
-
-externalconfig = {
-    # --- env ---
-    'maze_size':             EnvSizes.MEDIUM,
-    'num_balls':             5,
-    'max_steps_per_episode': max_steps,
-    'device':                'cuda' if torch.cuda.is_available() else 'cpu',
-
-    # --- phase 1 ---
-    'phase1_iterations':     3,
-    'goal_policy_lr':        5e-3,
-    'vae_mu0':               9.0,
-    'pivotal_spread_alpha':  0.02,
-    'explore_top_fraction':  0.20,
-    'diversity_walk_number': 30,
-    'walk_length':           400,
-    'walk_bias':             0.70,
-    'walk_episodes':         10,
-    'graph_walk_length':     50,
-    'graph_num_attempts':    150,
-    'convergence_threshold': 0.01,
-
-    # --- phase 2 ---
-    'phase3_episodes':          50,
-    'manager_horizon':          10,
-    'neighborhood_size':        math.ceil(EnvSizes.MEDIUM.value / 8),
-    'manager_lr':               5e-4,
-    'worker_lr':                1e-4,
-    'goal_timeout':             200,  # max steps on a goal before forcing replanning
-    'traversal_shaping_weight': 2.0,
-    'narrow_goal_timeout':      50,   # steps in NARROW_GOAL without progress → back to FINDING
-
-    # --- manager pretrain ---
-    'manager_wide_horizons_per_episode':   20,
-    'manager_wide_ppo_epochs':             4,
-    'manager_narrow_pretrain_episodes':    5000,  # 0 = skip
-    'manager_narrow_horizons_per_episode': 20,
-    'manager_narrow_ppo_epochs':           1,
-    'manager_narrow_use_per':              True,
-    'manager_narrow_per_warmup':           250,
-    'manager_narrow_per_replay_freq':      50,
-    'manager_narrow_per_buffer_size':      5000,
-    'manager_narrow_per_batch_size':       32,
-    'manager_narrow_per_alpha':            0.6,
-    'manager_narrow_per_beta_start':       0.4,
-    'manager_narrow_per_lr_factor':        1,
-    'manager_narrow_per_entropy_coef':     0.05,
-    'manager_narrow_entropy_start':        0.3,   # entropy_coef at ep 0 (prevents early collapse)
-    'manager_narrow_entropy_end':          0.001, # entropy_coef at final ep
-
-    # curriculum_manager_pretrain=True  → use phases below
-    # curriculum_manager_pretrain=False → single flat phase with manager_wide_pretrain_episodes
-    'curriculum_manager_pretrain':       False,
-    'manager_wide_pretrain_episodes':    1,  # used only when curriculum_manager_pretrain=False
-    'manager_wide_pretrain_r_offset':    2,      # r_offset for non-curriculum mode
-
-    # curriculum phases (r_offset added to neighborhood_size)
-    # each phase: {episodes, r_offset, lr_start_factor, lr_end_factor,
-    #              entropy_coef, entropy_warmup_eps, entropy_warmup_coef}
-    'manager_wide_pretrain_phases': [
-        {'episodes': 30000, 'r_offset': 2, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 0,   'entropy_warmup_coef': 0.001},
-        {'episodes': 20000, 'r_offset': 1, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
-        {'episodes': 10000, 'r_offset': 0, 'lr_start_factor': 1.2, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
-    ],
-
-    # --- PPO ---
-    'ppo_epochs':   4,
-    'ppo_clip_eps': 0.2,
-    'gae_lambda':   0.95,
-
-    # --- diagnostics ---
-    'diagnostic_interval':   100000,
-    'diagnostic_checkstart': False,
-    'full_breakdown_every':  10,
-
-    # --- worker pretrain curriculum ---
-    'threshold_r1': 0.95,  'threshold_r2': 0.85,  'threshold_r3': 0.85,
-    'repeat_r1':    3,      'repeat_r2':    2,      'repeat_r3':    2,
-    'i_steps_r1':   30,     'i_steps_r2':   80,     'i_steps_r3':   200,
-    'dropby_r1':    5,      'dropby_r2':    20,     'dropby_r3':    40,
-    'f_steps_r1':   5,      'f_steps_r2':   10,     'f_steps_r3':   20,
-    'substage_cap_r1': 5000, 'substage_cap_r2': 1000, 'substage_cap_r3': 1000,
-
-    # --- post-pretrain Worker edge refining (replaces GCP refine_paths_with_goal_policy) ---
-    'worker_edge_refine':      True,
-    'worker_graph_attempts':   50,   # attempts per pivot
-    'worker_graph_max_steps':  100,  # steps per attempt
-
-    # --- worker pretrain PER ---
-    'worker_per_use':            False,
-    'worker_per_buffer_size':    500,
-    'worker_per_warmup':         250,
-    'worker_per_replay_freq':    250,
-    'worker_per_batch_episodes': 50,
-    'worker_per_alpha':          0.6,
-    'worker_per_beta_start':     0.4,
-    'worker_per_lr_factor':      0.5,
-}
 
 def train_full_phase1_to_phase3(
         config=externalconfig,
-        phase1_animation=True,
         phase3_animation=True):
     
     """Complete training with comprehensive diagnostics."""
@@ -1959,7 +1884,7 @@ def train_full_phase1_to_phase3(
     print("\nPHASE 1: World Graph Discovery")
     start_time = time.time()
     
-    pivotal_states, world_graph, stat_buffer, all_pivotal_states = alternating_training_loop(
+    pivotal_states, world_graph, stat_buffer = alternating_training_loop(
         env, policy, vae_system, buffer, max_iterations=config['phase1_iterations'],
         convergence_threshold=config.get('convergence_threshold', 0.01),
         explore_top_fraction=config.get('explore_top_fraction', 0.20),
@@ -1988,9 +1913,6 @@ def train_full_phase1_to_phase3(
     GRIDSTATE=env.getGridState()
     save_graph_visualization(world_graph, pivotal_states, config['vae_mu0'], grid_state=GRIDSTATE)
 
-    if phase1_animation:
-        create_phase1_gif(all_pivotal_states, GRIDSTATE)
-
     if len(pivotal_states) < 2:
         print(f"\nERROR: Phase 1 produced only {len(pivotal_states)} pivotal state(s). "
               f"Phase 3 requires at least 2. Check VAE training — try increasing phase1_iterations or vae_mu0.")
@@ -2012,103 +1934,6 @@ def train_full_phase1_to_phase3(
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
     print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
 
-def run_phase1_comparison(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations=50):
-    """Run Phase 1 training on the same map with different mu0 values."""
-    if mu0_values is None:
-        mu0_values = [3.0, 6.0, 9.0]
-
-    device = resolve_device()
-
-    base_env = MinigridWrapper(size=maze_size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
-    base_env.phase = 1
-    base_env.randomgen = True
-    base_env.reset()
-    print_grid_image(base_env.getGridState(), name='base_map')
-    base_env.randomgen = False
-    base_env.firstgen = False
-
-    results = {}
-
-    for mu0 in mu0_values:
-        print(f"\n{'='*70}\nRunning Phase 1 with mu0={mu0}\n{'='*70}")
-
-        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
-        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=base_env.size, device=device)
-        buffer = StatBuffer()
-        base_env.phase = 1
-
-        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            base_env, policy, vae_system, buffer, max_iterations=iterations
-        )
-
-        final_loss = vae_system.training_history[-1]['total_loss']
-        results[mu0] = {
-            'pivotal_states': pivotal_states,
-            'world_graph': world_graph,
-            'metrics': metrics,
-            'final_loss': final_loss,
-        }
-
-        _plot_phase1_run(vae_system, metrics, mu0, f'mu0={mu0}', f'phase1_comparison_mu{mu0:.1f}.png')
-        save_graph_visualization(world_graph, pivotal_states, mu0)
-        print(f"Completed mu0={mu0} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
-
-    print(f"\n{'='*70}\nCOMPARISON SUMMARY\n{'='*70}")
-    print(f"{'mu0':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
-    print("-" * 70)
-    for mu0, res in results.items():
-        print(f"{mu0:<8.1f} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
-
-    return results
-
-def run_phase1_size_comparison(sizes=None, mu0=9.0, iterations=50):
-    """Run Phase 1 training on different environment sizes."""
-    if sizes is None:
-        sizes = [EnvSizes.SMALL, EnvSizes.MEDIUM]
-
-    device = resolve_device()
-
-    results = {}
-
-    for size in sizes:
-        print(f"\n{'='*70}\nRunning Phase 1 with size={size.name} (grid={size.value}x{size.value})\n{'='*70}")
-
-        env = MinigridWrapper(size=size, mode=EnvModes.MULTIGOAL, phase_one_eps=iterations * 10000)
-        env.phase = 1
-        env.randomgen = True
-        env.reset()
-        print_grid_image(env.getGridState(), name=f'map_{size.name}')
-
-        policy = GoalConditionedPolicy(lr=externalconfig['goal_policy_lr'], maze_size=externalconfig['maze_size'].value, device=device)
-        vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=env.size, device=device)
-        buffer = StatBuffer()
-
-        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
-            env, policy, vae_system, buffer, max_iterations=iterations
-        )
-
-        final_loss = vae_system.training_history[-1]['total_loss']
-        results[size.name] = {
-            'pivotal_states': pivotal_states,
-            'world_graph': world_graph,
-            'metrics': metrics,
-            'final_loss': final_loss,
-            'grid_size': size.value,
-        }
-
-        _plot_phase1_run(vae_system, metrics, mu0, size.name, f'phase1_size_{size.name}.png')
-        save_graph_visualization(world_graph, pivotal_states, mu0)
-        print(f"Completed {size.name} | pivotal states: {len(pivotal_states)} | edges: {len(world_graph.edges)}")
-
-    print(f"\n{'='*70}\nSIZE COMPARISON SUMMARY (mu0={mu0})\n{'='*70}")
-    print(f"{'Size':<10} {'Grid':<8} {'Pivotal':<10} {'Edges':<8} {'Final Loss':<12}")
-    print("-" * 70)
-    for name, res in results.items():
-        g = res['grid_size']
-        print(f"{name:<10} {g}x{g:<6} {len(res['pivotal_states']):<10} {len(res['world_graph'].edges):<8} {res['final_loss']:<12.4f}")
-
-    return results
-
 
 def main():
     """
@@ -2122,8 +1947,6 @@ def main():
     #train_full_phase1_to_phase3()       # Phase 1 + Phase 3 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
     run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    #run_manager_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_SMALL.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
-    #run_manager_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase3_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase3_animation=False)
     #render_phase3_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase3_final_episode.mp4', fps=15, max_steps=500)

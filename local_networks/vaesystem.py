@@ -622,12 +622,12 @@ class VAESystem(nn.Module):
     def train_vae(
         self,
         stat_buffer,
-        num_epochs: int = 100,
+        num_epochs: int = 25,
         batch_size: int = 8,
         convergence_threshold: float = 1e-4,
         patience: int = 10,
         initial_kl_weight: float = 1.0,
-        annealing_rate: float = 0.00, # <-- MODIFIED: Annealing rate
+        annealing_rate: float = 0.00,
         spread_alpha: float = 0.0
     ) -> List[Tuple]:
         """
@@ -651,7 +651,6 @@ class VAESystem(nn.Module):
         best_loss = float('inf')
         patience_counter = 0
 
-         # <-- MODIFIED: Initialize KL annealing schedule
         kl_weight = initial_kl_weight
         self.current_kl_weight = kl_weight  # Store for curiosity
 
@@ -684,7 +683,7 @@ class VAESystem(nn.Module):
 
 
             # Print progress
-            if epoch % 1 == 0:
+            if epoch % 5 == 0:
                 n_eps = len(all_trajectories)
                 avg_loss_per_ep = avg_losses['total_loss'] / max(n_eps, 1)
                 print(f"Epoch {epoch:3d}: Loss={avg_losses['total_loss']:.1f} ({avg_loss_per_ep:.3f}/ep), "

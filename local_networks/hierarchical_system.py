@@ -499,6 +499,7 @@ class HierarchicalWorker(nn.Module):
                  goal_policy=None,
                  maze_size: int = 24,
                  neighborhood_size: int = 3,
+                 narrow_goal_timeout: int = 25,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -546,7 +547,7 @@ class HierarchicalWorker(nn.Module):
         self._narrow_goal_steps: int = 0        # steps spent in NARROW_GOAL since entry / last slide
         self._narrow_goal_dist_ref: int = 0    # distance to narrow_goal at last window start
         self._narrow_goal_total_steps: int = 0 # total steps in current NARROW_GOAL stint
-        self.narrow_goal_timeout: int = 25     # no-progress window → back to FINDING
+        self.narrow_goal_timeout: int = narrow_goal_timeout
         self.narrow_goal_hard_timeout: int = 60  # hard cap regardless of progress
         self._spinning_recovery: bool = False  # blocks priority override after spinning detection
         self._last_local_goal = None           # set each MLP step; None for traversal steps
