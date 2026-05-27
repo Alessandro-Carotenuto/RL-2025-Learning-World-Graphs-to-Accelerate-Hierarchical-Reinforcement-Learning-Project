@@ -11,7 +11,7 @@ import numpy as np
 # PROJECT-SPECIFIC IMPORTS
 from local_distributions.hardkuma import HardKumaraswamy, BetaDistribution
 
-diagvae=False
+
 
 class PriorNetwork(nn.Module):
     """
@@ -229,7 +229,8 @@ class VAESystem(nn.Module):
         super().__init__()  # Initialize nn.Module
         
         self.current_kl_weight = 1.0
-        
+        self.diag_vae = False
+
         self.device = device
         self.mu0 = mu0
         self.state_dim = state_dim
@@ -282,40 +283,29 @@ class VAESystem(nn.Module):
             raise ValueError("encode_trajectories received no non-empty trajectories")
         batch_states = []
         batch_actions = []
-        batch_discrete_actions = []
 
         for trajectory in trajectories:
             states = [state for state, action in trajectory]
             actions = [action for state, action in trajectory]
-            
-            state_tensor = torch.tensor(states, dtype=torch.float32)
-            action_tensor = torch.tensor(actions, dtype=torch.long)
-            
-            batch_states.append(state_tensor)
-            batch_actions.append(action_tensor)
-            batch_discrete_actions.append(action_tensor)  # ← Store discrete actions
-        
-        # Pad sequences
-        max_len = max(len(states) for states in batch_states)
-        
+            batch_states.append(torch.tensor(states, dtype=torch.float32))
+            batch_actions.append(torch.tensor(actions, dtype=torch.long))
+
+        max_len = max(len(s) for s in batch_states)
+
         padded_states = torch.zeros(len(trajectories), max_len, 2)
         padded_actions = torch.zeros(len(trajectories), max_len, dtype=torch.long)
-        padded_discrete = torch.zeros(len(trajectories), max_len, dtype=torch.long)  # ← Add
         seq_lengths = []
-        
-        for i, (states, actions, discrete) in enumerate(zip(batch_states, batch_actions, batch_discrete_actions)):
+
+        for i, (states, actions) in enumerate(zip(batch_states, batch_actions)):
             seq_len = len(states)
             padded_states[i, :seq_len] = states
             padded_actions[i, :seq_len] = actions
-            padded_discrete[i, :seq_len] = discrete  # ← Pad discrete actions
             seq_lengths.append(seq_len)
-        
+
         encoded_states = self.state_encoder(padded_states.to(self.device))
         encoded_actions = self.action_encoder(padded_actions.to(self.device))
-        
 
-        return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_discrete.to(self.device)
-        #                                                                    ↑ Return discrete actions
+        return encoded_states, encoded_actions, torch.tensor(seq_lengths), padded_actions.to(self.device)
     
     def compute_elbo_loss(self, states, actions, seq_lengths, original_discrete_actions, kl_weight):
         """
@@ -418,7 +408,7 @@ class VAESystem(nn.Module):
         l0_loss = torch.pow(expected_l0 - target_l0, 2)
 
         # Optional diagnostics
-        if torch.rand(1) < 0.01 and diagvae==True:
+        if torch.rand(1) < 0.01 and self.diag_vae:
             # diagnostics on distributions
             print(f"  α_post std: {alpha_posterior.std():.4f}")
             print(f"  α_prior std: {alpha_prior.std():.4f}")
@@ -498,20 +488,12 @@ class VAESystem(nn.Module):
         loss_dict['total_loss'].backward()  # Compute gradients for everything
 
         total_grad = sum(p.grad.norm().item() for p in self.prior_net.parameters() if p.grad is not None)
-        if diagvae==True:
+        if self.diag_vae:
             print(f"  Prior grad norm: {total_grad:.4f}")
         
         # ============================================================
         # STEP 1: VAE update (minimize)
         # ============================================================
-        vae_params = (
-            list(self.state_encoder.parameters()) + 
-            list(self.action_encoder.parameters()) +
-            list(self.prior_net.parameters()) +
-            list(self.inference_net.parameters()) +
-            list(self.generation_net.parameters())
-        )
-
         torch.nn.utils.clip_grad_norm_(self.prior_net.parameters(), max_norm=5.0) # Clip prior gradients separately
         
         # Clip OTHER networks to 1.0 (excluding prior)
@@ -575,9 +557,8 @@ class VAESystem(nn.Module):
                 
                 # Extract original coordinates and their importance scores
                 original_states = [state for state, action in trajectory]
-                seq_len = len(original_states)
-                
-                for i, (x, y) in enumerate(original_states[:seq_len]):
+
+                for i, (x, y) in enumerate(original_states):
                     coord = (x, y)
                     importance = prior_means[0, i].item()
                     

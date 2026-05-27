@@ -663,7 +663,7 @@ def run_phase1_mu0_sweep(mu0_values=None, maze_size=EnvSizes.MEDIUM, iterations=
         buffer = StatBuffer()
         base_env.phase = 1
 
-        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
+        pivotal_states, world_graph, metrics = alternating_training_loop(
             base_env, policy, vae_system, buffer, max_iterations=iterations
         )
 
@@ -709,7 +709,7 @@ def run_phase1_size_sweep(sizes=None, mu0=9.0, iterations=50):
         vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=mu0, grid_size=env.size, device=device)
         buffer = StatBuffer()
 
-        pivotal_states, world_graph, metrics, _ = alternating_training_loop(
+        pivotal_states, world_graph, metrics = alternating_training_loop(
             env, policy, vae_system, buffer, max_iterations=iterations
         )
 
@@ -1586,7 +1586,7 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
         worker.pivotal_states = set(tuple(p) for p in pivotal_states)
 
     _wide_ep = (sum(p['episodes'] for p in config['manager_wide_pretrain_phases'])
-                if config.get('curriculum_manager_pretrain', True)
+                if config.get('curriculum_manager_pretrain', False)
                 else config.get('manager_wide_pretrain_episodes', 0))
     if _wide_ep > 0:
         run_manager_wide_pretrain(env, manager, grid_state, config, config['device'])
@@ -1672,9 +1672,9 @@ def run_phase3_standalone(
 
     if config_overrides:
         config.update(config_overrides)
-        resolve_device(config)
-        vae_system.to(config['device'])
-        policy.to(config['device'])
+    resolve_device(config)
+    vae_system.to(config['device'])
+    policy.to(config['device'])
 
     env = MinigridWrapper(size=config['maze_size'], mode=EnvModes.MULTIGOAL, max_steps=config['max_steps_per_episode'])
     env.reset()
