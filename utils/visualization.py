@@ -10,6 +10,11 @@ from wrappers.minigrid_wrapper import MinigridWrapper, EnvModes
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, WorkerState
 
 
+
+#----------------------------------------------------------------------------#
+#                            GRID UTILITIES                                  #
+#----------------------------------------------------------------------------#
+
 def print_grid_image(grid_text, name=''):
     fig, ax = plt.subplots(figsize=(len(grid_text[0]), len(grid_text)))
     ax.set_xlim(0, len(grid_text[0]))
@@ -26,6 +31,11 @@ def print_grid_image(grid_text, name=''):
     fig.savefig(f'grid{name}.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
+
+
+#----------------------------------------------------------------------------#
+#                           DIAGNOSTIC PLOTS                                 #
+#----------------------------------------------------------------------------#
 
 def _plot_phase1_run(vae_system, metrics, mu0, title_prefix, save_path):
     history = vae_system.training_history
@@ -415,6 +425,11 @@ def plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, reward_h
     plt.close(fig)
 
 
+
+#----------------------------------------------------------------------------#
+#                          GRAPH VISUALIZATION                               #
+#----------------------------------------------------------------------------#
+
 def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
     if not pivotal_states or world_graph is None or not world_graph.nodes:
         print("Skipping graph visualization: no pivotal states or empty graph.")
@@ -433,6 +448,11 @@ def save_graph_visualization(world_graph, pivotal_states, mu0, grid_state=None):
     plt.close(fig)
     print(f"Saved graph visualization to '{filename}'")
 
+
+
+#----------------------------------------------------------------------------#
+#                          EPISODE RENDERING                                 #
+#----------------------------------------------------------------------------#
 
 def render_phase3_episode_gif(checkpoint_path, filename='phase3_final_episode.mp4', fps=15, max_steps=500):
     """

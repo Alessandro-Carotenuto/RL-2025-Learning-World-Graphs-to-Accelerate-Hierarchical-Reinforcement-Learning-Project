@@ -11,7 +11,9 @@ from typing import List, Tuple, Dict
 from utils.misc import manhattan_distance,sample_goal_position
 from utils.graph_manager import GraphManager
 
-#-----------------------------------------------------------------------------
+#----------------------------------------------------------------------------#
+#                        GOAL-CONDITIONED POLICY                             #
+#----------------------------------------------------------------------------#
 
 class GoalConditionedPolicy(nn.Module):
     """

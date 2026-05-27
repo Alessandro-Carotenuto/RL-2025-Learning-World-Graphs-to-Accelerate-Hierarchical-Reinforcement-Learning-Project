@@ -27,7 +27,9 @@ from local_networks.hierarchical_system import HierarchicalManager, Hierarchical
 from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
 from config import externalconfig
 
-# DIAGNOSTIC FUNCTIONS ----------------------------------------------------
+#----------------------------------------------------------------------------#
+#                          DIAGNOSTIC FUNCTIONS                              #
+#----------------------------------------------------------------------------#
 
 def diagnose_graph_connectivity(world_graph, pivotal_states, env):
     """
@@ -452,7 +454,9 @@ def print_phase1_results_table(runs_dict):
         
         print(f"{name:<20} {loss:<10.3f} {recon:<10.3f} {l0:<8.1f} {nodes:<8} {conn:<8.1f} {succ:<8.1f}")
 
-# PHASE 1 ----------------------------------------------------------
+#----------------------------------------------------------------------------#
+#                      PHASE 1: WORLD GRAPH DISCOVERY                        #
+#----------------------------------------------------------------------------#
 
 def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: int = 8, convergence_threshold: float = 0.01,
                               explore_top_fraction: float = 0.20,
@@ -735,7 +739,9 @@ def run_phase1_size_sweep(sizes=None, mu0=9.0, iterations=50):
 
     return results
 
-# PHASE 2: PRETRAIN  ------------------------------------------------
+#----------------------------------------------------------------------------#
+#                           PHASE 2: PRETRAIN                                #
+#----------------------------------------------------------------------------#
 
 def run_worker_pretrain(env, worker, grid_state, config, device):
     """
@@ -1548,7 +1554,9 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
     return hit_history
 
-# PHASE 3: HIERARCHICAL TRAINING ----------------------------
+#----------------------------------------------------------------------------#
+#                     PHASE 3: INTEGRATION TRAINING                          #
+#----------------------------------------------------------------------------#
 
 def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
                          agent_start, first_balls, session_path, grid_state,
@@ -1657,6 +1665,10 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
             )
 
     return metrics
+
+#----------------------------------------------------------------------------#
+#                         STANDALONE ENTRY POINTS                            #
+#----------------------------------------------------------------------------#
 
 def run_phase3_standalone(
         checkpoint_path='phase1_checkpoint.pt',
@@ -1854,7 +1866,9 @@ def run_manager_wide_narrow_pretrain_standalone(
 
     return manager
 
-# ACTUAL TRAINING CODE ----------------------------------------------------
+#----------------------------------------------------------------------------#
+#                             FULL PIPELINE                                  #
+#----------------------------------------------------------------------------#
 
 def train_full_phase1_to_phase3(
         config=externalconfig,
@@ -1931,6 +1945,10 @@ def train_full_phase1_to_phase3(
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:])/10:.2f}")
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
     print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
+
+#----------------------------------------------------------------------------#
+#                                  MAIN                                      #
+#----------------------------------------------------------------------------#
 
 def main():
     """

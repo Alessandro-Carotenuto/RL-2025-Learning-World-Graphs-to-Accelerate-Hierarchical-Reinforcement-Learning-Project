@@ -1,14 +1,9 @@
 import torch
 
-# HARD KUMARASWAMY DISTRIBUTION:
-# DIFFERENTIABLE BINARY SAMPLING WITH STRETCH-AND-RECTIFY FOR VAE STATE SELECTION
-# ENABLES END-TO-END TRAINING WHILE MAINTAINING DISCRETE DECISIONS
 
 #----------------------------------------------------------------------------#
-#                            Hard Kumaraswamy                                #
+#                      HARD KUMARASWAMY DISTRIBUTION                        #
 #----------------------------------------------------------------------------#
-
-
 class HardKumaraswamy:
     def __init__(self, alpha, beta=1.0, gamma=-0.1, zeta=1.1):
         # INITIALIZE HARD KUMARASWAMY DISTRIBUTION PARAMETERS
@@ -68,10 +63,10 @@ class HardKumaraswamy:
         
         return rectified_expected
     
-#------------------------------------------------------------------------------   
-    
 
-# Beta distribution class for KL divergence computation
+#----------------------------------------------------------------------------#
+#                          BETA DISTRIBUTION                                 #
+#----------------------------------------------------------------------------#
 class BetaDistribution:
     # SIMPLE BETA DISTRIBUTION FOR KL WITH HARDKUMA
     

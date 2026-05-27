@@ -1,3 +1,6 @@
+#----------------------------------------------------------------------------#
+#                            IMPORTS & MODULE SETUP                          #
+#----------------------------------------------------------------------------#
 import math
 import torch
 import torch.nn as nn
@@ -14,6 +17,10 @@ from utils.misc import manhattan_distance
 diag=False
 diag2=False
 diag3=False
+
+#----------------------------------------------------------------------------#
+#                            HIERARCHICAL MANAGER                            #
+#----------------------------------------------------------------------------#
 
 class HierarchicalManager(nn.Module):
     """
@@ -478,10 +485,19 @@ class HierarchicalManager(nn.Module):
         if verbose:
             print(f"{'='*70}\n")
 
+
+#----------------------------------------------------------------------------#
+#                            WORKER FSM STATE ENUM                           #
+#----------------------------------------------------------------------------#
+
 class WorkerState(Enum):
     FINDING   = 1  # Navigating toward nearest pivotal state
     TRAVERSAL = 2  # Executing deterministic graph traversal to wide_goal
     NARROW_GOAL = 3  # MLP navigating from wide_goal to narrow_goal
+
+#----------------------------------------------------------------------------#
+#                            HIERARCHICAL WORKER                             #
+#----------------------------------------------------------------------------#
 
 class HierarchicalWorker(nn.Module):
     """
@@ -1097,6 +1113,11 @@ class HierarchicalWorker(nn.Module):
             actions.append(2)
         
         return actions
+
+
+#----------------------------------------------------------------------------#
+#                            HIERARCHICAL TRAINER                            #
+#----------------------------------------------------------------------------#
 
 class HierarchicalTrainer:
     def __init__(self, manager: HierarchicalManager, worker: HierarchicalWorker,

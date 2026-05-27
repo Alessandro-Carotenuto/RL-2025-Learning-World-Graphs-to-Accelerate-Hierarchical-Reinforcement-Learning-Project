@@ -5,6 +5,9 @@ from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 
 
+#----------------------------------------------------------------------------#
+#                          PHASE 1 CHECKPOINT                                #
+#----------------------------------------------------------------------------#
 def save_phase1_checkpoint(path, pivotal_states, world_graph, policy, vae_system, config, grid_state):
     """Save all Phase 1 outputs to a single file."""
     checkpoint = {
@@ -68,6 +71,9 @@ def load_phase1_checkpoint(path):
     )
 
 
+#----------------------------------------------------------------------------#
+#                           MAZE RESTORATION                                 #
+#----------------------------------------------------------------------------#
 def restore_maze_from_grid_state(env, grid_state):
     """Overwrite env.grid with the Phase 1 maze walls from the ASCII grid_state."""
     h = len(grid_state)

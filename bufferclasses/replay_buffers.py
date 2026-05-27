@@ -1,6 +1,9 @@
 import numpy as np
 
 
+#----------------------------------------------------------------------------#
+#                         NARROW REPLAY BUFFER                               #
+#----------------------------------------------------------------------------#
 class NarrowReplayBuffer:
     """PER buffer for narrow pretrain. Samples are i.i.d. (stateless MLP, no LSTM)."""
     def __init__(self, capacity, alpha=0.6):
@@ -33,6 +36,9 @@ class NarrowReplayBuffer:
         return len(self._buf)
 
 
+#----------------------------------------------------------------------------#
+#                      WORKER EPISODE REPLAY BUFFER                         #
+#----------------------------------------------------------------------------#
 class WorkerEpisodeReplayBuffer:
     """PER buffer for Worker pretrain. Stores full episodes (GAE requires complete sequences)."""
     def __init__(self, capacity, alpha=0.6):

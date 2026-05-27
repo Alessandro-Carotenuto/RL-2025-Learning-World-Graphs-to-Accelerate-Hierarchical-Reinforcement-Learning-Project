@@ -11,7 +11,9 @@ import numpy as np
 # PROJECT-SPECIFIC IMPORTS
 from local_distributions.hardkuma import HardKumaraswamy, BetaDistribution
 
-
+#----------------------------------------------------------------------------#
+#                            VAE SUB-NETWORKS                                #
+#----------------------------------------------------------------------------#
 
 class PriorNetwork(nn.Module):
     """
@@ -71,6 +73,11 @@ class PriorNetwork(nn.Module):
         return alpha, beta
 
 
+
+#----------------------------------------------------------------------------#
+#                           INFERENCE NETWORK                                #
+#----------------------------------------------------------------------------#
+
 class InferenceNetwork(nn.Module):
     """
     INFERENCE NETWORK (ENCODER) OUTPUTS HARDKUMA PARAMETERS FROM STATE-ACTION PAIRS
@@ -111,6 +118,11 @@ class InferenceNetwork(nn.Module):
         return alpha
 
 
+
+#----------------------------------------------------------------------------#
+#                           GENERATION NETWORK                               #
+#----------------------------------------------------------------------------#
+
 class GenerationNetwork(nn.Module):
     """
     GENERATION NETWORK (DECODER) RECONSTRUCTS ACTIONS FROM MASKED STATES
@@ -147,6 +159,11 @@ class GenerationNetwork(nn.Module):
         
         return action_logits
 
+
+
+#----------------------------------------------------------------------------#
+#                             STATE ENCODER                                  #
+#----------------------------------------------------------------------------#
 
 class StateEncoder(nn.Module):
     """
@@ -194,6 +211,11 @@ class StateEncoder(nn.Module):
             return self.encoder(states.float())
 
 
+
+#----------------------------------------------------------------------------#
+#                            ACTION ENCODER                                  #
+#----------------------------------------------------------------------------#
+
 class ActionEncoder(nn.Module):
     """
     ENCODE DISCRETE ACTIONS INTO CONTINUOUS REPRESENTATIONS
@@ -210,6 +232,11 @@ class ActionEncoder(nn.Module):
         # ENCODE DISCRETE ACTIONS
         return self.embedding(actions.long())
 
+
+
+#----------------------------------------------------------------------------#
+#                              VAE SYSTEM                                    #
+#----------------------------------------------------------------------------#
 
 class VAESystem(nn.Module):
     """

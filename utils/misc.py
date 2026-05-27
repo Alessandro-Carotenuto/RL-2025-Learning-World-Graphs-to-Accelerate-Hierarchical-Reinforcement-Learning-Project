@@ -1,8 +1,9 @@
 import random
 import torch
 
-#-----------------------------------------------------------------------------
-
+#----------------------------------------------------------------------------#
+#                                UTILITIES                                   #
+#----------------------------------------------------------------------------#
 def resolve_device(config=None):
     """Validate and print the active device. If config is given, mutates config['device'] in place.
     Always returns the resolved device string."""
