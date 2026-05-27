@@ -240,49 +240,6 @@ class GraphVisualizer:
         plt.tight_layout()
         return fig, ax
 
-    def show_path(self, pivotal_path: List[Tuple], path_color='red', path_width=3):
-        """
-        Highlights a specific path of pivotal states by drawing straight lines between them.
-        """
-        if not pivotal_path or len(pivotal_path) < 2:
-            print("Path is too short to visualize.")
-            return
-
-        # Start with the base visualization, highlighting the pivotal nodes
-        fig, ax = self.visualize(highlight_nodes=pivotal_path, highlight_color='orange')
-
-        # --- MODIFIED SECTION for straight-line path segments ---
-        for i in range(len(pivotal_path) - 1):
-            start_node, end_node = pivotal_path[i], pivotal_path[i + 1]
-
-            # Draw a straight line for this segment of the path
-            ax.plot([start_node[0], end_node[0]],
-                    [start_node[1], end_node[1]],
-                    color=path_color,
-                    linewidth=path_width,
-                    alpha=0.8,
-                    zorder=5,
-                    label='Shortest Path' if i == 0 else "")
-
-        ax.set_title(f"Shortest Path: {pivotal_path[0]} → {pivotal_path[-1]}",
-                     fontsize=14, fontweight='bold')
-        if any(ax.get_legend_handles_labels()):
-            ax.legend()
-
-        return fig, ax
-
-    def show_statistics(self):
-        """Display graph statistics."""
-        nodes = list(self.graph.nodes)
-        edges = self.graph.edges
-
-        print("Graph Statistics:")
-        print(f"  Nodes: {len(nodes)}")
-        print(f"  Edges: {len(edges)}")
-
-        if edges:
-            weights = [data['weight'] for data in edges.values()]
-            print(f"  Edge weights: min={min(weights)}, max={max(weights)}, avg={np.mean(weights):.1f}")
 
         connectivity = {node: len(self.graph.get_neighbors(node)) for node in nodes}
 

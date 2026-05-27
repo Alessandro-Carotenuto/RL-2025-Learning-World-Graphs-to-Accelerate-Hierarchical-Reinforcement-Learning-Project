@@ -1,5 +1,4 @@
 import torch
-from torch.distributions import Uniform
 
 # HARD KUMARASWAMY DISTRIBUTION:
 # DIFFERENTIABLE BINARY SAMPLING WITH STRETCH-AND-RECTIFY FOR VAE STATE SELECTION
@@ -23,9 +22,7 @@ class HardKumaraswamy:
         if sample_shape is None:
             sample_shape = self.alpha.shape
             
-    # SAMPLE UNIFORM NOISE
-        uniform = Uniform(0, 1)
-        u = uniform.sample(sample_shape).to(self.alpha.device)
+        u = torch.rand(sample_shape, device=self.alpha.device)
         
     # INVERSE CDF FOR KUMARASWAMY (BETA=1)
         eps = 1e-8  # EPSILON FOR NUMERICAL STABILITY
@@ -38,23 +35,6 @@ class HardKumaraswamy:
         z = torch.clamp(s, 0, 1)
         
         return z
-        
-    def log_prob(self, value):
-        # COMPUTE LOG PROBABILITY OF OBSERVED VALUE
-    # PROBABILITY OF GETTING 1
-        threshold = (1.0 - self.gamma) / (self.zeta - self.gamma)
-        
-    # KUMARASWAMY CDF
-        prob_one = torch.pow(torch.clamp(1.0 - threshold, 0.0, 1.0), self.alpha)
-        prob_zero = 1.0 - prob_one
-        
-    # LOG PROBABILITY BASED ON VALUE
-        eps = 1e-8
-        log_prob_one = torch.log(prob_one + eps)
-        log_prob_zero = torch.log(prob_zero + eps)
-        
-        log_prob = torch.where(value > 0.5, log_prob_one, log_prob_zero)
-        return log_prob
         
     def kl_divergence(self, other_dist):
         # KL DIVERGENCE: Bernoulli surrogate for HardKuma vs Beta prior.

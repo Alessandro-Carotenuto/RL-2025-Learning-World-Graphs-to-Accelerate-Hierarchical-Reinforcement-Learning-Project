@@ -68,36 +68,6 @@ def load_phase1_checkpoint(path):
     )
 
 
-def save_phase3_checkpoint(path, trainer, agent_start, ball_positions, phase1_checkpoint_path):
-    """Save Phase 3 training state for resumption."""
-    torch.save({
-        'manager_state_dict': trainer.manager.state_dict(),
-        'worker_state_dict': trainer.worker.state_dict(),
-        'goal_policy_state_dict': trainer.worker.goal_policy.state_dict() if trainer.worker.goal_policy is not None else None,
-        'global_episode_counter': trainer.global_episode_counter,
-        'global_step_counter': trainer.global_step_counter,
-        'diagnostic_history': trainer.diagnostic_history,
-        'agent_start': agent_start,
-        'ball_positions': ball_positions,
-        'phase1_checkpoint_path': str(phase1_checkpoint_path),
-    }, path)
-    print(f"Phase 3 checkpoint saved to '{path}' (episode {trainer.global_episode_counter})")
-
-
-def load_phase3_checkpoint(path, trainer):
-    """Load Phase 3 checkpoint into an already-constructed trainer. Returns (agent_start, ball_positions, phase1_checkpoint_path)."""
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    trainer.manager.load_state_dict(ckpt['manager_state_dict'])
-    trainer.worker.load_state_dict(ckpt['worker_state_dict'])
-    if ckpt['goal_policy_state_dict'] is not None and trainer.worker.goal_policy is not None:
-        trainer.worker.goal_policy.load_state_dict(ckpt['goal_policy_state_dict'])
-    trainer.global_episode_counter = ckpt['global_episode_counter']
-    trainer.global_step_counter = ckpt['global_step_counter']
-    trainer.diagnostic_history = ckpt['diagnostic_history']
-    print(f"Phase 3 checkpoint loaded from '{path}' (resuming from episode {trainer.global_episode_counter})")
-    return ckpt['agent_start'], ckpt['ball_positions'], ckpt['phase1_checkpoint_path']
-
-
 def restore_maze_from_grid_state(env, grid_state):
     """Overwrite env.grid with the Phase 1 maze walls from the ASCII grid_state."""
     h = len(grid_state)

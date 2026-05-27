@@ -15,7 +15,7 @@ from utils.statistics_buffer import StatBuffer
 from local_networks.vaesystem import VAESystem
 from local_networks.policy_networks import GoalConditionedPolicy
 from utils.misc import manhattan_distance, resolve_device, _walk_away_from_spawn
-from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state, save_phase3_checkpoint, load_phase3_checkpoint
+from utils.checkpoint import save_phase1_checkpoint, load_phase1_checkpoint, restore_maze_from_grid_state
 from utils.graph_manager import GraphManager
 from utils.visualization import (plot_training_diagnostics, save_graph_visualization,
                                   render_phase3_episode_gif,

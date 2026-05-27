@@ -478,12 +478,10 @@ class HierarchicalManager(nn.Module):
         if verbose:
             print(f"{'='*70}\n")
 
-
 class WorkerState(Enum):
     FINDING   = 1  # Navigating toward nearest pivotal state
     TRAVERSAL = 2  # Executing deterministic graph traversal to wide_goal
     NARROW_GOAL = 3  # MLP navigating from wide_goal to narrow_goal
-
 
 class HierarchicalWorker(nn.Module):
     """
