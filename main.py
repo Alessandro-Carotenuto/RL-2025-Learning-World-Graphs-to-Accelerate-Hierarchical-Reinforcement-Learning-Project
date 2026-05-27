@@ -533,7 +533,7 @@ def alternating_training_loop(env, policy, vae_system, buffer, max_iterations: i
 
         print(f"Discovered {len(pivotal_states)} pivotal states: {pivotal_states[:3]}...")
         
-        # Step 2: Collect trajectories from pivotal states
+        # Collect trajectories from pivotal states
         # Sort by distance from spawn descending — farthest states first — to break the
         # self-reinforcing clustering loop that keeps all pivotal states near spawn.
 
@@ -772,19 +772,19 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
             cur = max(cur - dropby, f_steps)
         return steps
 
-    cc = config
+    configuration = config
     default_cap = 5000
     curriculum = [
         (
             r,
-            cc.get(f'threshold_r{r}', thresh_def),
-            cc.get(f'repeat_r{r}', 1),
+            configuration.get(f'threshold_r{r}', thresh_def),
+            configuration.get(f'repeat_r{r}', 1),
             _build_steps_seq(
-                cc.get(f'i_steps_r{r}', i_def),
-                cc.get(f'dropby_r{r}',  drop_def),
-                cc.get(f'f_steps_r{r}', f_def),
+                configuration.get(f'i_steps_r{r}', i_def),
+                configuration.get(f'dropby_r{r}',  drop_def),
+                configuration.get(f'f_steps_r{r}', f_def),
             ),
-            cc.get(f'substage_cap_r{r}', default_cap),
+            configuration.get(f'substage_cap_r{r}', default_cap),
         )
         for r, thresh_def, i_def, drop_def, f_def in [
             (1, 0.95, 25,  5,  10),
@@ -1902,8 +1902,6 @@ def train_full_phase1_to_phase3(
     print(f"\nPhase 1 complete in {phase1_time:.1f}s")
     print(f"  Pivotal states: {len(pivotal_states)}")
     print(f"  Graph edges: {len(world_graph.edges)}")
-    
-
 
     # Diagnose graph connectivity
     reachable, unreachable = diagnose_graph_connectivity(
@@ -1933,7 +1931,6 @@ def train_full_phase1_to_phase3(
     print(f"Final 10-ep avg: {sum(metrics['rewards'][-10:])/10:.2f}")
     print(f"Avg manager updates/ep: {sum(metrics['manager_updates'])/len(metrics['manager_updates']):.1f}")
     print(f"Avg worker updates/ep: {sum(metrics['worker_updates'])/len(metrics['worker_updates']):.1f}")
-
 
 def main():
     """
