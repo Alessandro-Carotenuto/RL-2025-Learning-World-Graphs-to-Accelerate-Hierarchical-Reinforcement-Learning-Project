@@ -513,7 +513,6 @@ class HierarchicalWorker(nn.Module):
                  goal_policy=None,
                  maze_size: int = 24,
                  neighborhood_size: int = 3,
-                 narrow_goal_timeout: int = 25,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Args:
@@ -558,18 +557,11 @@ class HierarchicalWorker(nn.Module):
         # FSM state — reset to FINDING on each new manager goal
         self._worker_state: WorkerState = WorkerState.FINDING
         self._traversal_starts_this_episode: int = 0
-        self._narrow_goal_steps: int = 0        # steps spent in NARROW_GOAL since entry / last slide
-        self._narrow_goal_dist_ref: int = 0    # distance to narrow_goal at last window start
-        self._narrow_goal_total_steps: int = 0 # total steps in current NARROW_GOAL stint
-        self.narrow_goal_timeout: int = narrow_goal_timeout
-        self.narrow_goal_hard_timeout: int = 60  # hard cap regardless of progress
-        self._spinning_recovery: bool = False  # blocks priority override after spinning detection
         self._last_local_goal = None           # set each MLP step; None for traversal steps
         self._finding_local_goal = None        # current local goal being chased in FINDING
         self._finding_steps: int = 0           # steps spent chasing _finding_local_goal
-        self._finding_blacklist: set = set()   # pivots that timed out or led nowhere this goal period
+        self._finding_blacklist: set = set()   # pivots unreachable as local goals in FINDING
         self.finding_local_timeout: int = 30   # max steps per local goal in FINDING before skip
-        self._last_traversal_pivot = None      # pivot that triggered the last FINDING→TRAVERSAL
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -590,14 +582,9 @@ class HierarchicalWorker(nn.Module):
         self.current_edge_actions = []
         self.current_action_idx = 0
         self._worker_state = WorkerState.FINDING
-        self._narrow_goal_steps = 0
-        self._narrow_goal_dist_ref = 0
-        self._narrow_goal_total_steps = 0
-        self._spinning_recovery = False
         self._finding_local_goal = None
         self._finding_steps = 0
         self._finding_blacklist = set()
-        self._last_traversal_pivot = None
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -690,28 +677,17 @@ class HierarchicalWorker(nn.Module):
         self._last_local_goal = None  # cleared every step; only set for MLP steps
 
         # ── FSM TRANSITIONS ────────────────────────────────────────────────────
-        # Priority override: if narrow_goal is within Manhattan r from here, go straight to it.
-        # Blocked during spinning recovery — agent must route via graph first.
-        if (not self._spinning_recovery and
-                self._worker_state != WorkerState.TRAVERSAL and
-                manhattan_distance(state, narrow_goal) <= self.neighborhood_size):
-            if self._worker_state != WorkerState.NARROW_GOAL:
-                self.current_traversal_path = []
-                self.current_edge_actions = []
-                self._narrow_goal_steps = 0
-                self._narrow_goal_total_steps = 0
-                self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
-            self._worker_state = WorkerState.NARROW_GOAL
-
-        elif self._worker_state == WorkerState.FINDING:
-            # Arrived at a usable pivotal state — try to start graph traversal
-            if state in self.pivotal_states and state != wide_goal and state not in self._finding_blacklist:
+        if self._worker_state == WorkerState.FINDING:
+            if state == wide_goal:
+                # Already at wide_goal — enter NARROW_GOAL directly
+                if diag: print(f"\n[WORKER] FINDING: already at wide_goal {state}. →NARROW_GOAL")
+                self._worker_state = WorkerState.NARROW_GOAL
+            elif state in self.pivotal_states and state not in self._finding_blacklist:
                 path = self.plan_traversal(state, wide_goal)
                 if path:
                     self._worker_state = WorkerState.TRAVERSAL
                     self.current_traversal_path = path
                     self.traversal_step = 0
-                    self._last_traversal_pivot = state
                     self._traversal_starts_this_episode += 1
                     if diag:
                         print(f"\n[WORKER] FINDING→TRAVERSAL at {state}, target gw={wide_goal}")
@@ -744,9 +720,6 @@ class HierarchicalWorker(nn.Module):
                     if diag: print("  [WORKER] Traversal complete. →NARROW_GOAL")
                     self.reset_worker_state()               # clears path/edge buffers + sets FINDING
                     self._worker_state = WorkerState.NARROW_GOAL
-                    self._narrow_goal_steps = 0
-                    self._narrow_goal_total_steps = 0
-                    self._narrow_goal_dist_ref = manhattan_distance(state, narrow_goal)
 
             if self.current_edge_actions and self.current_action_idx < len(self.current_edge_actions):
                 action = self.current_edge_actions[self.current_action_idx]
@@ -760,48 +733,7 @@ class HierarchicalWorker(nn.Module):
                 return action, torch.tensor(-1.0, device=self.device), value.squeeze()
 
         # ── MLP NAVIGATION (FINDING or NARROW_GOAL) ────────────────────────────
-        if self._worker_state == WorkerState.NARROW_GOAL:
-            self._narrow_goal_steps += 1
-            self._narrow_goal_total_steps += 1
-            current_dist = manhattan_distance(state, narrow_goal)
-
-            # Hard cap: too long overall → give up regardless of progress
-            if self._narrow_goal_total_steps >= self.narrow_goal_hard_timeout:
-                if diag: print(f"  [WORKER] NARROW_GOAL hard timeout ({self._narrow_goal_total_steps} steps) →FINDING")
-                self._worker_state = WorkerState.FINDING
-                self._spinning_recovery = True
-                self._narrow_goal_steps = 0
-                self._narrow_goal_total_steps = 0
-                if self._last_traversal_pivot is not None:
-                    self._finding_blacklist.add(self._last_traversal_pivot)
-                    if diag: print(f"  [WORKER] Blacklisting traversal pivot {self._last_traversal_pivot} (hard timeout)")
-
-            # No-progress window: no improvement in last N steps → spinning
-            elif self._narrow_goal_steps >= self.narrow_goal_timeout:
-                if current_dist >= self._narrow_goal_dist_ref:
-                    if diag: print(f"  [WORKER] NARROW_GOAL spinning (dist {current_dist} >= ref {self._narrow_goal_dist_ref}) →FINDING")
-                    self._worker_state = WorkerState.FINDING
-                    self._spinning_recovery = True
-                    self._narrow_goal_steps = 0
-                    if self._last_traversal_pivot is not None:
-                        self._finding_blacklist.add(self._last_traversal_pivot)
-                        if diag: print(f"  [WORKER] Blacklisting traversal pivot {self._last_traversal_pivot} (spinning)")
-                else:
-                    # Made progress → slide the window forward
-                    self._narrow_goal_steps = 0
-                    self._narrow_goal_dist_ref = current_dist
-
         if self._worker_state == WorkerState.FINDING:
-            # In spinning recovery, arriving at a pivot can't trigger TRAVERSAL → blacklist it immediately
-            if (self._spinning_recovery
-                    and self._finding_local_goal is not None
-                    and state == self._finding_local_goal
-                    and state in self.pivotal_states):
-                if diag: print(f"  [WORKER] FINDING+recovery: reached pivot {state}, can't traverse → blacklist")
-                self._finding_blacklist.add(state)
-                self._finding_local_goal = None
-                self._finding_steps = 0
-
             # Steer toward nearest pivotal state; exclude current pos and timed-out pivots
             candidates = [p for p in self.pivotal_states
                           if p != state and p not in self._finding_blacklist]
@@ -839,59 +771,6 @@ class HierarchicalWorker(nn.Module):
         dist  = torch.distributions.Categorical(probs)
         idx   = dist.sample()
         return idx.item(), dist.log_prob(idx), value.squeeze()
-
-    def _compute_required_direction(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> int:
-        """
-        Compute which direction agent must face to move from->to in one step.
-        
-        Returns:
-            0: Right (+x)
-            1: Down (+y)
-            2: Left (-x)
-            3: Up (-y)
-        """
-        dx = to_pos[0] - from_pos[0]
-        dy = to_pos[1] - from_pos[1]
-        
-        if dx > 0:
-            return 0  # Right
-        elif dy > 0:
-            return 1  # Down
-        elif dx < 0:
-            return 2  # Left
-        elif dy < 0:
-            return 3  # Up
-        else:
-            # Same position (shouldn't happen in traversal)
-            return 0
-
-    def _compute_turn_action(self, current_dir: int, target_dir: int) -> int:
-        """
-        Compute ONE turn action to get closer to target direction.
-        
-        Args:
-            current_dir: Current facing direction (0-3)
-            target_dir: Target facing direction (0-3)
-        
-        Returns:
-            0: turn_left
-            1: turn_right
-        """
-        # Compute shortest rotation
-        diff = (target_dir - current_dir) % 4
-        
-        if diff == 0:
-            # Already facing target (shouldn't be called in this case)
-            return 1  # turn_right (no-op, shouldn't happen)
-        elif diff == 1:
-            # Target is 1 turn right away
-            return 1  # turn_right
-        elif diff == 2:
-            # Target is opposite (2 turns away, choose right arbitrarily)
-            return 1  # turn_right
-        else:  # diff == 3
-            # Target is 1 turn left away (or 3 turns right)
-            return 0  # turn_left
 
     def compute_reward(self, prev_state: Tuple[int, int], current_state: Tuple[int, int], wide_goal: Tuple[int, int], narrow_goal: Tuple[int, int]) -> float:
         """

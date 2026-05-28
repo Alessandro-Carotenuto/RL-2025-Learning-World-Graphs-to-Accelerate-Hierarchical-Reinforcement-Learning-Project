@@ -1578,7 +1578,6 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
         goal_policy=policy,
         maze_size=config['maze_size'].value,
         neighborhood_size=config['neighborhood_size'],
-        narrow_goal_timeout=config.get('narrow_goal_timeout', 25),
         device=config['device'],
     )
     manager.initialize_from_goal_policy(policy)
@@ -1794,7 +1793,6 @@ def run_worker_pretrain_standalone(
         goal_policy=policy,
         maze_size=config['maze_size'].value,
         neighborhood_size=config.get('neighborhood_size', 3),
-        narrow_goal_timeout=config.get('narrow_goal_timeout', 25),
         device=device,
     )
     worker.initialize_from_goal_policy(policy)

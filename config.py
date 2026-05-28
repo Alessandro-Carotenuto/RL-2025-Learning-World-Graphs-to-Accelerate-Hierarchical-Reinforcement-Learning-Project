@@ -35,9 +35,8 @@ externalconfig = {
     'neighborhood_size':        math.ceil(EnvSizes.MEDIUM.value / 8),
     'manager_lr':               5e-4,
     'worker_lr':                1e-4,
-    'goal_timeout':             200,  # max steps on a goal before forcing replanning
+    'goal_timeout':             200,  # max steps on a goal before forcing replanning; drives narrow_goal_hard_timeout=//2, narrow_goal_timeout=//4
     'traversal_shaping_weight': 2.0,
-    'narrow_goal_timeout':      50,   # steps in NARROW_GOAL without progress → back to FINDING
 
     # --- manager pretrain ---
     'manager_wide_horizons_per_episode':   20,
