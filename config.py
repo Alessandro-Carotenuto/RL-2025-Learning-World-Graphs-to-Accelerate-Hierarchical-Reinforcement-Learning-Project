@@ -37,6 +37,7 @@ externalconfig = {
     'worker_lr':                1e-4,
     'goal_timeout':             200,  # max steps on a goal before forcing replanning; drives narrow_goal_hard_timeout=//2, narrow_goal_timeout=//4
     'traversal_shaping_weight': 2.0,
+    'phase3_train_with_instant_traversals': False,  # teleport to wide_goal instead of graph traversal during training
 
     # --- manager pretrain ---
     'manager_wide_horizons_per_episode':   20,

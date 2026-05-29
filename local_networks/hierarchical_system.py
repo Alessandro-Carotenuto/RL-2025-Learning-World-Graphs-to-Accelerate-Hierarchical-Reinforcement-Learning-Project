@@ -157,10 +157,11 @@ class HierarchicalManager(nn.Module):
             dx, dy = 0.0, 0.0
         narrow_logits = self.narrow_head(torch.tensor([dx, dy], dtype=torch.float32, device=self.device))
 
-        neighborhood = self.get_neighborhood(wide_goal, valid_cells=valid_cells)
+        # Always build the full diamond first so logit i always maps to full_neighborhood[i]
+        neighborhood_full = self.get_neighborhood(wide_goal)
 
         if valid_cells is not None:
-            valid_indices = [i for i, cell in enumerate(neighborhood) if cell in valid_cells]
+            valid_indices = [i for i, cell in enumerate(neighborhood_full) if cell in valid_cells]
             if not valid_indices:
                 return self._nearest_valid_cell(wide_goal, valid_cells), torch.tensor(0.0, device=self.device)
 
@@ -170,13 +171,13 @@ class HierarchicalManager(nn.Module):
             valid_dist = torch.distributions.Categorical(valid_probs)
             local_idx = valid_dist.sample()
             log_prob = valid_dist.log_prob(local_idx)
-            narrow_goal = neighborhood[valid_indices[local_idx.item()]]
+            narrow_goal = neighborhood_full[valid_indices[local_idx.item()]]
             return narrow_goal, log_prob
 
         narrow_probs = F.softmax(narrow_logits, dim=0)
         dist = torch.distributions.Categorical(narrow_probs)
         idx = dist.sample()
-        return neighborhood[idx.item()], dist.log_prob(idx)
+        return neighborhood_full[idx.item()], dist.log_prob(idx)
     
     def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None):
         verbose = self.action_verbose and (
@@ -280,8 +281,9 @@ class HierarchicalManager(nn.Module):
         print("Manager initialized from goal policy LSTM")
 
 
-    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None, wide_only=False, narrow_only=False, wide_idxs=None, ppo_epochs=1, clip_eps=0.2):
+    def update_policy(self, states, wide_goals, narrow_goals, rewards, values, log_probs, entropies, step_count=0, balls_snapshots=None, wide_only=False, narrow_only=False, wide_idxs=None, ppo_epochs=1, clip_eps=0.2, entropy_coef_override=None):
         """Update Manager policy with wide + narrow entropy regularization."""
+        _entropy_coef = self.entropy_coef if entropy_coef_override is None else entropy_coef_override
         if len(rewards) == 0:
             return
         
@@ -376,8 +378,8 @@ class HierarchicalManager(nn.Module):
                         dx_i, dy_i = 0.0, 0.0
                     narrow_logits = self.narrow_head(torch.tensor([dx_i, dy_i], dtype=torch.float32, device=self.device))
                     if self._valid_cells is not None:
-                        neighborhood_i = self.get_neighborhood(wide_goal_i, valid_cells=self._valid_cells)
-                        valid_idx = [j for j, c in enumerate(neighborhood_i) if c in self._valid_cells]
+                        neighborhood_full_i = self.get_neighborhood(wide_goal_i)
+                        valid_idx = [j for j, c in enumerate(neighborhood_full_i) if c in self._valid_cells]
                         if valid_idx:
                             idx_t = torch.tensor(valid_idx, dtype=torch.long, device=self.device)
                             narrow_logits = narrow_logits[idx_t]
@@ -392,11 +394,11 @@ class HierarchicalManager(nn.Module):
                 print(f"  Value loss: {value_loss.item():.6f}")
                 print(f"  Wide entropy: {wide_entropy_mean.item():.6f}")
                 print(f"  Narrow entropy: {narrow_entropy_mean.item():.6f}")
-                print(f"  Entropy coef: {self.entropy_coef}")
+                print(f"  Entropy coef: {_entropy_coef}")
 
             total_loss = (policy_loss +
                           self.value_coef * value_loss -
-                          self.entropy_coef * (wide_entropy_mean + narrow_entropy_mean))
+                          _entropy_coef * (wide_entropy_mean + narrow_entropy_mean))
 
             if verbose:
                 print(f"  Total loss: {total_loss.item():.6f}")
@@ -431,16 +433,16 @@ class HierarchicalManager(nn.Module):
                             dy_t = float(nearest[1] - gw_t[1])
                         else:
                             dx_t, dy_t = 0.0, 0.0
-                        narrow_logits_t  = self.narrow_head(torch.tensor([dx_t, dy_t], dtype=torch.float32, device=self.device))
-                        neighborhood_t   = self.get_neighborhood(gw_t, valid_cells=self._valid_cells)
-                        valid_idx_t      = [i for i, c in enumerate(neighborhood_t)
-                                            if self._valid_cells is None or c in self._valid_cells]
+                        narrow_logits_t   = self.narrow_head(torch.tensor([dx_t, dy_t], dtype=torch.float32, device=self.device))
+                        neighborhood_full_t = self.get_neighborhood(gw_t)
+                        valid_idx_t       = [i for i, c in enumerate(neighborhood_full_t)
+                                             if self._valid_cells is None or c in self._valid_cells]
                         if valid_idx_t:
                             idx_tensor    = torch.tensor(valid_idx_t, dtype=torch.long, device=self.device)
                             valid_probs_t = F.softmax(narrow_logits_t[idx_tensor], dim=0)
                             ng_t          = narrow_goals[t]
-                            global_i      = neighborhood_t.index(ng_t) if ng_t in neighborhood_t else None
-                            local_i       = valid_idx_t.index(global_i) if global_i in valid_idx_t else None
+                            global_i      = neighborhood_full_t.index(ng_t) if ng_t in neighborhood_full_t else None
+                            local_i       = valid_idx_t.index(global_i) if global_i is not None and global_i in valid_idx_t else None
                             lp_t  = torch.log(valid_probs_t[local_i] + 1e-8) if local_i is not None \
                                     else torch.tensor(-10.0, device=self.device)
                             ent_t = -(valid_probs_t * torch.log(valid_probs_t + 1e-8)).sum()
@@ -472,7 +474,7 @@ class HierarchicalManager(nn.Module):
 
                 total_loss = (policy_loss +
                               self.value_coef * value_loss -
-                              self.entropy_coef * entropy_mean)
+                              _entropy_coef * entropy_mean)
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -562,6 +564,9 @@ class HierarchicalWorker(nn.Module):
         self._finding_steps: int = 0           # steps spent chasing _finding_local_goal
         self._finding_blacklist: set = set()   # pivots unreachable as local goals in FINDING
         self.finding_local_timeout: int = 30   # max steps per local goal in FINDING before skip
+        self._narrow_goal_steps: int = 0       # steps spent in NARROW_GOAL since entry
+        self.narrow_goal_timeout: int = 30     # steps in NARROW_GOAL without reaching it → force manager replanning
+        self.narrow_goal_timed_out: bool = False  # trainer checks this to trigger goal change
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -585,6 +590,8 @@ class HierarchicalWorker(nn.Module):
         self._finding_local_goal = None
         self._finding_steps = 0
         self._finding_blacklist = set()
+        self._narrow_goal_steps = 0
+        self.narrow_goal_timed_out = False
     
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
@@ -762,6 +769,10 @@ class HierarchicalWorker(nn.Module):
                 self._finding_local_goal = local_goal
                 self._finding_steps = 0
         else:   # NARROW_GOAL
+            self._narrow_goal_steps += 1
+            if self._narrow_goal_steps >= self.narrow_goal_timeout:
+                if diag: print(f"  [WORKER] NARROW_GOAL timeout ({self._narrow_goal_steps} steps) → request replanning")
+                self.narrow_goal_timed_out = True
             local_goal = narrow_goal
 
         self._last_local_goal = local_goal  # expose for diagnostics
@@ -1007,7 +1018,8 @@ class HierarchicalTrainer:
                  managershaping=True,
                  narrow_shaping_weight: float = 1.0,
                  traversal_shaping_weight: float = 2.0,
-                 goal_timeout: int = 3):
+                 goal_timeout: int = 3,
+                 instant_traversal: bool = False):
         self.manager = manager
         self.worker = worker
         self.env = env
@@ -1039,6 +1051,7 @@ class HierarchicalTrainer:
         self.traversal_shaping_weight=traversal_shaping_weight
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
+        self.instant_traversal = instant_traversal
     
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1):
         """Train one episode with comprehensive diagnostics."""
@@ -1116,6 +1129,7 @@ class HierarchicalTrainer:
                 or goal_reached_prev
                 or ball_collected_prev
                 or steps_on_goal >= self.goal_timeout
+                or self.worker.narrow_goal_timed_out
             )
 
             if need_new_goal:
@@ -1187,6 +1201,15 @@ class HierarchicalTrainer:
                     state, wide_goal, narrow_goal,
                     agent_dir=agent_dir
                 )
+
+                # Instant traversal: teleport to wide_goal instead of executing graph actions
+                if self.instant_traversal and self.worker._worker_state == WorkerState.TRAVERSAL:
+                    self.env.agent_pos = np.array(wide_goal)
+                    state = wide_goal
+                    self.worker.reset_worker_state()
+                    self.worker._worker_state = WorkerState.NARROW_GOAL
+                    traversal_completed_this_horizon = True
+                    continue
 
                 if was_traversing and not self.worker.current_traversal_path and state == wide_goal:
                     traversal_completed_this_horizon = True

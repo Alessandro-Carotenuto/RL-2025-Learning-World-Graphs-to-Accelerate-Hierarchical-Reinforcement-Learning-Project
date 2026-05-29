@@ -1438,8 +1438,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
             dy = float(target_ball[1] - wide_goal[1])
             narrow_logits = manager.narrow_head(torch.tensor([dx, dy], dtype=torch.float32, device=device))
 
-            neighborhood  = manager.get_neighborhood(wide_goal, valid_cells=valid_set)
-            valid_indices = [i for i, cell in enumerate(neighborhood) if cell in valid_set]
+            neighborhood_full = manager.get_neighborhood(wide_goal)
+            valid_indices = [i for i, cell in enumerate(neighborhood_full) if cell in valid_set]
             if not valid_indices:
                 continue
 
@@ -1450,7 +1450,7 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
             local_idx    = valid_dist.sample()
             log_prob     = valid_dist.log_prob(local_idx)
             entropy      = -(valid_probs * torch.log(valid_probs + 1e-8)).sum().detach()
-            narrow_goal  = neighborhood[valid_indices[local_idx.item()]]
+            narrow_goal  = neighborhood_full[valid_indices[local_idx.item()]]
 
             dist_to_ball = manhattan_distance(narrow_goal, target_ball)
             if dist_to_ball == 0:
@@ -1509,10 +1509,10 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                     new_lps, old_lps, advantages, entropies_r = [], [], [], []
                     for (dx_r, dy_r, wg_r, ng_r, rew_r, old_lp_r), w in zip(samples, weights):
                         nl = manager.narrow_head(torch.tensor([dx_r, dy_r], dtype=torch.float32, device=device))
-                        nb = manager.get_neighborhood(wg_r, valid_cells=valid_set)
+                        nb = manager.get_neighborhood(wg_r)
                         vi = [i for i, c in enumerate(nb) if c in valid_set]
                         gi = nb.index(ng_r) if ng_r in nb else None
-                        li = vi.index(gi) if gi in vi else None
+                        li = vi.index(gi) if gi is not None and gi in vi else None
                         if li is not None and vi:
                             vp = F.softmax(nl[torch.tensor(vi, dtype=torch.long, device=device)], dim=0)
                             new_lps.append(torch.log(vp[li] + 1e-8))
@@ -1546,6 +1546,10 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                   f"Hit(dist=0): {sum(recent_hit)/len(recent_hit)*100:.1f}% | "
                   f"Near(dist≤1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
                   f"Entropy: {avg_entropy:.3f}")
+
+        if len(hit_history) >= 10 and all(h == 1.0 for h in hit_history[-10:]):
+            print(f"  Early stopping at ep {episode+1}: 10 consecutive episodes at 100% hit rate.")
+            break
 
     manager.entropy_coef = _original_entropy_coef
 
@@ -1618,6 +1622,7 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
         diagnostic_checkstart=config['diagnostic_checkstart'],
         goal_timeout=config.get('goal_timeout', 3),
         traversal_shaping_weight=config.get('traversal_shaping_weight', 2.0),
+        instant_traversal=config.get('phase3_train_with_instant_traversals', False),
     )
 
     print("\nPHASE 3: Hierarchical Training")
@@ -1959,8 +1964,8 @@ def main():
     """
     #train_full_phase1_to_phase3()       # Phase 1 + Phase 3 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
-    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase3_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase3_animation=False)
     #render_phase3_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase3_final_episode.mp4', fps=15, max_steps=500)
 
