@@ -1278,7 +1278,7 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
                     active_balls.discard(closest)
                 else:
                     dist_to_closest = min(manhattan_distance(wide_goal, b) for b in active_balls)
-                    reward          = -min((dist_to_closest / pretrain_r) ** 2, 3.0)
+                    reward          = -dist_to_closest / maze_diagonal
 
                 m_dists.append(dist_to_closest)
                 m_states.append(state)
