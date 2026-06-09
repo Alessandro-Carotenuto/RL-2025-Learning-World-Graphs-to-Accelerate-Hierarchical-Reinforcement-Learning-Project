@@ -528,6 +528,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     manager.reset_manager_state()
     worker.reset_worker_state()
     worker.valid_cells = valid_cells
+    worker.build_wall_mask(env.width, env.height)
 
     overlay_enabled = world_graph is not None and pivotal_states is not None
     if overlay_enabled:

@@ -538,10 +538,15 @@ class HierarchicalWorker(nn.Module):
         # double-counting in the optimizer and polluting worker.state_dict().
         object.__setattr__(self, 'goal_policy', goal_policy)
 
-        # A2C-MLP architecture (9 inputs: state_x, state_y, dir_sin, dir_cos, goal_dx, goal_dy,
-        #                                   wall_fwd, wall_left, wall_right)
+        # A2C-MLP architecture (17 inputs: asymmetric agent-relative wall patch + goal_dx, goal_dy)
+        # Patch: 5x5 square sliced, rotated (row-0=forward), cropped to (patch_rows_forward+1)x5.
+        # Agent sits at last row; rows behind are discarded (worker has no backward action).
+        self.wall_patch_size = 5        # square slice size; half=2 used for pre-padding
+        self.patch_rows_forward = 2     # rows visible ahead (excl. agent row)
+        self.wall_mask: np.ndarray = None  # pre-padded (height+4, width+4), built by build_wall_mask()
+        _patch_inputs = (self.patch_rows_forward + 1) * self.wall_patch_size  # 3*5=15
         self.net = nn.Sequential(
-            nn.Linear(9, 64), nn.Tanh(),
+            nn.Linear(_patch_inputs + 2, 64), nn.Tanh(),
             nn.Linear(64, 64), nn.Tanh(),
         ).to(device)
 
@@ -593,6 +598,14 @@ class HierarchicalWorker(nn.Module):
         self._narrow_goal_steps = 0
         self.narrow_goal_timed_out = False
     
+    def build_wall_mask(self, width: int, height: int):
+        """Precompute pre-padded wall mask from valid_cells. Call once after setting valid_cells."""
+        half = self.wall_patch_size // 2
+        raw = np.ones((height, width), dtype=np.float32)
+        for (x, y) in self.valid_cells:
+            raw[y, x] = 0.0
+        self.wall_mask = np.pad(raw, half, mode='constant', constant_values=1.0)
+
     def is_at_pivotal_state(self, state: Tuple[int, int]) -> bool:
         """Check if current state is a pivotal state."""
         return state in self.pivotal_states
@@ -652,25 +665,25 @@ class HierarchicalWorker(nn.Module):
             action_logits: Logits over 3 navigation actions
             value: State value estimate
         """
-        # dir encoded as (sin, cos) — preserves circular adjacency (all neighbours equidistant).
-        # Goal delta raw (goal_norm_div=1.0) — matches GCP and worker pretrain convention.
-        # Wall flags: 1.0 = blocked, 0.0 = free. Direction vectors: right/down/left/up.
-        _dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
-        fwd   = _dirs[agent_dir]
-        left  = _dirs[(agent_dir - 1) % 4]
-        right = _dirs[(agent_dir + 1) % 4]
-        vc = self.valid_cells
-        wall_f = 0.0 if (state[0] + fwd[0],   state[1] + fwd[1])   in vc else 1.0
-        wall_l = 0.0 if (state[0] + left[0],  state[1] + left[1])  in vc else 1.0
-        wall_r = 0.0 if (state[0] + right[0], state[1] + right[1]) in vc else 1.0
-        net_input = torch.tensor([
-            state[0] / self.maze_size, state[1] / self.maze_size,
-            math.sin(agent_dir * math.pi / 2),
-            math.cos(agent_dir * math.pi / 2),
-            float(narrow_goal[0] - state[0]) / self.goal_norm_div,
-            float(narrow_goal[1] - state[1]) / self.goal_norm_div,
-            wall_f, wall_l, wall_r,
-        ], dtype=torch.float32, device=self.device)  # [9]
+        # Asymmetric agent-relative wall patch: slice 5x5, rotate (row-0=forward), crop behind.
+        # k=(dir+1)%4 CCW: dir0(east)→k1, dir1(south)→k2, dir2(west)→k3, dir3(north)→k0
+        # After crop: shape (patch_rows_forward+1, 5) = (3,5). Agent at last row, center col.
+        ax, ay = state
+        patch = self.wall_mask[ay : ay + self.wall_patch_size, ax : ax + self.wall_patch_size]
+        patch = np.rot90(patch, k=(agent_dir + 1) % 4)
+        patch = patch[:self.patch_rows_forward + 1, :]
+        # Goal in agent-relative frame (CW rotation by agent_dir*90°):
+        # dir0: fwd=+x, rgt=+y | dir1: fwd=+y, rgt=-x | dir2: fwd=-x, rgt=-y | dir3: fwd=-y, rgt=+x
+        wx = float(narrow_goal[0] - ax) / self.goal_norm_div
+        wy = float(narrow_goal[1] - ay) / self.goal_norm_div
+        if   agent_dir == 0: goal_fwd, goal_rgt =  wx,  wy
+        elif agent_dir == 1: goal_fwd, goal_rgt =  wy, -wx
+        elif agent_dir == 2: goal_fwd, goal_rgt = -wx, -wy
+        else:                goal_fwd, goal_rgt = -wy,  wx
+        net_input = torch.tensor(
+            patch.flatten().tolist() + [goal_fwd, goal_rgt],
+            dtype=torch.float32, device=self.device,
+        )  # [17]
         features = self.net(net_input)               # [64]
         
         # Action and value

@@ -123,6 +123,7 @@ def diagnose_worker_behavior_single_episode(env, manager, worker, world_graph):
         if env._is_traversable(env.grid.get(x, y))
     }
     worker.valid_cells = valid_cells_diag
+    worker.build_wall_mask(env.width, env.height)
 
     print(f"\nAgent starts at: {start_pos}")
     print(f"Balls at: {list(env.active_balls)[:5]}")
@@ -768,6 +769,7 @@ def run_worker_pretrain(env, worker, grid_state, config, device):
     ]
     valid_set = set(valid_cells)
     worker.valid_cells = valid_set
+    worker.build_wall_mask(env.width, env.height)
 
     def _build_steps_seq(i_steps, dropby, f_steps):
         steps, cur = [], i_steps
@@ -1964,8 +1966,8 @@ def main():
     """
     #train_full_phase1_to_phase3()       # Phase 1 + Phase 3 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
-    #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
-    run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
+    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase3_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase3_animation=False)
     #render_phase3_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase3_final_episode.mp4', fps=15, max_steps=500)
 

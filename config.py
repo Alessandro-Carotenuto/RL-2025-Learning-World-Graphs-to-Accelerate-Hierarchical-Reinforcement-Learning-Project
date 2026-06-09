@@ -98,11 +98,11 @@ externalconfig = {
     'worker_graph_max_steps':  100,  # steps per attempt
 
     # --- worker pretrain PER ---
-    'worker_per_use':            False,
+    'worker_per_use':            True,
     'worker_per_buffer_size':    500,
-    'worker_per_warmup':         250,
-    'worker_per_replay_freq':    250,
-    'worker_per_batch_episodes': 50,
+    'worker_per_warmup':         300,
+    'worker_per_replay_freq':    200,
+    'worker_per_batch_episodes': 100,
     'worker_per_alpha':          0.6,
     'worker_per_beta_start':     0.4,
     'worker_per_lr_factor':      0.5,
