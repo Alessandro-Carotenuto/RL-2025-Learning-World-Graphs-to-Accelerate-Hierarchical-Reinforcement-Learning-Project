@@ -179,7 +179,7 @@ class HierarchicalManager(nn.Module):
         idx = dist.sample()
         return neighborhood_full[idx.item()], dist.log_prob(idx)
     
-    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None):
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None, wide_blacklist=None):
         verbose = self.action_verbose and (
             (self.diagnostic_checkstart and step_count < 15) or
             (step_count % self.diagnostic_interval == 0)
@@ -194,6 +194,14 @@ class HierarchicalManager(nn.Module):
 
         # Pass 1: wide goal — also captures logits/entropy without an extra forward
         wide_logits, _, value = self.forward(state, active_balls)
+
+        # Mask blacklisted wide goals; fallback: ignore blacklist if all pivots would be masked
+        if wide_blacklist:
+            blacklisted = [i for i, ps in enumerate(self.pivotal_states) if ps in wide_blacklist]
+            if len(blacklisted) < len(self.pivotal_states):
+                for i in blacklisted:
+                    wide_logits[i] = -1e9
+
         wide_probs = F.softmax(wide_logits, dim=0)
         entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
 
@@ -705,6 +713,7 @@ class HierarchicalWorker(nn.Module):
             elif state in self.pivotal_states and state not in self._finding_blacklist:
                 path = self.plan_traversal(state, wide_goal)
                 if path:
+                    self._finding_blacklist.clear()
                     self._worker_state = WorkerState.TRAVERSAL
                     self.current_traversal_path = path
                     self.traversal_step = 0
@@ -1134,7 +1143,8 @@ class HierarchicalTrainer:
         manager_balls_snapshots = []
         
         horizon_counter = 0
-        
+        wide_blacklist: set = set()  # wide goals to avoid after narrow_goal timeout; cleared on goal reached
+
         while episode_steps < max_steps:
             # ── GOAL SELECTION (persistence) ──────────────────────────────────
             need_new_goal = (
@@ -1146,12 +1156,16 @@ class HierarchicalTrainer:
             )
 
             if need_new_goal:
+                if goal_reached_prev:
+                    wide_blacklist.clear()
                 if active_wide_goal is not None:
+                    if self.worker.narrow_goal_timed_out:
+                        wide_blacklist.add(active_wide_goal)
                     self.worker.reset_worker_state()  # resets traversal buffers + FSM to FINDING
 
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
                     state, step_count=self.global_step_counter, valid_cells=valid_cells,
-                    active_balls=list(self.env.active_balls)
+                    active_balls=list(self.env.active_balls), wide_blacklist=wide_blacklist
                 )
                 if self.manager.hidden_state is not None:
                     self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)

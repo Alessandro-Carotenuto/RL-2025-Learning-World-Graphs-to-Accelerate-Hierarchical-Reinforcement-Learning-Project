@@ -1237,13 +1237,8 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
             manager.entropy_coef = warmup_entropy if ep_in_phase < warmup_eps else base_entropy
 
             # ── Episode rollout ──────────────────────────────────────────────
-            spawn = random.choice(valid_cells)
-            env.agent_start_pos = spawn
-            env.agent_start_dir = random.randint(0, 3)
-            env.reset()
-            state = tuple(env.agent_pos)
-
-            active_balls       = set(env.active_balls)
+            state              = random.choice(valid_cells)
+            active_balls       = env.reset_for_wide_pretrain(valid_cells, config.get('num_balls', 5))
             initial_ball_count = len(active_balls)
 
             manager.reset_manager_state()
@@ -1283,7 +1278,7 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
                     active_balls.discard(closest)
                 else:
                     dist_to_closest = min(manhattan_distance(wide_goal, b) for b in active_balls)
-                    reward          = -dist_to_closest / maze_diagonal
+                    reward          = -min((dist_to_closest / pretrain_r) ** 2, 3.0)
 
                 m_dists.append(dist_to_closest)
                 m_states.append(state)

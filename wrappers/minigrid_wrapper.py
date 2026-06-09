@@ -803,6 +803,23 @@ class MinigridWrapper(MiniGridEnv):
         
         return obs, reward, terminated, truncated, info
 
+    def reset_for_wide_pretrain(self, valid_cells: list, num_balls: int) -> set:
+        """
+        Lightweight reset for manager wide pretrain: no BFS, no agent placement,
+        no full grid scan. Removes only current balls, places new ones directly.
+        """
+        for (bx, by) in self.active_balls:
+            self.grid.set(bx, by, None)
+
+        positions = random.sample(valid_cells, min(num_balls, len(valid_cells)))
+        for i, (px, py) in enumerate(positions):
+            self.grid.set(px, py, Ball(COLOR_NAMES[i % len(COLOR_NAMES)]))
+
+        self.active_balls    = set(positions)
+        self.total_balls     = len(positions)
+        self.balls_collected = 0
+        return set(self.active_balls)  # copy: caller can discard without corrupting env state
+
     def _process_obs(self, obs):
         # EXTRACT AND PROCESS THE OBSERVATIONS
         return obs
