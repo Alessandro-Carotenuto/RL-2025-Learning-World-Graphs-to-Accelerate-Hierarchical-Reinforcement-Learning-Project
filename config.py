@@ -43,6 +43,7 @@ externalconfig = {
     'manager_wide_horizons_per_episode':   20,
     'manager_wide_ppo_epochs':             4,
     'manager_wide_ppo_batch_size':         50,   # episodes per PPO update (1 = update every ep)
+    'manager_wide_lr_end_factor':          1.0,  # cosine LR end = manager_lr * this (1.0 = fixed LR)
     'manager_wide_er_buffer_size':         500,  # replay buffer capacity (0 = disabled)
     'manager_wide_er_update_freq':         50,   # sample+update every N new episodes
     'manager_wide_er_sample_size':         50,   # episodes sampled per update

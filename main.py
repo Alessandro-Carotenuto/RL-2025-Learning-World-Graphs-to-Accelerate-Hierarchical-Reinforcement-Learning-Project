@@ -1178,7 +1178,8 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
         episodes = config.get('manager_wide_pretrain_episodes', 0)
         phases = [{'episodes': episodes,
                    'r_offset': config.get('manager_wide_pretrain_r_offset', 0),
-                   'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
+                   'lr_start_factor': 1.0,
+                   'lr_end_factor': config.get('manager_wide_lr_end_factor', 1.0),
                    'entropy_coef': manager.entropy_coef,
                    'entropy_warmup_eps': 0, 'entropy_warmup_coef': manager.entropy_coef}]
 
