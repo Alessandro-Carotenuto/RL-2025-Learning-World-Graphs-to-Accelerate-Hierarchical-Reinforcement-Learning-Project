@@ -42,6 +42,12 @@ externalconfig = {
     # --- manager pretrain ---
     'manager_wide_horizons_per_episode':   20,
     'manager_wide_ppo_epochs':             4,
+    'manager_wide_ppo_batch_size':         50,   # episodes per PPO update (1 = update every ep)
+    'manager_wide_er_buffer_size':         500,  # replay buffer capacity (0 = disabled)
+    'manager_wide_er_update_freq':         50,   # sample+update every N new episodes
+    'manager_wide_er_sample_size':         50,   # episodes sampled per update
+    'manager_wide_er_alpha':               0.6,  # priority exponent
+    'manager_wide_er_reward_offset':       0.5,  # shift rewards before priority so mild misses aren't zeroed
     'manager_narrow_pretrain_episodes':    5000,  # 0 = skip
     'manager_narrow_horizons_per_episode': 20,
     'manager_narrow_ppo_epochs':           1,

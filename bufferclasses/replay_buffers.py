@@ -73,3 +73,41 @@ class WorkerEpisodeReplayBuffer:
 
     def __len__(self):
         return len(self._buf)
+
+
+#----------------------------------------------------------------------------#
+#                    WIDE PRETRAIN EPISODE REPLAY BUFFER                     #
+#----------------------------------------------------------------------------#
+class WidePretrainReplayBuffer:
+    """
+    PER episode-level buffer for manager wide pretrain.
+    Priority = (max(avg_reward + offset, 0) + eps)^alpha so that episodes
+    closer to balls (higher reward) get replayed more often.
+    No IS weights — PPO clip handles the off-policy correction.
+    """
+    def __init__(self, capacity, alpha=0.6, reward_offset=0.5):
+        self.capacity      = capacity
+        self.alpha         = alpha
+        self.reward_offset = reward_offset
+        self._buf          = []
+        self._prios        = np.zeros(capacity, dtype=np.float32)
+        self._pos          = 0
+
+    def add(self, rollout, avg_reward):
+        p = (max(avg_reward + self.reward_offset, 0.0) + 1e-6) ** self.alpha
+        if len(self._buf) < self.capacity:
+            self._buf.append(rollout)
+        else:
+            self._buf[self._pos] = rollout
+        self._prios[self._pos] = p
+        self._pos = (self._pos + 1) % self.capacity
+
+    def sample(self, n):
+        sz    = len(self._buf)
+        prios = self._prios[:sz]
+        probs = prios / prios.sum()
+        idxs  = np.random.choice(sz, size=min(n, sz), replace=(sz < n), p=probs)
+        return [self._buf[i] for i in idxs]
+
+    def __len__(self):
+        return len(self._buf)

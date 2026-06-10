@@ -1,1 +1,1 @@
-from .replay_buffers import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
+from .replay_buffers import NarrowReplayBuffer, WorkerEpisodeReplayBuffer, WidePretrainReplayBuffer

@@ -495,6 +495,92 @@ class HierarchicalManager(nn.Module):
         if verbose:
             print(f"{'='*70}\n")
 
+    def update_policy_batched(self, rollouts, ppo_epochs=4, clip_eps=0.2, entropy_coef_override=None):
+        """
+        Batched PPO update over multiple episode rollouts.
+        Sequence-batches each episode's LSTM (one call per episode per epoch instead of T calls),
+        then accumulates loss across all rollouts before a single backward pass per epoch.
+        """
+        _entropy_coef = self.entropy_coef if entropy_coef_override is None else entropy_coef_override
+
+        # Pre-build fixed tensors for each rollout (done once, reused across epochs)
+        prepared = []
+        for (states, wide_goals, narrow_goals, rewards, values, log_probs, entropies,
+             balls_snapshots, wide_idxs) in rollouts:
+            if len(rewards) <= 1:
+                continue
+
+            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+            values_t  = torch.stack(values).squeeze().detach()
+            if values_t.dim() == 0:
+                values_t = values_t.unsqueeze(0)
+            old_lps_t = torch.stack(log_probs).detach()
+
+            R = 0; rets = []
+            for r in reversed(rewards): R = r + self.gamma * R; rets.insert(0, R)
+            returns_t = torch.tensor(rets, dtype=torch.float32, device=self.device)
+
+            gae = 0; advantages = torch.zeros_like(rewards_t)
+            for t in reversed(range(len(rewards))):
+                next_val = values_t[t + 1] if t < len(rewards) - 1 else torch.tensor(0.0, device=self.device)
+                delta    = rewards_t[t] + self.gamma * next_val - values_t[t]
+                gae      = delta + self.gamma * 0.95 * gae
+                advantages[t] = gae
+            adv_std = advantages.std()
+            if adv_std > 1e-6:
+                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            else:
+                advantages = advantages - advantages.mean()
+            advantages = advantages.clamp(-3.0, 3.0)
+
+            # Build [1, T, 7] sequence input
+            T_len = len(states)
+            seq   = torch.zeros(T_len, 7, dtype=torch.float32, device=self.device)
+            balls_iter = balls_snapshots if balls_snapshots is not None else [None] * T_len
+            for t, (s_t, balls_t) in enumerate(zip(states, balls_iter)):
+                prev_gw = wide_goals[t - 1] if t > 0 else (0, 0)
+                if balls_t and len(balls_t) > 0:
+                    nb = min(balls_t, key=lambda b: abs(b[0] - s_t[0]) + abs(b[1] - s_t[1]))
+                    nb_x, nb_y, n_rem = float(nb[0]), float(nb[1]), float(len(balls_t))
+                else:
+                    nb_x, nb_y, n_rem = 0.0, 0.0, 0.0
+                seq[t] = torch.tensor([s_t[0], s_t[1], prev_gw[0], prev_gw[1], nb_x, nb_y, n_rem])
+            seq = seq.unsqueeze(0)  # [1, T, 7]
+
+            wide_idxs_t = torch.tensor(wide_idxs, dtype=torch.long, device=self.device)
+            prepared.append((seq, wide_idxs_t, old_lps_t, advantages, returns_t))
+
+        if not prepared:
+            return
+
+        for _epoch in range(ppo_epochs):
+            total_loss = torch.tensor(0.0, device=self.device)
+            for seq, wide_idxs_t, old_lps_t, advantages, returns_t in prepared:
+                lstm_out, _       = self.lstm(seq, None)              # [1, T, 64]
+                feats             = lstm_out.squeeze(0)               # [T, 64]
+                wide_logits_all   = self.wide_head(feats)             # [T, N_pivots]
+                values_new        = self.critic(feats).squeeze(-1)    # [T]
+
+                probs_all  = F.softmax(wide_logits_all, dim=-1)
+                new_lps_t  = torch.log(probs_all.gather(1, wide_idxs_t.unsqueeze(1)).squeeze(1) + 1e-8)
+                ents_t     = -(probs_all * torch.log(probs_all + 1e-8)).sum(dim=-1)
+
+                ratios     = torch.exp(new_lps_t - old_lps_t)
+                surr1      = ratios * advantages
+                surr2      = ratios.clamp(1 - clip_eps, 1 + clip_eps) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss  = F.mse_loss(values_new, returns_t)
+                entropy_mean = ents_t.mean()
+
+                total_loss = total_loss + (policy_loss + self.value_coef * value_loss
+                                           - _entropy_coef * entropy_mean)
+
+            total_loss = total_loss / len(prepared)
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
+            self.optimizer.step()
+
 
 #----------------------------------------------------------------------------#
 #                            WORKER FSM STATE ENUM                           #

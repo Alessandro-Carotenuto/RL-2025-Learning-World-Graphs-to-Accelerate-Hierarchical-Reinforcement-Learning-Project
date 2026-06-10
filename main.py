@@ -24,7 +24,7 @@ from utils.visualization import (plot_training_diagnostics, save_graph_visualiza
                                   plot_manager_wide_pretrain_diagnostics,
                                   plot_manager_narrow_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
-from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
+from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer, WidePretrainReplayBuffer
 from config import externalconfig
 
 #----------------------------------------------------------------------------#
@@ -1160,10 +1160,17 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     curriculum_manager_pretrain=True  → multi-phase curriculum via 'manager_wide_pretrain_phases'
     curriculum_manager_pretrain=False → single flat phase via 'manager_wide_pretrain_episodes'
     """
-    horizons_per_ep = config.get('manager_wide_horizons_per_episode', 20)
-    r               = config.get('neighborhood_size', 3)
-    base_lr         = config.get('manager_lr', 5e-4)
-    ppo_epochs      = config.get('manager_wide_ppo_epochs', 4)
+    horizons_per_ep  = config.get('manager_wide_horizons_per_episode', 20)
+    r                = config.get('neighborhood_size', 3)
+    base_lr          = config.get('manager_lr', 5e-4)
+    ppo_epochs       = config.get('manager_wide_ppo_epochs', 4)
+    ppo_batch_size   = config.get('manager_wide_ppo_batch_size', 1)
+    er_buffer_size   = config.get('manager_wide_er_buffer_size', 0)
+    er_update_freq   = config.get('manager_wide_er_update_freq', 50)
+    er_sample_size   = config.get('manager_wide_er_sample_size', 50)
+    er_alpha         = config.get('manager_wide_er_alpha', 0.6)
+    er_reward_offset = config.get('manager_wide_er_reward_offset', 0.5)
+    use_er           = er_buffer_size > 0
 
     if config.get('curriculum_manager_pretrain', True):
         phases = config['manager_wide_pretrain_phases']
@@ -1178,6 +1185,13 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     env.phase = 2
     env.fixed_ball_positions = None
 
+    env.randomgen = False
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.randomgen = True
+    env.firstgen  = False
+    env.reset()
+
     valid_cells = [
         (x, y)
         for x in range(1, env.width - 1)
@@ -1188,13 +1202,6 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     maze_diagonal = (env.width - 2) + (env.height - 2)
     if valid_cells:
         env.agent_start_pos = random.choice(valid_cells)
-
-    env.randomgen = False
-    env.reset()
-    restore_maze_from_grid_state(env, grid_state)
-    env.randomgen = True
-    env.firstgen  = False
-    env.reset()
 
     total_episodes = sum(p['episodes'] for p in phases)
     print(f"\n{'='*70}")
@@ -1207,6 +1214,10 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     avg_reward_history    = []
     avg_dist_history      = []
     global_episode        = 0
+    rollout_buffer        = []
+    er_buffer = WidePretrainReplayBuffer(er_buffer_size, alpha=er_alpha,
+                                         reward_offset=er_reward_offset) if use_er else None
+    er_new_since_update   = 0
 
     for phase_idx, phase in enumerate(phases):
         phase_episodes      = phase['episodes']
@@ -1297,18 +1308,35 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
             avg_dist_history.append(sum(m_dists)    / len(m_dists)    if m_dists    else 0.0)
 
             if len(m_rewards) > 1:
-                manager.update_policy(
-                    m_states, m_wide, m_narrow, m_rewards, m_values, m_log_probs, m_entropies,
-                    step_count=global_episode, balls_snapshots=m_balls, wide_idxs=m_wide_idxs,
-                    wide_only=False, ppo_epochs=ppo_epochs,
-                )
+                ep_avg_rew = sum(m_rewards) / len(m_rewards)
+                rollout    = (m_states, m_wide, m_narrow, m_rewards, m_values,
+                              m_log_probs, m_entropies, m_balls, m_wide_idxs)
+
+                if use_er:
+                    er_buffer.add(rollout, ep_avg_rew)
+                    er_new_since_update += 1
+                    if er_new_since_update >= er_update_freq and len(er_buffer) >= er_sample_size:
+                        batch = er_buffer.sample(er_sample_size)
+                        manager.update_policy_batched(
+                            batch, ppo_epochs=ppo_epochs,
+                            entropy_coef_override=manager.entropy_coef,
+                        )
+                        er_new_since_update = 0
+                else:
+                    rollout_buffer.append(rollout)
+                    if len(rollout_buffer) >= ppo_batch_size:
+                        manager.update_policy_batched(
+                            rollout_buffer, ppo_epochs=ppo_epochs,
+                            entropy_coef_override=manager.entropy_coef,
+                        )
+                        rollout_buffer = []
 
             global_episode += 1
 
-            if (global_episode) % 50 == 0:
-                recent      = ball_coverage_history[-50:]
-                recent_dist = avg_dist_history[-50:]
-                recent_rew  = avg_reward_history[-50:]
+            if (global_episode) % 500 == 0:
+                recent      = ball_coverage_history[-500:]
+                recent_dist = avg_dist_history[-500:]
+                recent_rew  = avg_reward_history[-500:]
                 avg_entropy = sum(m_entropies).item() / len(m_entropies) if m_entropies else 0.0
                 num_pivots  = len(manager.pivotal_states)
                 max_entropy = math.log(num_pivots) if num_pivots > 1 else 1.0
@@ -1319,6 +1347,13 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
                       f"AvgRew: {sum(recent_rew)/len(recent_rew):+.3f} | "
                       f"Entropy: {avg_entropy:.3f}/{max_entropy:.3f} "
                       f"({100*avg_entropy/max_entropy:.0f}%)")
+
+    if not use_er and rollout_buffer:
+        manager.update_policy_batched(
+            rollout_buffer, ppo_epochs=ppo_epochs,
+            entropy_coef_override=manager.entropy_coef,
+        )
+        rollout_buffer = []
 
     final_cov  = sum(ball_coverage_history[-100:]) / min(100, len(ball_coverage_history)) * 100
     final_dist = sum(avg_dist_history[-100:])      / min(100, len(avg_dist_history))
