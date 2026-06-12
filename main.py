@@ -1521,8 +1521,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                   f"Near(dist≤1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
                   f"Entropy: {avg_entropy:.3f}")
 
-        if len(hit_history) >= 10 and all(h == 1.0 for h in hit_history[-10:]):
-            print(f"  Early stopping at ep {episode+1}: 10 consecutive episodes at 100% hit rate.")
+        if len(hit_history) >= 50 and all(h == 1.0 for h in hit_history[-50:]):
+            print(f"  Early stopping at ep {episode+1}: 50 consecutive episodes at 100% hit rate.")
             break
 
     manager.entropy_coef = _original_entropy_coef
