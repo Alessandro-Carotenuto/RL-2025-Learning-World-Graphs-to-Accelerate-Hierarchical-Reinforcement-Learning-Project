@@ -1334,10 +1334,10 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
 
             global_episode += 1
 
-            if (global_episode) % 500 == 0:
-                recent      = ball_coverage_history[-500:]
-                recent_dist = avg_dist_history[-500:]
-                recent_rew  = avg_reward_history[-500:]
+            if (global_episode) % 10000 == 0:
+                recent      = ball_coverage_history[-10000:]
+                recent_dist = avg_dist_history[-10000:]
+                recent_rew  = avg_reward_history[-10000:]
                 avg_entropy = sum(m_entropies).item() / len(m_entropies) if m_entropies else 0.0
                 num_pivots  = len(manager.pivotal_states)
                 max_entropy = math.log(num_pivots) if num_pivots > 1 else 1.0
@@ -1637,6 +1637,11 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
 
     if config.get('manager_narrow_pretrain_episodes', 0) > 0:
         run_manager_narrow_pretrain(env, manager, grid_state, config, config['device'])
+
+    # Reset optimizer for Phase 3 with lower LR (fresh momentum, avoids pretrain gradient bleed)
+    phase3_lr = config.get('manager_phase3_lr', config['manager_lr'])
+    manager.optimizer = torch.optim.Adam(manager.parameters(), lr=phase3_lr)
+    print(f"Manager optimizer reset for Phase 3: lr={phase3_lr:.1e}")
 
     # Pre-training phases modify env state — restore correct Phase 3 configuration
     env.agent_start_pos = agent_start

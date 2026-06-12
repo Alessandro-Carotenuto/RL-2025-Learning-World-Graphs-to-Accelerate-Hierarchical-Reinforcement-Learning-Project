@@ -34,6 +34,7 @@ externalconfig = {
     'manager_horizon':          10,
     'neighborhood_size':        math.ceil(EnvSizes.MEDIUM.value / 8),
     'manager_lr':               5e-4,
+    'manager_phase3_lr':        5e-5,
     'worker_lr':                1e-4,
     'goal_timeout':             200,  # max steps on a goal before forcing replanning; drives narrow_goal_hard_timeout=//2, narrow_goal_timeout=//4
     'traversal_shaping_weight': 2.0,
@@ -43,8 +44,8 @@ externalconfig = {
     'manager_wide_horizons_per_episode':   20,
     'manager_wide_ppo_epochs':             4,
     'manager_wide_ppo_batch_size':         50,   # episodes per PPO update (1 = update every ep)
-    'manager_wide_lr_end_factor':          1.0,  # cosine LR end = manager_lr * this (1.0 = fixed LR)
-    'manager_wide_er_buffer_size':         500,  # replay buffer capacity (0 = disabled)
+    'manager_wide_lr_end_factor':          0.1,  # cosine LR end = manager_lr * this (1.0 = fixed LR)
+    'manager_wide_er_buffer_size':         0,    # replay buffer capacity (0 = disabled)
     'manager_wide_er_update_freq':         50,   # sample+update every N new episodes
     'manager_wide_er_sample_size':         50,   # episodes sampled per update
     'manager_wide_er_alpha':               0.6,  # priority exponent

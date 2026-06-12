@@ -1465,8 +1465,7 @@ class HierarchicalTrainer:
                 dist_wide_to_ball = min(
                     manhattan_distance(wide_goal, ball) for ball in starting_balls_snapshot
                 )
-                if dist_wide_to_ball <= 3:
-                    manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball) ** 2
+                manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball) ** 2
 
             # Push manager experience every horizon
             manager_states.append(starting_state_snapshot)
