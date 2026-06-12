@@ -45,11 +45,6 @@ externalconfig = {
     'manager_wide_ppo_epochs':             4,
     'manager_wide_ppo_batch_size':         50,   # episodes per PPO update (1 = update every ep)
     'manager_wide_lr_end_factor':          0.1,  # cosine LR end = manager_lr * this (1.0 = fixed LR)
-    'manager_wide_er_buffer_size':         0,    # replay buffer capacity (0 = disabled)
-    'manager_wide_er_update_freq':         50,   # sample+update every N new episodes
-    'manager_wide_er_sample_size':         50,   # episodes sampled per update
-    'manager_wide_er_alpha':               0.6,  # priority exponent
-    'manager_wide_er_reward_offset':       0.5,  # shift rewards before priority so mild misses aren't zeroed
     'manager_narrow_pretrain_episodes':    5000,  # 0 = skip
     'manager_narrow_horizons_per_episode': 20,
     'manager_narrow_ppo_epochs':           1,
@@ -65,23 +60,8 @@ externalconfig = {
     'manager_narrow_entropy_start':        0.3,   # entropy_coef at ep 0 (prevents early collapse)
     'manager_narrow_entropy_end':          0.001, # entropy_coef at final ep
 
-    # curriculum_manager_pretrain=True  → use phases below
-    # curriculum_manager_pretrain=False → single flat phase with manager_wide_pretrain_episodes
-    'curriculum_manager_pretrain':       False,
-    'manager_wide_pretrain_episodes':    1,  # used only when curriculum_manager_pretrain=False
-    'manager_wide_pretrain_r_offset':    2,  # r_offset for non-curriculum mode
-
-    # curriculum phases (r_offset added to neighborhood_size)
-    # each phase: {episodes, r_offset, lr_start_factor, lr_end_factor,
-    #              entropy_coef, entropy_warmup_eps, entropy_warmup_coef}
-    'manager_wide_pretrain_phases': [
-        {'episodes': 30000, 'r_offset': 2, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 0,   'entropy_warmup_coef': 0.001},
-        {'episodes': 20000, 'r_offset': 1, 'lr_start_factor': 1.0, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
-        {'episodes': 10000, 'r_offset': 0, 'lr_start_factor': 1.2, 'lr_end_factor': 0.1,
-         'entropy_coef': 0.001, 'entropy_warmup_eps': 500, 'entropy_warmup_coef': 0.005},
-    ],
+    'manager_wide_pretrain_episodes':    1,
+    'manager_wide_pretrain_r_offset':    2,
 
     # --- PPO ---
     'ppo_epochs':   4,
