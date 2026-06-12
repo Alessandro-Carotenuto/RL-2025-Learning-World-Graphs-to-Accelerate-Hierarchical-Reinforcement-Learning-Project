@@ -1461,11 +1461,14 @@ class HierarchicalTrainer:
             # Traversal completion bonus: reward manager for arriving at wide_goal via graph,
             # scaled by proximity of wide_goal to nearest ball. Fires reliably (traversal is
             # deterministic) giving the wide head a direct gradient toward ball-adjacent pivotals.
+            # Cutoff at neighborhood_size: if the pivot is further than r from every ball,
+            # the narrow head cannot reach that ball anyway — rewarding it is misleading.
             if traversal_completed_this_horizon and len(starting_balls_snapshot) > 0:
                 dist_wide_to_ball = min(
                     manhattan_distance(wide_goal, ball) for ball in starting_balls_snapshot
                 )
-                manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball) ** 2
+                if dist_wide_to_ball <= self.manager.neighborhood_size:
+                    manager_reward += self.traversal_shaping_weight / (1.0 + dist_wide_to_ball) ** 2
 
             # Push manager experience every horizon
             manager_states.append(starting_state_snapshot)
