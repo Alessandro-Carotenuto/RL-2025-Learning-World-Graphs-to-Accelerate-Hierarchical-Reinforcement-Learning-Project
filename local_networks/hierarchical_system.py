@@ -149,7 +149,7 @@ class HierarchicalManager(nn.Module):
     def _nearest_valid_cell(self, center: Tuple[int, int], valid_cells: set) -> Tuple[int, int]:
         return min(valid_cells, key=lambda c: abs(c[0] - center[0]) + abs(c[1] - center[1]))
 
-    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None, active_balls=None) -> Tuple[Tuple[int, int], torch.Tensor]:
+    def select_narrow_goal(self, state: Tuple[int, int], wide_goal: Tuple[int, int], valid_cells=None, active_balls=None, narrow_blacklist=None) -> Tuple[Tuple[int, int], torch.Tensor]:
         if active_balls:
             nearest = min(active_balls, key=lambda b: abs(b[0] - wide_goal[0]) + abs(b[1] - wide_goal[1]))
             dx, dy = float(nearest[0] - wide_goal[0]), float(nearest[1] - wide_goal[1])
@@ -165,6 +165,12 @@ class HierarchicalManager(nn.Module):
             if not valid_indices:
                 return self._nearest_valid_cell(wide_goal, valid_cells), torch.tensor(0.0, device=self.device)
 
+            # Exclude blacklisted cells; fallback to all valid if all are blacklisted
+            if narrow_blacklist:
+                candidates = [i for i in valid_indices if neighborhood_full[i] not in narrow_blacklist]
+                if candidates:
+                    valid_indices = candidates
+
             idx_t = torch.tensor(valid_indices, dtype=torch.long, device=self.device)
             valid_logits = narrow_logits[idx_t]
             valid_probs = F.softmax(valid_logits, dim=0)
@@ -174,12 +180,20 @@ class HierarchicalManager(nn.Module):
             narrow_goal = neighborhood_full[valid_indices[local_idx.item()]]
             return narrow_goal, log_prob
 
+        # No valid_cells: mask blacklisted indices directly in logits
+        if narrow_blacklist:
+            non_blacklisted = [i for i, cell in enumerate(neighborhood_full) if cell not in narrow_blacklist]
+            if non_blacklisted:  # fallback: if all cells blacklisted, ignore blacklist
+                for i, cell in enumerate(neighborhood_full):
+                    if cell in narrow_blacklist:
+                        narrow_logits[i] = -1e9
+
         narrow_probs = F.softmax(narrow_logits, dim=0)
         dist = torch.distributions.Categorical(narrow_probs)
         idx = dist.sample()
         return neighborhood_full[idx.item()], dist.log_prob(idx)
     
-    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None, wide_blacklist=None):
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None, wide_blacklist=None, narrow_blacklist=None):
         verbose = self.action_verbose and (
             (self.diagnostic_checkstart and step_count < 15) or
             (step_count % self.diagnostic_interval == 0)
@@ -223,7 +237,7 @@ class HierarchicalManager(nn.Module):
 
         # Pass 2: narrow goal — LSTM now sees updated prev_wide_goal as context
         self._valid_cells = valid_cells
-        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells, active_balls=active_balls)
+        narrow_goal, narrow_log_prob = self.select_narrow_goal(state, wide_goal, valid_cells=valid_cells, active_balls=active_balls, narrow_blacklist=narrow_blacklist)
         combined_log_prob = wide_log_prob + narrow_log_prob
 
         if verbose:
@@ -1154,7 +1168,7 @@ class HierarchicalTrainer:
         }
 
         self.worker_shaping_weight=0.2   # max ~0.15/horizon << success reward 1.0
-        self.manager_shaping_weight=1
+        self.manager_shaping_weight=5
         self.narrow_shaping_weight=narrow_shaping_weight
         self.traversal_shaping_weight=traversal_shaping_weight
         self.manhattan_distance_rew_shaping=workershaping
@@ -1229,7 +1243,8 @@ class HierarchicalTrainer:
         manager_balls_snapshots = []
         
         horizon_counter = 0
-        wide_blacklist: set = set()  # wide goals to avoid after narrow_goal timeout; cleared on goal reached
+        wide_blacklist: set = set()   # wide goals to avoid after narrow_goal timeout; cleared on goal reached
+        narrow_blacklist: set = set() # narrow goals already reached without collecting a ball this episode
 
         while episode_steps < max_steps:
             # ── GOAL SELECTION (persistence) ──────────────────────────────────
@@ -1242,6 +1257,11 @@ class HierarchicalTrainer:
             )
 
             if need_new_goal:
+                if ball_collected_prev:
+                    narrow_blacklist.clear()  # ball collected → new context, restart exploration
+                    wide_blacklist.clear()    # ball collected → old stuck-pivot entries no longer relevant
+                elif goal_reached_prev and active_narrow_goal is not None:
+                    narrow_blacklist.add(active_narrow_goal)  # reached but no ball → don't revisit
                 if goal_reached_prev:
                     wide_blacklist.clear()
                 if active_wide_goal is not None:
@@ -1251,7 +1271,8 @@ class HierarchicalTrainer:
 
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
                     state, step_count=self.global_step_counter, valid_cells=valid_cells,
-                    active_balls=list(self.env.active_balls), wide_blacklist=wide_blacklist
+                    active_balls=list(self.env.active_balls), wide_blacklist=wide_blacklist,
+                    narrow_blacklist=narrow_blacklist
                 )
                 if self.manager.hidden_state is not None:
                     self.manager.hidden_state = tuple(h.detach() for h in self.manager.hidden_state)

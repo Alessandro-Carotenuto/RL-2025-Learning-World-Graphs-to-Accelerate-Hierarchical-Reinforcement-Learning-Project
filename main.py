@@ -1189,7 +1189,7 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
     print(f"\n{'='*70}")
     print(f"INTERMEDIATE PHASE: Manager Wide Goal Pre-training")
     print(f"  {episodes} ep | {horizons_per_ep} horizons/ep | pretrain_r={pretrain_r} | "
-          f"LR {lr_start:.1e}→{lr_end:.1e} cosine | diagonal={maze_diagonal}")
+          f"LR {lr_start:.1e}->{lr_end:.1e} cosine | diagonal={maze_diagonal}")
     print(f"{'='*70}")
 
     ball_coverage_history = []
@@ -1321,6 +1321,11 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
 
     # Restore Phase 1 maze first so valid_cells is computed from clean grid (no balls)
     env.randomgen = False
+    # Set a safe start pos from grid_state before reset (current grid may have balls on agent_start_pos)
+    temp_valid = [(x, y) for x in range(1, env.width - 1) for y in range(1, env.height - 1)
+                  if grid_state[y][x] != '#']
+    if temp_valid:
+        env.agent_start_pos = random.choice(temp_valid)
     env.reset()
     restore_maze_from_grid_state(env, grid_state)
 
@@ -1477,8 +1482,8 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                     pg['_saved_lr'] = pg['lr']
                     pg['lr']        = pg['lr'] * per_lr_factor
 
-                pbar = tqdm(range(n_steps), desc=f"[PER ep {ep1}]", leave=False)
-                for _ in pbar:
+                per_loss_sum, per_ent_sum, per_steps_done = 0.0, 0.0, 0
+                for _ in range(n_steps):
                     samples, weights = replay_buffer.sample(per_batch_size, beta)
                     new_lps, old_lps, advantages, entropies_r = [], [], [], []
                     for (dx_r, dy_r, wg_r, ng_r, rew_r, old_lp_r), w in zip(samples, weights):
@@ -1506,7 +1511,13 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(manager.narrow_head.parameters(), max_norm=0.5)
                         manager.optimizer.step()
-                        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'ent': f'{ent_t.item():.3f}'})
+                        per_loss_sum += loss.item()
+                        per_ent_sum  += ent_t.item()
+                        per_steps_done += 1
+                if per_steps_done > 0:
+                    print(f"    [PER ep {ep1}] steps={per_steps_done} | "
+                          f"loss={per_loss_sum/per_steps_done:.4f} | "
+                          f"ent={per_ent_sum/per_steps_done:.3f}")
 
                 # restore lr
                 for pg in manager.optimizer.param_groups:
@@ -1518,7 +1529,7 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
             avg_entropy = sum(m_entropies).item() / len(m_entropies) if m_entropies else 0.0
             print(f"  Ep {episode+1:>5}/{episodes} | "
                   f"Hit(dist=0): {sum(recent_hit)/len(recent_hit)*100:.1f}% | "
-                  f"Near(dist≤1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
+                  f"Near(dist<=1): {sum(recent_near)/len(recent_near)*100:.1f}% | "
                   f"Entropy: {avg_entropy:.3f}")
 
         if len(hit_history) >= 50 and all(h == 1.0 for h in hit_history[-50:]):
