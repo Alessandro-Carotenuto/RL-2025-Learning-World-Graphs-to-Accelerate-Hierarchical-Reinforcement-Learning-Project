@@ -500,7 +500,7 @@ def render_phase3_episode_gif(checkpoint_path, filename='phase3_final_episode.mp
 
 def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                           ball_positions, filename, fps, max_steps,
-                          world_graph=None, pivotal_states=None):
+                          world_graph=None, pivotal_states=None, temperature: float = 0.3):
     env = MinigridWrapper(
         size=config['maze_size'],
         mode=EnvModes.MULTIGOAL,
@@ -628,7 +628,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     worker.reset_worker_state()
                     wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
                         state, step_count=999999, valid_cells=valid_cells,
-                        active_balls=list(env.active_balls)
+                        active_balls=list(env.active_balls), temperature=temperature
                     )
                     if manager.hidden_state is not None:
                         manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)

@@ -1653,6 +1653,7 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
                 manager, worker, config, grid_state, agent_start, first_balls,
                 f'phase3_final_episode_{_ep_i + 1}.mp4', fps=15, max_steps=500,
                 world_graph=world_graph, pivotal_states=pivotal_states,
+                temperature=0.3,
             )
 
     return metrics

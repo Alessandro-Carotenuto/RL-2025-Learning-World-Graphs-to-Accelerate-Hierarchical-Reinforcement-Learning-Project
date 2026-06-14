@@ -193,7 +193,7 @@ class HierarchicalManager(nn.Module):
         idx = dist.sample()
         return neighborhood_full[idx.item()], dist.log_prob(idx)
     
-    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None, wide_blacklist=None, narrow_blacklist=None):
+    def get_manager_action(self, state: Tuple[int, int], step_count: int = 0, valid_cells=None, active_balls=None, wide_blacklist=None, narrow_blacklist=None, temperature: float = 1.0):
         verbose = self.action_verbose and (
             (self.diagnostic_checkstart and step_count < 15) or
             (step_count % self.diagnostic_interval == 0)
@@ -216,7 +216,7 @@ class HierarchicalManager(nn.Module):
                 for i in blacklisted:
                     wide_logits[i] = -1e9
 
-        wide_probs = F.softmax(wide_logits, dim=0)
+        wide_probs = F.softmax(wide_logits / temperature, dim=0)
         entropy = -(wide_probs * torch.log(wide_probs + 1e-8)).sum()
 
         wide_dist = torch.distributions.Categorical(wide_probs)
@@ -680,6 +680,8 @@ class HierarchicalWorker(nn.Module):
         self._narrow_goal_steps: int = 0       # steps spent in NARROW_GOAL since entry
         self.narrow_goal_timeout: int = 30     # steps in NARROW_GOAL without reaching it → force manager replanning
         self.narrow_goal_timed_out: bool = False  # trainer checks this to trigger goal change
+        self._spinning_steps: int = 0          # consecutive NARROW_GOAL steps without x,y change
+        self.spinning_timeout: int = 10        # spinning steps before forcing replanning
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -705,7 +707,20 @@ class HierarchicalWorker(nn.Module):
         self._finding_blacklist = set()
         self._narrow_goal_steps = 0
         self.narrow_goal_timed_out = False
-    
+        self._spinning_steps = 0
+
+    def report_step(self, prev_state: Tuple[int, int], next_state: Tuple[int, int]):
+        """Called by trainer after each env step. Detects spinning in NARROW_GOAL and fires replanning."""
+        if self._worker_state != WorkerState.NARROW_GOAL:
+            self._spinning_steps = 0
+            return
+        if prev_state == next_state:
+            self._spinning_steps += 1
+            if self._spinning_steps >= self.spinning_timeout:
+                self.narrow_goal_timed_out = True
+        else:
+            self._spinning_steps = 0
+
     def build_wall_mask(self, width: int, height: int):
         """Precompute pre-padded wall mask from valid_cells. Call once after setting valid_cells."""
         half = self.wall_patch_size // 2
@@ -1257,11 +1272,10 @@ class HierarchicalTrainer:
             )
 
             if need_new_goal:
+                if active_narrow_goal is not None:
+                    narrow_blacklist.add(active_narrow_goal)  # always blacklist: narrow goals never re-selected in same episode
                 if ball_collected_prev:
-                    narrow_blacklist.clear()  # ball collected → new context, restart exploration
                     wide_blacklist.clear()    # ball collected → old stuck-pivot entries no longer relevant
-                elif goal_reached_prev and active_narrow_goal is not None:
-                    narrow_blacklist.add(active_narrow_goal)  # reached but no ball → don't revisit
                 if goal_reached_prev:
                     wide_blacklist.clear()
                 if active_wide_goal is not None:
@@ -1269,9 +1283,10 @@ class HierarchicalTrainer:
                         wide_blacklist.add(active_wide_goal)
                     self.worker.reset_worker_state()  # resets traversal buffers + FSM to FINDING
 
+                no_repeat_blacklist = wide_blacklist | ({active_wide_goal} if active_wide_goal is not None else set())
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
                     state, step_count=self.global_step_counter, valid_cells=valid_cells,
-                    active_balls=list(self.env.active_balls), wide_blacklist=wide_blacklist,
+                    active_balls=list(self.env.active_balls), wide_blacklist=no_repeat_blacklist,
                     narrow_blacklist=narrow_blacklist
                 )
                 if self.manager.hidden_state is not None:
@@ -1360,6 +1375,8 @@ class HierarchicalTrainer:
                     next_state = state
                     terminated = False
                     truncated = False
+
+                self.worker.report_step(state, next_state)
 
                 # Local goal achievement tracking (MLP steps only)
                 if self.worker._last_local_goal is not None:
