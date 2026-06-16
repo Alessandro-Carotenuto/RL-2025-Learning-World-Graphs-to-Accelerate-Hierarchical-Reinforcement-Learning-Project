@@ -878,7 +878,10 @@ class HierarchicalWorker(nn.Module):
 
         # ── MLP NAVIGATION (FINDING or NARROW_GOAL) ────────────────────────────
         if self._worker_state == WorkerState.FINDING:
-            # Steer toward nearest pivotal state; exclude current pos and timed-out pivots
+            # Steer toward nearest pivotal state; exclude current pos and timed-out pivots.
+            # Always prefer wide_goal directly when it's a valid candidate — avoids the
+            # one-step display artifact where the agent lands on wide_goal while targeting
+            # a different pivot, and makes FINDING take the most direct route.
             candidates = [p for p in self.pivotal_states
                           if p != state and p not in self._finding_blacklist]
             if not candidates:
@@ -887,8 +890,11 @@ class HierarchicalWorker(nn.Module):
                 self._finding_local_goal = None
                 self._finding_steps = 0
                 candidates = [p for p in self.pivotal_states if p != state]
-            local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
-                          if candidates else narrow_goal)
+            if wide_goal in candidates:
+                local_goal = wide_goal
+            else:
+                local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
+                              if candidates else narrow_goal)
             # Timer: if same target, tick; on timeout blacklist it and pick next
             if local_goal == self._finding_local_goal:
                 self._finding_steps += 1
@@ -906,10 +912,11 @@ class HierarchicalWorker(nn.Module):
                 self._finding_local_goal = local_goal
                 self._finding_steps = 0
         else:   # NARROW_GOAL
-            self._narrow_goal_steps += 1
-            if self._narrow_goal_steps >= self.narrow_goal_timeout:
-                if diag: print(f"  [WORKER] NARROW_GOAL timeout ({self._narrow_goal_steps} steps) → request replanning")
-                self.narrow_goal_timed_out = True
+            if state != narrow_goal:  # don't count steps once already on the goal cell
+                self._narrow_goal_steps += 1
+                if self._narrow_goal_steps >= self.narrow_goal_timeout:
+                    if diag: print(f"  [WORKER] NARROW_GOAL timeout ({self._narrow_goal_steps} steps) → request replanning")
+                    self.narrow_goal_timed_out = True
             local_goal = narrow_goal
 
         self._last_local_goal = local_goal  # expose for diagnostics
@@ -1274,13 +1281,13 @@ class HierarchicalTrainer:
             if need_new_goal:
                 if active_narrow_goal is not None:
                     narrow_blacklist.add(active_narrow_goal)  # always blacklist: narrow goals never re-selected in same episode
-                if ball_collected_prev:
-                    wide_blacklist.clear()    # ball collected → old stuck-pivot entries no longer relevant
-                if goal_reached_prev:
+                if ball_collected_prev or goal_reached_prev:
                     wide_blacklist.clear()
-                if active_wide_goal is not None:
-                    if self.worker.narrow_goal_timed_out:
+                elif self.worker.narrow_goal_timed_out:
+                    # Only blacklist the pivot when the goal was NOT reached (worker was genuinely stuck)
+                    if active_wide_goal is not None:
                         wide_blacklist.add(active_wide_goal)
+                if active_wide_goal is not None:
                     self.worker.reset_worker_state()  # resets traversal buffers + FSM to FINDING
 
                 no_repeat_blacklist = wide_blacklist | ({active_wide_goal} if active_wide_goal is not None else set())
@@ -1405,9 +1412,6 @@ class HierarchicalTrainer:
                 if self.manhattan_distance_rew_shaping:
                     worker_reward += progress_bonus * self.worker_shaping_weight
                 
-                if next_state == narrow_goal:
-                    goal_reached_this_horizon = True
-                
                 # Store Worker experience
                 # Only store if worker is NOT traversing
                 if not self.worker.current_traversal_path:
@@ -1416,24 +1420,28 @@ class HierarchicalTrainer:
                     worker_rewards.append(worker_reward)
                     worker_values.append(worker_value)
                     worker_log_probs.append(worker_log_prob)
-                
-                # # Update Worker every step
-                # if len(worker_rewards) > 0:
-                #     self.worker.update_policy(
-                #         [worker_states[-1]], [worker_actions[-1]], [worker_rewards[-1]],
-                #         [worker_values[-1]], [worker_log_probs[-1]]
-                #     )
-                #     worker_updates += 1
-                
+
                 # Track episode stats
                 horizon_env_reward += env_reward
                 episode_reward += env_reward
-                
-                
+
                 self.global_step_counter += 1
                 episode_steps += 1
                 state = next_state
-                
+
+                # TEMP DIAGNOSTIC — remove once bug is identified
+                _dist_to_narrow = abs(next_state[0] - narrow_goal[0]) + abs(next_state[1] - narrow_goal[1])
+                if _dist_to_narrow <= 1:
+                    print(f"[NARROW DBG] dist={_dist_to_narrow} "
+                          f"next_state={next_state} ({type(next_state[0]).__name__}) "
+                          f"narrow_goal={narrow_goal} ({type(narrow_goal[0]).__name__}) "
+                          f"equal={next_state == narrow_goal} "
+                          f"worker_state={self.worker._worker_state.name}")
+
+                if next_state == narrow_goal:
+                    goal_reached_this_horizon = True
+                    break  # don't waste remaining horizon steps after goal reached
+
                 if terminated or truncated:
                     break
             
