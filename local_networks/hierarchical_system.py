@@ -1334,6 +1334,8 @@ class HierarchicalTrainer:
             horizon_env_reward = 0
             goal_reached_this_horizon = False
             traversal_completed_this_horizon = False
+            terminated = False
+            truncated = False
 
             # Save starting state for Manager reward shaping
             starting_state_snapshot = state
@@ -1434,15 +1436,6 @@ class HierarchicalTrainer:
                 self.global_step_counter += 1
                 episode_steps += 1
                 state = next_state
-
-                # TEMP DIAGNOSTIC — remove once bug is identified
-                _dist_to_narrow = abs(next_state[0] - narrow_goal[0]) + abs(next_state[1] - narrow_goal[1])
-                if _dist_to_narrow <= 1:
-                    print(f"[NARROW DBG] dist={_dist_to_narrow} "
-                          f"next_state={next_state} ({type(next_state[0]).__name__}) "
-                          f"narrow_goal={narrow_goal} ({type(narrow_goal[0]).__name__}) "
-                          f"equal={next_state == narrow_goal} "
-                          f"worker_state={self.worker._worker_state.name}")
 
                 if next_state == narrow_goal:
                     goal_reached_this_horizon = True
