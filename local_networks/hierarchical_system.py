@@ -710,14 +710,12 @@ class HierarchicalWorker(nn.Module):
         self._spinning_steps = 0
 
     def report_step(self, prev_state: Tuple[int, int], next_state: Tuple[int, int]):
-        """Called by trainer after each env step. Detects spinning in NARROW_GOAL and fires replanning."""
-        if self._worker_state != WorkerState.NARROW_GOAL:
-            self._spinning_steps = 0
-            return
+        """Called by trainer after each env step. Detects spinning in any FSM state."""
         if prev_state == next_state:
             self._spinning_steps += 1
             if self._spinning_steps >= self.spinning_timeout:
                 self.narrow_goal_timed_out = True
+                self._spinning_steps = 0  # prevent repeated firing within same horizon
         else:
             self._spinning_steps = 0
 
@@ -1342,6 +1340,14 @@ class HierarchicalTrainer:
             starting_balls_snapshot = list(self.env.active_balls)
 
             for h in range(self.horizon):
+                # Check goal at step entry: agent may already be at narrow_goal from
+                # the previous step's move (or instant_traversal teleport to wide_goal
+                # when wide_goal == narrow_goal).  The post-action check misses this
+                # because the MLP would take an action and move away first.
+                if state == narrow_goal:
+                    goal_reached_this_horizon = True
+                    break
+
                 # BEFORE taking action, record distance FOR SHAPING
                 old_dist_narrow = manhattan_distance(state, narrow_goal)
                 old_dist_wide = manhattan_distance(state, wide_goal)

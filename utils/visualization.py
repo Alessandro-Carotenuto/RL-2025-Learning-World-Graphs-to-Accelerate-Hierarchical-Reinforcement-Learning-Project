@@ -601,6 +601,8 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     ball_collected_prev = False
     wide_goal = manager.pivotal_states[0]
     narrow_goal = manager.pivotal_states[0]
+    wide_blacklist: set = set()
+    narrow_blacklist: set = set()
 
     first_frame = env.render()
     if overlay_enabled:
@@ -623,12 +625,22 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     or goal_reached_prev
                     or ball_collected_prev
                     or horizons_on_goal >= goal_timeout
+                    or worker.narrow_goal_timed_out
                 )
                 if need_new_goal:
+                    if active_narrow_goal is not None:
+                        narrow_blacklist.add(active_narrow_goal)
+                    if ball_collected_prev or goal_reached_prev:
+                        wide_blacklist.clear()
+                    elif worker.narrow_goal_timed_out:
+                        if active_wide_goal is not None:
+                            wide_blacklist.add(active_wide_goal)
                     worker.reset_worker_state()
+                    no_repeat_blacklist = wide_blacklist | ({active_wide_goal} if active_wide_goal is not None else set())
                     wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
                         state, step_count=999999, valid_cells=valid_cells,
-                        active_balls=list(env.active_balls), temperature=temperature
+                        active_balls=list(env.active_balls), temperature=temperature,
+                        wide_blacklist=no_repeat_blacklist, narrow_blacklist=narrow_blacklist
                     )
                     if manager.hidden_state is not None:
                         manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
@@ -641,12 +653,14 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 goal_reached_this_horizon = False
                 starting_balls_snapshot = list(env.active_balls)
 
+            prev_state = state
             action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
             try:
                 obs, _, terminated, truncated, _ = env.step(action)
             except (AssertionError, IndexError):
                 terminated, truncated = False, False
             state = tuple(env.agent_pos)
+            worker.report_step(prev_state, state)
 
             if state == narrow_goal:
                 goal_reached_this_horizon = True
