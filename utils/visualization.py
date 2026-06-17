@@ -536,7 +536,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     else:
         print(f"[VIDEO] Overlay OFF: world_graph={world_graph is not None}, pivotal_states={pivotal_states is not None}")
 
-    def apply_overlay(frame, wg, ng, traversal_path=None, active_balls=None, agent_state=None, local_goal=None):
+    def apply_overlay(frame, wg, ng, traversal_path=None, active_balls=None, agent_state=None, local_goal=None, wide_blacklist=None, narrow_blacklist=None, finding_blacklist=None):
         tile_size = frame.shape[1] // env.width
 
         def px(coord):
@@ -584,6 +584,15 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 fill=(255, 200, 50, 120)  # yellow, FINDING local goal
             )
 
+        blacklisted = (wide_blacklist or set()) | (narrow_blacklist or set()) | (finding_blacklist or set())
+        for cell in blacklisted:
+            bx, by = cell
+            draw.rectangle(
+                [(bx * tile_size, by * tile_size),
+                 ((bx + 1) * tile_size - 1, (by + 1) * tile_size - 1)],
+                fill=(220, 30, 30, 100)  # red, blacklisted cell
+            )
+
         if agent_state is not None and active_balls:
             nearest_ball = min(active_balls,
                                key=lambda b: abs(b[0] - agent_state[0]) + abs(b[1] - agent_state[1]))
@@ -607,7 +616,8 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     first_frame = env.render()
     if overlay_enabled:
         first_frame = apply_overlay(first_frame, None, None,
-                                    active_balls=list(env.active_balls), agent_state=state)
+                                    active_balls=list(env.active_balls), agent_state=state,
+                                    wide_blacklist=wide_blacklist, narrow_blacklist=narrow_blacklist)
     frames = [first_frame]
 
     done = False
@@ -624,12 +634,13 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                     active_wide_goal is None
                     or goal_reached_prev
                     or ball_collected_prev
-                    or horizons_on_goal >= goal_timeout
+                    or horizons_on_goal * horizon >= goal_timeout
                     or worker.narrow_goal_timed_out
                 )
                 if need_new_goal:
                     if active_narrow_goal is not None:
-                        narrow_blacklist.add(active_narrow_goal)
+                        if goal_reached_prev or horizons_on_goal * horizon >= goal_timeout or worker.narrow_goal_timed_out:
+                            narrow_blacklist.add(active_narrow_goal)
                     if ball_collected_prev or goal_reached_prev:
                         wide_blacklist.clear()
                     elif worker.narrow_goal_timed_out:
@@ -653,22 +664,33 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 goal_reached_this_horizon = False
                 starting_balls_snapshot = list(env.active_balls)
 
+            terminated, truncated = False, False
             prev_state = state
-            action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
-            try:
-                obs, _, terminated, truncated, _ = env.step(action)
-            except (AssertionError, IndexError):
-                terminated, truncated = False, False
-            state = tuple(env.agent_pos)
-            worker.report_step(prev_state, state)
 
-            if state == narrow_goal:
+            # Pre-action check: mirrors train_episode inner-loop entry guard.
+            # If already at narrow_goal, skip the action entirely (training breaks here).
+            if state == narrow_goal and not goal_reached_this_horizon:
                 goal_reached_this_horizon = True
-                horizon_step = horizon - 1  # force horizon end at next increment
+                horizon_step = horizon - 1  # force horizon end on next increment
+            else:
+                action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
+                try:
+                    obs, _, terminated, truncated, _ = env.step(action)
+                except (AssertionError, IndexError):
+                    terminated, truncated = False, False
+                state = tuple(env.agent_pos)
+                worker.report_step(prev_state, state)
 
-            # FINDING local goal: nearest pivotal state (excluding current pos)
+                if state == narrow_goal and not goal_reached_this_horizon:
+                    goal_reached_this_horizon = True
+                    horizon_step = horizon - 1  # force horizon end at next increment
+
+            # FINDING local goal: mirrors get_action() — nearest non-blacklisted pivot
             if worker._worker_state == WorkerState.FINDING and worker.pivotal_states:
-                candidates = [p for p in worker.pivotal_states if p != state]
+                candidates = [p for p in worker.pivotal_states
+                              if p != state and p not in worker._finding_blacklist]
+                if not candidates:
+                    candidates = [p for p in worker.pivotal_states if p != state]
                 local_goal_vis = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
                                   if candidates else None)
             else:
@@ -679,7 +701,9 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 frame = apply_overlay(frame, wide_goal, narrow_goal,
                                       traversal_path=worker.current_traversal_path or None,
                                       active_balls=list(env.active_balls), agent_state=state,
-                                      local_goal=local_goal_vis)
+                                      local_goal=local_goal_vis,
+                                      wide_blacklist=wide_blacklist, narrow_blacklist=narrow_blacklist,
+                                      finding_blacklist=worker._finding_blacklist)
             frames.append(frame)
             done = terminated or truncated
             step += 1

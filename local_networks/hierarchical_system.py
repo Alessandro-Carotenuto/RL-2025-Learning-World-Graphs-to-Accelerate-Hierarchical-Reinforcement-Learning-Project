@@ -681,7 +681,7 @@ class HierarchicalWorker(nn.Module):
         self.narrow_goal_timeout: int = 30     # steps in NARROW_GOAL without reaching it → force manager replanning
         self.narrow_goal_timed_out: bool = False  # trainer checks this to trigger goal change
         self._spinning_steps: int = 0          # consecutive NARROW_GOAL steps without x,y change
-        self.spinning_timeout: int = 10        # spinning steps before forcing replanning
+        self.spinning_timeout: int = 15        # spinning steps before forcing replanning
 
         # Set of traversable (x,y) cells — used by forward() to compute wall flags.
         # Must be populated before the first call to forward() (set by trainer/pretrain).
@@ -710,12 +710,21 @@ class HierarchicalWorker(nn.Module):
         self._spinning_steps = 0
 
     def report_step(self, prev_state: Tuple[int, int], next_state: Tuple[int, int]):
-        """Called by trainer after each env step. Detects spinning in any FSM state."""
+        """Called by trainer after each env step. Detects spinning in any FSM state.
+        In FINDING: blacklists the current local goal and picks a new one (no manager replanning).
+        In NARROW_GOAL: signals the manager to replan via narrow_goal_timed_out."""
         if prev_state == next_state:
             self._spinning_steps += 1
             if self._spinning_steps >= self.spinning_timeout:
-                self.narrow_goal_timed_out = True
-                self._spinning_steps = 0  # prevent repeated firing within same horizon
+                self._spinning_steps = 0
+                if self._worker_state == WorkerState.FINDING:
+                    # Blacklist the stuck local goal and let get_action() pick the next nearest.
+                    if self._finding_local_goal is not None:
+                        self._finding_blacklist.add(self._finding_local_goal)
+                        self._finding_local_goal = None
+                        self._finding_steps = 0
+                else:
+                    self.narrow_goal_timed_out = True
         else:
             self._spinning_steps = 0
 
@@ -876,10 +885,11 @@ class HierarchicalWorker(nn.Module):
 
         # ── MLP NAVIGATION (FINDING or NARROW_GOAL) ────────────────────────────
         if self._worker_state == WorkerState.FINDING:
-            # Steer toward nearest pivotal state; exclude current pos and timed-out pivots.
-            # Always prefer wide_goal directly when it's a valid candidate — avoids the
-            # one-step display artifact where the agent lands on wide_goal while targeting
-            # a different pivot, and makes FINDING take the most direct route.
+            # Steer toward the NEAREST pivotal state (not wide_goal directly).
+            # The worker MLP is pretrained on goals at distance ≤ r=3; targeting
+            # wide_goal directly puts the input far out of distribution when wide_goal
+            # is many cells away. The nearest pivot keeps the local goal close, then
+            # TRAVERSAL handles the long-range leg via the graph.
             candidates = [p for p in self.pivotal_states
                           if p != state and p not in self._finding_blacklist]
             if not candidates:
@@ -888,11 +898,8 @@ class HierarchicalWorker(nn.Module):
                 self._finding_local_goal = None
                 self._finding_steps = 0
                 candidates = [p for p in self.pivotal_states if p != state]
-            if wide_goal in candidates:
-                local_goal = wide_goal
-            else:
-                local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
-                              if candidates else narrow_goal)
+            local_goal = (min(candidates, key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]))
+                          if candidates else narrow_goal)
             # Timer: if same target, tick; on timeout blacklist it and pick next
             if local_goal == self._finding_local_goal:
                 self._finding_steps += 1
@@ -1278,7 +1285,11 @@ class HierarchicalTrainer:
 
             if need_new_goal:
                 if active_narrow_goal is not None:
-                    narrow_blacklist.add(active_narrow_goal)  # always blacklist: narrow goals never re-selected in same episode
+                    # Blacklist only if the goal was actually resolved (reached or timed out/spinning).
+                    # If we're replanning because a ball was collected mid-pursuit, the narrow_goal
+                    # was never truly "used up" — keep it available for the next manager decision.
+                    if goal_reached_prev or steps_on_goal >= self.goal_timeout or self.worker.narrow_goal_timed_out:
+                        narrow_blacklist.add(active_narrow_goal)
                 if ball_collected_prev or goal_reached_prev:
                     wide_blacklist.clear()
                 elif self.worker.narrow_goal_timed_out:
