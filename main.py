@@ -1543,6 +1543,152 @@ def run_manager_narrow_pretrain(env, manager, grid_state, config, device):
     plot_manager_narrow_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
     return hit_history
 
+
+def run_manager_joint_pretrain(env, manager, grid_state, config, device):
+    """
+    Joint wide+narrow pre-training. No oracle: manager picks (wide, narrow) together
+    via get_manager_action. State fed to manager = closest pivot to random player position,
+    matching the pivot-space assumption used in train_episode and _run_and_save_episode.
+    Reward: composite alpha*reward_wide + (1-alpha)*reward_narrow so both heads get
+    direct signal.
+    """
+    episodes        = config.get('manager_joint_pretrain_episodes', 0)
+    horizons_per_ep = config.get('manager_joint_horizons_per_episode', 20)
+    r               = config.get('neighborhood_size', 3)
+    ppo_epochs      = config.get('manager_joint_ppo_epochs', 4)
+    ppo_batch_size  = config.get('manager_joint_ppo_batch_size', 1)
+    base_lr         = config.get('manager_lr', 5e-4)
+    entropy_start   = config.get('manager_joint_entropy_start', 0.1)
+    entropy_end     = config.get('manager_joint_entropy_end', 0.001)
+    reward_alpha    = config.get('manager_joint_reward_alpha', 0.5)  # weight for wide reward
+
+    if episodes == 0 or not manager.pivotal_states:
+        return
+
+    # Restore maze
+    env.phase = 2
+    env.fixed_ball_positions = None
+    env.randomgen = False
+    temp_valid = [(x, y) for x in range(1, env.width - 1) for y in range(1, env.height - 1)
+                  if grid_state[y][x] != '#']
+    if temp_valid:
+        env.agent_start_pos = random.choice(temp_valid)
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+
+    valid_cells = [(x, y) for x in range(1, env.width - 1) for y in range(1, env.height - 1)
+                   if env._is_traversable(env.grid.get(x, y))]
+    valid_set = set(valid_cells)
+    manager._valid_cells = valid_set
+
+    if valid_cells:
+        env.agent_start_pos = random.choice(valid_cells)
+    env.randomgen = True
+    env.firstgen  = False
+    env.reset()
+
+    maze_diagonal = (env.width - 2) + (env.height - 2)
+
+    print(f"\n{'='*70}")
+    print(f"INTERMEDIATE PHASE: Manager Joint Wide+Narrow Pre-training")
+    print(f"  {episodes} ep | {horizons_per_ep} horizons/ep | r={r} | LR={base_lr:.1e}")
+    print(f"{'='*70}")
+
+    _original_entropy_coef = manager.entropy_coef
+    manager.optimizer = torch.optim.Adam(manager.parameters(), lr=base_lr)
+
+    hit_history        = []
+    avg_reward_history = []
+    rollout_buffer     = []
+
+    for ep in range(episodes):
+        t = ep / max(1, episodes - 1)
+        manager.entropy_coef = entropy_end + 0.5 * (entropy_start - entropy_end) * (1 + math.cos(math.pi * t))
+
+        manager.reset_manager_state()
+        active_balls = list(env.reset_for_wide_pretrain(valid_cells, config.get('num_balls', 5)))
+
+        m_states, m_wide, m_narrow            = [], [], []
+        m_rewards, m_values, m_log_probs, m_entropies = [], [], [], []
+        m_balls, m_wide_idxs                  = [], []
+        hits = 0
+
+        for h in range(horizons_per_ep):
+            if not active_balls:
+                break
+
+            player_pos    = random.choice(valid_cells)
+            closest_pivot = min(manager.pivotal_states,
+                                key=lambda p: abs(p[0] - player_pos[0]) + abs(p[1] - player_pos[1]))
+
+            m_balls.append(list(active_balls))
+
+            wide_goal, narrow_goal, log_prob, value, entropy = manager.get_manager_action(
+                closest_pivot, valid_cells=valid_set, active_balls=active_balls
+            )
+            if manager.hidden_state is not None:
+                manager.hidden_state = tuple(hs.detach() for hs in manager.hidden_state)
+
+            wide_idx = manager.pivotal_states.index(wide_goal) if wide_goal in manager.pivotal_states else 0
+
+            # Wide reward: same formula as wide pretrain (covers ball within pretrain_r)
+            pretrain_r = r + config.get('manager_wide_pretrain_r_offset', 0)
+            wide_covered = [b for b in active_balls if manhattan_distance(wide_goal, b) <= pretrain_r]
+            if wide_covered:
+                closest_wide = min(wide_covered, key=lambda b: manhattan_distance(wide_goal, b))
+                dist_wide = manhattan_distance(wide_goal, closest_wide)
+                reward_wide = 1.0 + 2.0 * (pretrain_r - dist_wide) / pretrain_r
+            else:
+                dist_wide = min(manhattan_distance(wide_goal, b) for b in active_balls)
+                reward_wide = -dist_wide / maze_diagonal
+
+            # Narrow reward: distance narrow_goal → nearest ball
+            nearest_ball = min(active_balls, key=lambda b: abs(b[0] - narrow_goal[0]) + abs(b[1] - narrow_goal[1]))
+            dist_narrow = abs(narrow_goal[0] - nearest_ball[0]) + abs(narrow_goal[1] - nearest_ball[1])
+            if dist_narrow == 0:
+                reward_narrow = 2.0
+                active_balls.remove(nearest_ball)
+                hits += 1
+            elif dist_narrow <= 1:
+                reward_narrow = 1.0
+            else:
+                reward_narrow = -dist_narrow / maze_diagonal
+
+            reward = reward_alpha * reward_wide + (1.0 - reward_alpha) * reward_narrow
+
+            m_states.append(closest_pivot)
+            m_wide.append(wide_goal)
+            m_narrow.append(narrow_goal)
+            m_rewards.append(reward)
+            m_values.append(value)
+            m_log_probs.append(log_prob)
+            m_entropies.append(entropy.detach())
+            m_wide_idxs.append(wide_idx)
+
+        if m_rewards:
+            hit_history.append(hits / len(m_rewards))
+            avg_reward_history.append(sum(m_rewards) / len(m_rewards))
+
+        if len(m_rewards) > 1:
+            rollout_buffer.append((m_states, m_wide, m_narrow, m_rewards, m_values,
+                                   m_log_probs, m_entropies, m_balls, m_wide_idxs))
+            if len(rollout_buffer) >= ppo_batch_size:
+                manager.update_policy_batched(rollout_buffer, ppo_epochs=ppo_epochs,
+                                              entropy_coef_override=manager.entropy_coef)
+                rollout_buffer = []
+
+        if (ep + 1) % 1000 == 0:
+            recent_hits = hit_history[-1000:]
+            recent_rew  = avg_reward_history[-1000:]
+            print(f"  Ep {ep+1:>6}/{episodes} | HitRate: {sum(recent_hits)/len(recent_hits)*100:.1f}% | "
+                  f"AvgReward: {sum(recent_rew)/len(recent_rew):.3f} | "
+                  f"entropy_coef: {manager.entropy_coef:.4f}")
+
+    manager.entropy_coef = _original_entropy_coef
+    final_hit = sum(hit_history[-100:]) / min(100, len(hit_history)) * 100 if hit_history else 0.0
+    print(f"\nManager Joint Pre-training complete. Final hit rate (last 100 ep): {final_hit:.1f}%")
+
+
 #----------------------------------------------------------------------------#
 #                     PHASE 3: INTEGRATION TRAINING                          #
 #----------------------------------------------------------------------------#
@@ -1586,6 +1732,9 @@ def _run_phase3_training(config, pivotal_states, world_graph, policy, env,
 
     if config.get('manager_narrow_pretrain_episodes', 0) > 0:
         run_manager_narrow_pretrain(env, manager, grid_state, config, config['device'])
+
+    if config.get('manager_joint_pretrain_episodes', 0) > 0:
+        run_manager_joint_pretrain(env, manager, grid_state, config, config['device'])
 
     # Reset optimizer for Phase 3 with lower LR (fresh momentum, avoids pretrain gradient bleed)
     phase3_lr = config.get('manager_phase3_lr', config['manager_lr'])
@@ -1850,6 +1999,7 @@ def run_manager_wide_narrow_pretrain_standalone(
 
     run_manager_wide_pretrain(env, manager, grid_state, config, device)
     run_manager_narrow_pretrain(env, manager, grid_state, config, device)
+    run_manager_joint_pretrain(env, manager, grid_state, config, device)
 
     if save_path:
         torch.save({'manager': manager.state_dict()}, save_path)

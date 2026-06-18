@@ -500,7 +500,7 @@ def render_phase3_episode_gif(checkpoint_path, filename='phase3_final_episode.mp
 
 def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                           ball_positions, filename, fps, max_steps,
-                          world_graph=None, pivotal_states=None, temperature: float = 0.3):
+                          world_graph=None, pivotal_states=None, temperature: float = 0.4):
     env = MinigridWrapper(
         size=config['maze_size'],
         mode=EnvModes.MULTIGOAL,
@@ -610,14 +610,13 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
     ball_collected_prev = False
     wide_goal = manager.pivotal_states[0]
     narrow_goal = manager.pivotal_states[0]
-    wide_blacklist: set = set()
     narrow_blacklist: set = set()
 
     first_frame = env.render()
     if overlay_enabled:
         first_frame = apply_overlay(first_frame, None, None,
                                     active_balls=list(env.active_balls), agent_state=state,
-                                    wide_blacklist=wide_blacklist, narrow_blacklist=narrow_blacklist)
+                                    narrow_blacklist=narrow_blacklist)
     frames = [first_frame]
 
     done = False
@@ -640,16 +639,13 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                 if need_new_goal:
                     if active_narrow_goal is not None:
                         if goal_reached_prev or horizons_on_goal * horizon >= goal_timeout or worker.narrow_goal_timed_out:
-                            narrow_blacklist.add(active_narrow_goal)
-                    if ball_collected_prev or goal_reached_prev:
-                        wide_blacklist.clear()
-                    elif worker.narrow_goal_timed_out:
-                        if active_wide_goal is not None:
-                            wide_blacklist.add(active_wide_goal)
+                            if active_narrow_goal not in env.active_balls:
+                                narrow_blacklist.add(active_narrow_goal)
                     worker.reset_worker_state()
-                    no_repeat_blacklist = wide_blacklist | ({active_wide_goal} if active_wide_goal is not None else set())
+                    no_repeat_blacklist = {active_wide_goal} if active_wide_goal is not None else set()
+                    manager_state = min(manager.pivotal_states, key=lambda p: abs(p[0]-state[0]) + abs(p[1]-state[1]))
                     wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
-                        state, step_count=999999, valid_cells=valid_cells,
+                        manager_state, step_count=999999, valid_cells=valid_cells,
                         active_balls=list(env.active_balls), temperature=temperature,
                         wide_blacklist=no_repeat_blacklist, narrow_blacklist=narrow_blacklist
                     )
@@ -702,7 +698,7 @@ def _run_and_save_episode(manager, worker, config, grid_state, agent_start_pos,
                                       traversal_path=worker.current_traversal_path or None,
                                       active_balls=list(env.active_balls), agent_state=state,
                                       local_goal=local_goal_vis,
-                                      wide_blacklist=wide_blacklist, narrow_blacklist=narrow_blacklist,
+                                      narrow_blacklist=narrow_blacklist,
                                       finding_blacklist=worker._finding_blacklist)
             frames.append(frame)
             done = terminated or truncated

@@ -1201,7 +1201,10 @@ class HierarchicalTrainer:
         self.manhattan_distance_rew_shaping=workershaping
         self.manager_reward_shaping=managershaping
         self.instant_traversal = instant_traversal
-    
+
+    def _closest_pivot(self, pos: Tuple[int, int]) -> Tuple[int, int]:
+        return min(self.manager.pivotal_states, key=lambda p: abs(p[0] - pos[0]) + abs(p[1] - pos[1]))
+
     def train_episode(self, max_steps: int = 200, full_breakdown_every=1):
         """Train one episode with comprehensive diagnostics."""
 
@@ -1270,7 +1273,6 @@ class HierarchicalTrainer:
         manager_balls_snapshots = []
         
         horizon_counter = 0
-        wide_blacklist: set = set()   # wide goals to avoid after narrow_goal timeout; cleared on goal reached
         narrow_blacklist: set = set() # narrow goals already reached without collecting a ball this episode
 
         while episode_steps < max_steps:
@@ -1289,19 +1291,15 @@ class HierarchicalTrainer:
                     # If we're replanning because a ball was collected mid-pursuit, the narrow_goal
                     # was never truly "used up" — keep it available for the next manager decision.
                     if goal_reached_prev or steps_on_goal >= self.goal_timeout or self.worker.narrow_goal_timed_out:
-                        narrow_blacklist.add(active_narrow_goal)
-                if ball_collected_prev or goal_reached_prev:
-                    wide_blacklist.clear()
-                elif self.worker.narrow_goal_timed_out:
-                    # Only blacklist the pivot when the goal was NOT reached (worker was genuinely stuck)
-                    if active_wide_goal is not None:
-                        wide_blacklist.add(active_wide_goal)
+                        if active_narrow_goal not in self.env.active_balls:
+                            narrow_blacklist.add(active_narrow_goal)
                 if active_wide_goal is not None:
                     self.worker.reset_worker_state()  # resets traversal buffers + FSM to FINDING
 
-                no_repeat_blacklist = wide_blacklist | ({active_wide_goal} if active_wide_goal is not None else set())
+                no_repeat_blacklist = {active_wide_goal} if active_wide_goal is not None else set()
+                manager_state = self._closest_pivot(state)
                 wide_goal, narrow_goal, manager_log_prob, manager_value, entropy = self.manager.get_manager_action(
-                    state, step_count=self.global_step_counter, valid_cells=valid_cells,
+                    manager_state, step_count=self.global_step_counter, valid_cells=valid_cells,
                     active_balls=list(self.env.active_balls), wide_blacklist=no_repeat_blacklist,
                     narrow_blacklist=narrow_blacklist
                 )
@@ -1348,8 +1346,8 @@ class HierarchicalTrainer:
             terminated = False
             truncated = False
 
-            # Save starting state for Manager reward shaping
-            starting_state_snapshot = state
+            # Save starting state for Manager reward shaping (pivot space for LSTM consistency)
+            starting_state_snapshot = self._closest_pivot(state)
             starting_balls_snapshot = list(self.env.active_balls)
 
             for h in range(self.horizon):

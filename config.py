@@ -63,6 +63,14 @@ externalconfig = {
     'manager_wide_pretrain_episodes':    1,
     'manager_wide_pretrain_r_offset':    2,
 
+    'manager_joint_pretrain_episodes':    50000,  # 0 = skip
+    'manager_joint_horizons_per_episode': 20,
+    'manager_joint_ppo_epochs':           4,
+    'manager_joint_ppo_batch_size':       1,
+    'manager_joint_entropy_start':        0.05,
+    'manager_joint_entropy_end':          0.001,
+    'manager_joint_reward_alpha':         0.5,   # weight wide vs narrow reward (0=only narrow, 1=only wide)
+
     # --- PPO ---
     'ppo_epochs':   4,
     'ppo_clip_eps': 0.2,
