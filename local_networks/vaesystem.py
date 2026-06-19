@@ -714,7 +714,7 @@ class VAESystem(nn.Module):
         
             
         # Extract final pivotal states
-        pivotal_states = self.extract_pivotal_states(all_trajectories, spread_alpha=spread_alpha)
+        pivotal_states = self.extract_pivotal_states(all_trajectories, threshold_percentile=85, spread_alpha=spread_alpha)
         
         print(f"Training completed. Discovered {len(pivotal_states)} pivotal states:")
         for i, (x, y) in enumerate(pivotal_states[:10]):  # Show first 10

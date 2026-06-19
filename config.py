@@ -67,8 +67,9 @@ externalconfig = {
     'manager_joint_horizons_per_episode': 20,
     'manager_joint_ppo_epochs':           4,
     'manager_joint_ppo_batch_size':       1,
-    'manager_joint_entropy_start':        0.05,
+    'manager_joint_entropy_start':        0.3,
     'manager_joint_entropy_end':          0.001,
+    'manager_joint_entropy_warmup':       0.1,   # fraction of eps held at entropy_start before cosine anneal
     'manager_joint_reward_alpha':         0.5,   # weight wide vs narrow reward (0=only narrow, 1=only wide)
 
     # --- PPO ---

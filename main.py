@@ -22,7 +22,8 @@ from utils.visualization import (plot_training_diagnostics, save_graph_visualiza
                                   _run_and_save_episode, print_grid_image, _plot_phase1_run,
                                   plot_worker_pretrain_diagnostics,
                                   plot_manager_wide_pretrain_diagnostics,
-                                  plot_manager_narrow_pretrain_diagnostics)
+                                  plot_manager_narrow_pretrain_diagnostics,
+                                  plot_manager_joint_pretrain_diagnostics)
 from local_networks.hierarchical_system import HierarchicalManager, HierarchicalWorker, HierarchicalTrainer
 from bufferclasses import NarrowReplayBuffer, WorkerEpisodeReplayBuffer
 from config import externalconfig
@@ -1259,7 +1260,11 @@ def run_manager_wide_pretrain(env, manager, grid_state, config, device):
             m_log_probs.append(log_prob)
             m_entropies.append(entropy.detach())
 
-            state = wide_goal
+            # Simulate agent at a narrow goal in the neighborhood of wide_goal
+            # (mirrors Phase 3 where goal_reached triggers replanning from narrow_goal position)
+            neighborhood = manager.get_neighborhood(wide_goal)
+            valid_narrow = [c for c in neighborhood if c in set(valid_cells)]
+            state = random.choice(valid_narrow) if valid_narrow else wide_goal
 
         ball_coverage_history.append((initial_ball_count - len(active_balls)) / max(1, initial_ball_count))
         avg_reward_history.append(sum(m_rewards) / len(m_rewards) if m_rewards else 0.0)
@@ -1594,16 +1599,24 @@ def run_manager_joint_pretrain(env, manager, grid_state, config, device):
     print(f"  {episodes} ep | {horizons_per_ep} horizons/ep | r={r} | LR={base_lr:.1e}")
     print(f"{'='*70}")
 
+    entropy_warmup = config.get('manager_joint_entropy_warmup', 0.1)  # fraction of eps at full entropy
+    warmup_eps     = int(episodes * entropy_warmup)
+    pretrain_r     = r + config.get('manager_wide_pretrain_r_offset', 0)
+
     _original_entropy_coef = manager.entropy_coef
     manager.optimizer = torch.optim.Adam(manager.parameters(), lr=base_lr)
 
     hit_history        = []
+    near_history       = []
     avg_reward_history = []
     rollout_buffer     = []
 
     for ep in range(episodes):
-        t = ep / max(1, episodes - 1)
-        manager.entropy_coef = entropy_end + 0.5 * (entropy_start - entropy_end) * (1 + math.cos(math.pi * t))
+        if ep < warmup_eps:
+            manager.entropy_coef = entropy_start
+        else:
+            t = (ep - warmup_eps) / max(1, episodes - warmup_eps - 1)
+            manager.entropy_coef = entropy_end + 0.5 * (entropy_start - entropy_end) * (1 + math.cos(math.pi * t))
 
         manager.reset_manager_state()
         active_balls = list(env.reset_for_wide_pretrain(valid_cells, config.get('num_balls', 5)))
@@ -1612,6 +1625,7 @@ def run_manager_joint_pretrain(env, manager, grid_state, config, device):
         m_rewards, m_values, m_log_probs, m_entropies = [], [], [], []
         m_balls, m_wide_idxs                  = [], []
         hits = 0
+        nears = 0
 
         for h in range(horizons_per_ep):
             if not active_balls:
@@ -1631,26 +1645,27 @@ def run_manager_joint_pretrain(env, manager, grid_state, config, device):
 
             wide_idx = manager.pivotal_states.index(wide_goal) if wide_goal in manager.pivotal_states else 0
 
-            # Wide reward: same formula as wide pretrain (covers ball within pretrain_r)
-            pretrain_r = r + config.get('manager_wide_pretrain_r_offset', 0)
+            # Wide reward: same formula as wide pretrain
             wide_covered = [b for b in active_balls if manhattan_distance(wide_goal, b) <= pretrain_r]
             if wide_covered:
                 closest_wide = min(wide_covered, key=lambda b: manhattan_distance(wide_goal, b))
-                dist_wide = manhattan_distance(wide_goal, closest_wide)
-                reward_wide = 1.0 + 2.0 * (pretrain_r - dist_wide) / pretrain_r
+                dist_wide    = manhattan_distance(wide_goal, closest_wide)
+                reward_wide  = 1.0 + 2.0 * (pretrain_r - dist_wide) / pretrain_r
             else:
-                dist_wide = min(manhattan_distance(wide_goal, b) for b in active_balls)
+                dist_wide   = min(manhattan_distance(wide_goal, b) for b in active_balls)
                 reward_wide = -dist_wide / maze_diagonal
 
             # Narrow reward: distance narrow_goal → nearest ball
             nearest_ball = min(active_balls, key=lambda b: abs(b[0] - narrow_goal[0]) + abs(b[1] - narrow_goal[1]))
-            dist_narrow = abs(narrow_goal[0] - nearest_ball[0]) + abs(narrow_goal[1] - nearest_ball[1])
+            dist_narrow  = abs(narrow_goal[0] - nearest_ball[0]) + abs(narrow_goal[1] - nearest_ball[1])
             if dist_narrow == 0:
                 reward_narrow = 2.0
                 active_balls.remove(nearest_ball)
-                hits += 1
+                hits  += 1
+                nears += 1
             elif dist_narrow <= 1:
                 reward_narrow = 1.0
+                nears += 1
             else:
                 reward_narrow = -dist_narrow / maze_diagonal
 
@@ -1665,8 +1680,12 @@ def run_manager_joint_pretrain(env, manager, grid_state, config, device):
             m_entropies.append(entropy.detach())
             m_wide_idxs.append(wide_idx)
 
+            # Next player_pos = narrow_goal (mirrors Phase 3: goal_reached triggers replanning from narrow_goal)
+            player_pos = narrow_goal
+
         if m_rewards:
-            hit_history.append(hits / len(m_rewards))
+            hit_history.append(hits  / len(m_rewards))
+            near_history.append(nears / len(m_rewards))
             avg_reward_history.append(sum(m_rewards) / len(m_rewards))
 
         if len(m_rewards) > 1:
@@ -1678,15 +1697,21 @@ def run_manager_joint_pretrain(env, manager, grid_state, config, device):
                 rollout_buffer = []
 
         if (ep + 1) % 1000 == 0:
-            recent_hits = hit_history[-1000:]
-            recent_rew  = avg_reward_history[-1000:]
-            print(f"  Ep {ep+1:>6}/{episodes} | HitRate: {sum(recent_hits)/len(recent_hits)*100:.1f}% | "
+            recent_hits  = hit_history[-1000:]
+            recent_nears = near_history[-1000:]
+            recent_rew   = avg_reward_history[-1000:]
+            print(f"  Ep {ep+1:>6}/{episodes} | "
+                  f"HitRate: {sum(recent_hits)/len(recent_hits)*100:.1f}% | "
+                  f"NearRate: {sum(recent_nears)/len(recent_nears)*100:.1f}% | "
                   f"AvgReward: {sum(recent_rew)/len(recent_rew):.3f} | "
                   f"entropy_coef: {manager.entropy_coef:.4f}")
 
     manager.entropy_coef = _original_entropy_coef
-    final_hit = sum(hit_history[-100:]) / min(100, len(hit_history)) * 100 if hit_history else 0.0
-    print(f"\nManager Joint Pre-training complete. Final hit rate (last 100 ep): {final_hit:.1f}%")
+    final_hit  = sum(hit_history[-100:])  / min(100, len(hit_history))  * 100 if hit_history  else 0.0
+    final_near = sum(near_history[-100:]) / min(100, len(near_history)) * 100 if near_history else 0.0
+    print(f"\nManager Joint Pre-training complete. "
+          f"Final hit rate: {final_hit:.1f}% | Near rate: {final_near:.1f}% (last 100 ep)")
+    plot_manager_joint_pretrain_diagnostics(hit_history, near_history, avg_reward_history)
 
 
 #----------------------------------------------------------------------------#
