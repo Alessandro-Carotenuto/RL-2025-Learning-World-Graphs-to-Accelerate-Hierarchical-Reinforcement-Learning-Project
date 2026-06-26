@@ -1,4 +1,4 @@
-# Learning World Graphs to Accelerate Hierarchical Reinforcement Learning
+# Hierarchical RL with Learned World Graph for Navigation
 
 <p align="center">
   <img src="readme assets/reinforce.gif" alt="HRL agent navigating a 24×24 maze to collect all five balls" width="75%" />
