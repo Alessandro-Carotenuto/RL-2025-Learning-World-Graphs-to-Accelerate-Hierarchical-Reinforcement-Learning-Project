@@ -61,37 +61,37 @@ The plots below show typical training dynamics across the full pipeline. Individ
 <!-- TODO: add Phase 1 diagnostics plot -->
 
 <p align="center">
-  <img src="readme assets/WG EXAMPLE.png" alt="World Graph overlaid on the 24×24 maze: 58 pivotal states and 121 directed edges" width="40%" />
+  <img src="readme assets/WG EXAMPLE.png" alt="World Graph overlaid on the 24×24 maze: 58 pivotal states and 121 directed edges" width="70%" />
 </p>
 
 ### Pretrain — Worker
 
 <p align="center">
-  <img src="readme assets/pretrain_worker_diagnostics.png" alt="Worker pretraining diagnostics" width="50%" />
+  <img src="readme assets/pretrain_worker_diagnostics.png" alt="Worker pretraining diagnostics" width="70%" />
 </p>
 
 ### Pretrain — Manager Wide
 
 <p align="center">
-  <img src="readme assets/pretrain_manager_wide_diagnostics.png" alt="Manager wide head pretraining diagnostics" width="50%" />
+  <img src="readme assets/pretrain_manager_wide_diagnostics.png" alt="Manager wide head pretraining diagnostics" width="70%" />
 </p>
 
 ### Pretrain — Manager Narrow
 
 <p align="center">
-  <img src="readme assets/pretrain_manager_narrow_diagnostics.png" alt="Manager narrow head pretraining diagnostics" width="50%%" />
+  <img src="readme assets/pretrain_manager_narrow_diagnostics.png" alt="Manager narrow head pretraining diagnostics" width="70%" />
 </p>
 
 ### Pretrain — Manager Joint
 
 <p align="center">
-  <img src="readme assets/pretrain_manager_joint_diagnostics.png" alt="Manager joint pretraining diagnostics" width="50%%" />
+  <img src="readme assets/pretrain_manager_joint_diagnostics.png" alt="Manager joint pretraining diagnostics" width="70%" />
 </p>
 
 ### Phase 3 — Integration Training
 
 <p align="center">
-  <img src="readme assets/diagnostics_sizeMEDIUM_h10_n3_ep5000.png" alt="Phase 3 integration training diagnostics" width="50%" />
+  <img src="readme assets/diagnostics_sizeMEDIUM_h10_n3_ep5000.png" alt="Phase 3 integration training diagnostics" width="70%" />
 </p>
 
 ---
