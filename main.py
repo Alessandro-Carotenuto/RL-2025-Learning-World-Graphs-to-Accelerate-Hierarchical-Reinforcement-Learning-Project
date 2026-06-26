@@ -2032,6 +2032,380 @@ def run_manager_wide_narrow_pretrain_standalone(
 
     return manager
 
+
+def testing_grounds(
+        checkpoint_path: str = 'phase1_checkpoint_MEDIUM.pt',
+        num_episodes: int = 100,
+        temperature: float = 0.4,
+        max_steps: int = 10_000):
+    """
+    Evaluate the trained agent over num_episodes greedy episodes without rendering.
+    Loads Phase 1 checkpoint + _session.pt (manager/worker weights saved after Phase 3).
+    Uses the full Worker FSM (FINDING → TRAVERSAL → NARROW_GOAL) and goal-persistence
+    logic identical to _run_and_save_episode, but without any frame capture.
+
+    Reports:
+        - success rate  (all balls collected within max_steps)
+        - mean steps per episode
+        - 1×1 plot of steps per episode with moving average, saved as PNG.
+
+    Args:
+        checkpoint_path: path to Phase 1 .pt file (session file inferred automatically)
+        num_episodes:    number of evaluation episodes to run
+        temperature:     softmax temperature for manager action selection
+        max_steps:       per-episode step budget (default 10 000)
+
+    Returns:
+        dict with keys 'success_rate', 'mean_steps', 'episode_steps', 'episode_success'
+    """
+    import matplotlib.pyplot as plt
+
+    # ── Load checkpoints ────────────────────────────────────────────────────
+    pivotal_states, world_graph, policy, vae_system, config, grid_state = \
+        load_phase1_checkpoint(checkpoint_path)
+
+    session_path = checkpoint_path.replace('.pt', '_session.pt')
+    session = torch.load(session_path, map_location='cpu', weights_only=False)
+    agent_start  = session['agent_start']
+    ball_positions = session['ball_positions']
+
+    if 'goal_policy_state_dict' in session:
+        policy.load_state_dict(session['goal_policy_state_dict'])
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=config['neighborhood_size'],
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        device='cpu',
+    )
+    manager.load_state_dict(session['manager_state_dict'])
+    manager.eval()
+
+    worker = HierarchicalWorker(
+        world_graph,
+        pivotal_states,
+        lr=config['worker_lr'],
+        goal_policy=policy,
+        maze_size=config['maze_size'].value,
+        neighborhood_size=config.get('neighborhood_size', 3),
+        device='cpu',
+    )
+    worker.load_state_dict(session['worker_state_dict'])
+    worker.eval()
+
+    # ── Environment (same maze + same fixed ball positions every episode) ───
+    env = MinigridWrapper(
+        size=config['maze_size'],
+        mode=EnvModes.MULTIGOAL,
+        max_steps=max_steps,
+    )
+    env.reset()
+    restore_maze_from_grid_state(env, grid_state)
+    env.agent_start_pos = agent_start
+    env.agent_pos = agent_start
+    env.placeable_grid[agent_start[0]][agent_start[1]] = False
+    env.firstgen = False
+    env.phase = 2
+    env.fixed_ball_positions = ball_positions
+
+    num_balls   = len(ball_positions) if ball_positions else config.get('num_balls', 5)
+    goal_timeout = config.get('goal_timeout', 3)
+    horizon      = config['manager_horizon']
+
+    episode_steps: list[int]  = []
+    episode_success: list[bool] = []
+
+    print(f"\n{'='*60}")
+    print(f"TESTING GROUNDS — {num_episodes} episodes, max {max_steps} steps each")
+    print(f"  Checkpoint : {checkpoint_path}")
+    print(f"  Session    : {session_path}")
+    print(f"  Balls      : {num_balls}  |  Temperature: {temperature}")
+    print(f"{'='*60}")
+
+    with torch.no_grad():
+        for ep in range(num_episodes):
+            env.reset()
+            state = tuple(env.agent_pos)
+            valid_cells = {
+                (x, y)
+                for x in range(env.width)
+                for y in range(env.height)
+                if env._is_traversable(env.grid.get(x, y))
+            }
+            manager.reset_manager_state()
+            worker.reset_worker_state()
+            worker.valid_cells = valid_cells
+            worker.build_wall_mask(env.width, env.height)
+
+            # Goal-persistence state — mirrors _run_and_save_episode exactly
+            active_wide_goal  = None
+            active_narrow_goal = None
+            horizons_on_goal  = 0
+            goal_reached_prev  = False
+            ball_collected_prev = False
+            narrow_blacklist: set = set()
+            goal_reached_this_horizon = False
+            starting_balls_snapshot   = list(env.active_balls)
+
+            wide_goal   = manager.pivotal_states[0]
+            narrow_goal = manager.pivotal_states[0]
+
+            done         = False
+            step         = 0
+            horizon_step = 0
+
+            while not done and step < max_steps:
+                # ── Horizon boundary ──────────────────────────────────────
+                if horizon_step == 0:
+                    need_new_goal = (
+                        active_wide_goal is None
+                        or goal_reached_prev
+                        or ball_collected_prev
+                        or horizons_on_goal * horizon >= goal_timeout
+                        or worker.narrow_goal_timed_out
+                    )
+                    if need_new_goal:
+                        if active_narrow_goal is not None:
+                            if (goal_reached_prev
+                                    or horizons_on_goal * horizon >= goal_timeout
+                                    or worker.narrow_goal_timed_out):
+                                if active_narrow_goal not in env.active_balls:
+                                    narrow_blacklist.add(active_narrow_goal)
+                        worker.reset_worker_state()
+                        no_repeat_blacklist = {active_wide_goal} if active_wide_goal is not None else set()
+                        manager_state = min(
+                            manager.pivotal_states,
+                            key=lambda p: abs(p[0] - state[0]) + abs(p[1] - state[1]),
+                        )
+                        wide_goal, narrow_goal, _, _, _ = manager.get_manager_action(
+                            manager_state, step_count=999_999, valid_cells=valid_cells,
+                            active_balls=list(env.active_balls), temperature=temperature,
+                            wide_blacklist=no_repeat_blacklist, narrow_blacklist=narrow_blacklist,
+                        )
+                        if manager.hidden_state is not None:
+                            manager.hidden_state = tuple(h.detach() for h in manager.hidden_state)
+                        active_wide_goal   = wide_goal
+                        active_narrow_goal = narrow_goal
+                        horizons_on_goal   = 0
+                    else:
+                        wide_goal   = active_wide_goal
+                        narrow_goal = active_narrow_goal
+
+                    goal_reached_this_horizon = False
+                    starting_balls_snapshot   = list(env.active_balls)
+
+                terminated, truncated = False, False
+                prev_state = state
+
+                # Pre-action check: if already at narrow_goal, skip action
+                if state == narrow_goal and not goal_reached_this_horizon:
+                    goal_reached_this_horizon = True
+                    horizon_step = horizon - 1
+                else:
+                    action, _, _ = worker.get_action(state, wide_goal, narrow_goal, agent_dir=env.agent_dir)
+                    try:
+                        _, _, terminated, truncated, _ = env.step(action)
+                    except (AssertionError, IndexError):
+                        terminated, truncated = False, False
+                    state = tuple(env.agent_pos)
+                    worker.report_step(prev_state, state)
+
+                    if state == narrow_goal and not goal_reached_this_horizon:
+                        goal_reached_this_horizon = True
+                        horizon_step = horizon - 1
+
+                done  = terminated or truncated
+                step += 1
+                horizon_step += 1
+
+                if horizon_step >= horizon:
+                    horizon_step        = 0
+                    horizons_on_goal   += 1
+                    goal_reached_prev   = goal_reached_this_horizon
+                    ball_collected_prev = (len(starting_balls_snapshot) - len(env.active_balls)) > 0
+
+            balls_collected = num_balls - len(env.active_balls)
+            success = balls_collected == num_balls
+            episode_steps.append(step)
+            episode_success.append(success)
+            print(f"  Ep {ep+1:>3}/{num_episodes}  steps={step:>6}  "
+                  f"balls={balls_collected}/{num_balls}  {'SUCCESS' if success else 'fail'}")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    success_rate = 100.0 * sum(episode_success) / num_episodes
+    mean_steps   = sum(episode_steps) / num_episodes
+    print(f"\n{'='*60}")
+    print(f"RESULTS  ({num_episodes} episodes)")
+    print(f"  Success rate : {success_rate:.1f}%")
+    print(f"  Mean steps   : {mean_steps:.1f}")
+    print(f"{'='*60}")
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    window     = max(5, num_episodes // 10)
+    moving_avg = [
+        sum(episode_steps[max(0, i - window + 1): i + 1]) / min(window, i + 1)
+        for i in range(num_episodes)
+    ]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    eps = list(range(1, num_episodes + 1))
+    ax.plot(eps, episode_steps, color='steelblue', linewidth=0.8, alpha=0.55, label='Steps per episode')
+    ax.plot(eps, moving_avg,    color='darkorange', linewidth=2.0,  label=f'Moving avg (w={window})')
+    ax.axhline(mean_steps, color='crimson', linewidth=1.2, linestyle='--',
+               label=f'Mean {mean_steps:.0f} steps')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Steps')
+    ax.set_title(
+        f'Testing Grounds — {num_episodes} ep  |  '
+        f'Success {success_rate:.1f}%  |  Mean steps {mean_steps:.0f}'
+    )
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plot_path = checkpoint_path.replace('.pt', '_testing_grounds.png')
+    fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Plot saved to '{plot_path}'")
+
+    return {
+        'success_rate':   success_rate,
+        'mean_steps':     mean_steps,
+        'episode_steps':  episode_steps,
+        'episode_success': episode_success,
+    }
+
+
+def smoke_test_testing_grounds(
+        out_checkpoint: str = '_smoke_phase1.pt',
+        num_episodes: int = 3,
+        max_steps: int = 300):
+    """
+    Build throwaway mock checkpoints (no training, random weights) and run
+    testing_grounds end-to-end.  Use this to verify testing_grounds doesn't
+    crash before committing to a real long run.
+
+    Saves _smoke_phase1.pt and _smoke_phase1_session.pt, then deletes them.
+    """
+    import os
+
+    # ── 1. Build a small env and grab the grid state ─────────────────────────
+    env = MinigridWrapper(
+        size=EnvSizes.SMALL,
+        mode=EnvModes.MULTIGOAL,
+        max_steps=max_steps,
+    )
+    env.phase = 1
+    env.randomgen = True
+    env.reset()
+    grid_state = env.getGridState()
+
+    valid_cells = [
+        (x, y)
+        for x in range(1, env.width - 1)
+        for y in range(1, env.height - 1)
+        if env._is_traversable(env.grid.get(x, y))
+    ]
+    assert len(valid_cells) >= 8, "Too few valid cells for smoke test"
+
+    # ── 2. Pick pivotal states, agent start, ball positions ──────────────────
+    pivotal_states = random.sample(valid_cells, min(6, len(valid_cells)))
+    agent_start    = random.choice([c for c in valid_cells if c not in pivotal_states])
+    remaining      = [c for c in valid_cells if c != agent_start and c not in pivotal_states]
+    ball_positions = random.sample(remaining, min(3, len(remaining)))
+
+    # ── 3. Minimal world graph: ring of edges between consecutive pivots ──────
+    world_graph = GraphManager()
+    for ps in pivotal_states:
+        world_graph.add_node(ps)
+    for i in range(len(pivotal_states)):
+        a = pivotal_states[i]
+        b = pivotal_states[(i + 1) % len(pivotal_states)]
+        world_graph.add_edge(a, b, weight=1, path=[a, b])
+        world_graph.add_edge(b, a, weight=1, path=[b, a])
+
+    # ── 4. Config ─────────────────────────────────────────────────────────────
+    r = max(1, math.ceil(EnvSizes.SMALL.value / 8))
+    config = {
+        'maze_size':              EnvSizes.SMALL,
+        'device':                 'cpu',
+        'max_steps_per_episode':  max_steps,
+        'neighborhood_size':      r,
+        'manager_horizon':        10,
+        'manager_lr':             5e-4,
+        'worker_lr':              1e-4,
+        'goal_policy_lr':         5e-3,
+        'goal_timeout':           30,
+        'diagnostic_interval':    10000,
+        'diagnostic_checkstart':  False,
+        'num_balls':              len(ball_positions),
+    }
+
+    # ── 5. Instantiate networks (random weights) ──────────────────────────────
+    policy     = GoalConditionedPolicy(lr=config['goal_policy_lr'],
+                                       maze_size=config['maze_size'].value, device='cpu')
+    vae_system = VAESystem(state_dim=16, action_vocab_size=7, mu0=9.0, grid_size=env.size)
+
+    manager = HierarchicalManager(
+        pivotal_states,
+        neighborhood_size=r,
+        lr=config['manager_lr'],
+        horizon=config['manager_horizon'],
+        diagnostic_interval=config['diagnostic_interval'],
+        diagnostic_checkstart=config['diagnostic_checkstart'],
+        device='cpu',
+    )
+    worker = HierarchicalWorker(
+        world_graph,
+        pivotal_states,
+        lr=config['worker_lr'],
+        goal_policy=policy,
+        maze_size=config['maze_size'].value,
+        neighborhood_size=r,
+        device='cpu',
+    )
+
+    # ── 6. Save mock Phase 1 checkpoint ──────────────────────────────────────
+    save_phase1_checkpoint(
+        out_checkpoint, pivotal_states, world_graph, policy, vae_system, config, grid_state
+    )
+
+    # ── 7. Save mock session file ─────────────────────────────────────────────
+    session_path = out_checkpoint.replace('.pt', '_session.pt')
+    torch.save({
+        'agent_start':            agent_start,
+        'ball_positions':         ball_positions,
+        'manager_state_dict':     manager.state_dict(),
+        'worker_state_dict':      worker.state_dict(),
+        'goal_policy_state_dict': policy.state_dict(),
+    }, session_path)
+    print(f"Mock session saved to '{session_path}'")
+
+    # ── 8. Run testing_grounds ────────────────────────────────────────────────
+    print("\n--- smoke_test: calling testing_grounds ---")
+    try:
+        results = testing_grounds(
+            checkpoint_path=out_checkpoint,
+            num_episodes=num_episodes,
+            temperature=1.0,
+            max_steps=max_steps,
+        )
+        print(f"\nSmoke test PASSED  "
+              f"success={results['success_rate']:.1f}%  "
+              f"mean_steps={results['mean_steps']:.1f}")
+    finally:
+        # Clean up temp files
+        for path in [out_checkpoint, session_path,
+                     out_checkpoint.replace('.pt', '_testing_grounds.png')]:
+            if os.path.exists(path):
+                os.remove(path)
+        print("Temp checkpoint files removed.")
+
+    return results
+
 #----------------------------------------------------------------------------#
 #                             FULL PIPELINE                                  #
 #----------------------------------------------------------------------------#
@@ -2125,12 +2499,14 @@ def main():
         'device': externalconfig['device'],
     })
     """
+    smoke_test_testing_grounds()
     #train_full_phase1_to_phase3()       # Phase 1 + Phase 3 together (saves checkpoint automatically)
     #run_worker_pretrain_standalone(use_checkpoint=True,  checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='gcp_pretrained.pt')
-    run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
+    #run_worker_pretrain_standalone(use_checkpoint=False, config_overrides=externalconfig)
     #run_manager_wide_narrow_pretrain_standalone(use_checkpoint=False, checkpoint_path='phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, save_path='manager_pretrained.pt')
     #run_phase3_standalone('phase1_checkpoint_MEDIUM.pt', config_overrides=externalconfig, fixed_balls=True, phase3_animation=False)
     #render_phase3_episode_gif('phase1_checkpoint_MEDIUM.pt', filename='phase3_final_episode.mp4', fps=15, max_steps=500)
+    #testing_grounds('phase1_checkpoint_MEDIUM.pt', num_episodes=500, temperature=0.4, max_steps=10_000)
 
 if __name__ == "__main__":
     main()
